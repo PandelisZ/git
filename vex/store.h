@@ -195,6 +195,13 @@ int vex_epoch_allocate(struct vex_store *store, const char *push_id,
 uint64_t vex_epoch_id(const struct vex_epoch *epoch);
 
 /*
+ * Record active receive progress durably when the local refresh interval is
+ * due.  MySQL+S3 recovery ages this heartbeat, while filesystem stores retain
+ * their existing process-local behavior.
+ */
+int vex_epoch_heartbeat(struct vex_epoch *epoch);
+
+/*
  * Attach a process-local handle to an already-open epoch.  This is the
  * receive-pack handoff primitive: a child that inherited the lease may stage
  * and read only that epoch's quarantined objects, but cannot publish it on

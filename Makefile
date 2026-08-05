@@ -2541,6 +2541,8 @@ VEX_MYSQL_PROBE_BIN = t/vex/bin/vex-mysql-metadata-probe
 VEX_MYSQL_PROBE_OBJS = vex/meta-mysql-probe.o t/vex/mysql-metadata-probe.o
 VEX_SWEEP_PLAN_BIN = t/vex/bin/vex-sweep-plan
 VEX_SWEEP_PLAN_OBJS = t/vex/vex-sweep-plan.o
+VEX_EPOCH_LEASE_BIN = t/vex/bin/vex-epoch-lease
+VEX_EPOCH_LEASE_OBJS = t/vex/vex-epoch-lease.o
 
 # `vex/meta-mysql.o` changes ABI when VEX_MYSQL is toggled. Track that
 # selection separately so alternating normal and MySQL-enabled builds cannot
@@ -3088,6 +3090,9 @@ vex-mysql-metadata-probe: $(VEX_MYSQL_PROBE_BIN)
 .PHONY: vex-sweep-plan
 vex-sweep-plan: $(VEX_SWEEP_PLAN_BIN)
 
+.PHONY: vex-epoch-lease
+vex-epoch-lease: $(VEX_EPOCH_LEASE_BIN)
+
 vex/meta-mysql-probe.o: vex/meta-mysql.c vex/meta-mysql.h
 	$(QUIET_CC)if test -z "$(VEX_MYSQL_CFLAGS)" || test -z "$(VEX_MYSQL_LIBS)"; then \
 		echo >&2 "Vex MySQL probe requires pkg-config mysqlclient or mysql_config"; \
@@ -3107,12 +3112,20 @@ t/vex/mysql-metadata-probe.o: t/vex/mysql-metadata-probe.c vex/meta-mysql.h
 t/vex/vex-sweep-plan.o: t/vex/vex-sweep-plan.c vex/store.h odb/source-vex.h FORCE
 	$(QUIET_CC)$(CC) $(ALL_CFLAGS) -c -o $@ $<
 
+t/vex/vex-epoch-lease.o: t/vex/vex-epoch-lease.c vex/store.h vex/blob-s3.h FORCE
+	$(QUIET_CC)$(CC) $(ALL_CFLAGS) -c -o $@ $<
+
 $(VEX_MYSQL_PROBE_BIN): $(VEX_MYSQL_PROBE_OBJS)
 	$(call mkdir_p_parent_template)
 	$(QUIET_LINK)$(CC) $(ALL_CFLAGS) $(ALL_LDFLAGS) -o $@ \
 		$(VEX_MYSQL_PROBE_OBJS) $(VEX_MYSQL_LIBS)
 
 $(VEX_SWEEP_PLAN_BIN): $(VEX_SWEEP_PLAN_OBJS) $(GITLIBS) GIT-LDFLAGS
+	$(call mkdir_p_parent_template)
+	$(QUIET_LINK)$(CC) $(ALL_CFLAGS) -o $@ $(ALL_LDFLAGS) \
+		$(filter %.o,$^) $(filter %.a,$^) $(LIBS)
+
+$(VEX_EPOCH_LEASE_BIN): $(VEX_EPOCH_LEASE_OBJS) $(GITLIBS) GIT-LDFLAGS
 	$(call mkdir_p_parent_template)
 	$(QUIET_LINK)$(CC) $(ALL_CFLAGS) -o $@ $(ALL_LDFLAGS) \
 		$(filter %.o,$^) $(filter %.a,$^) $(LIBS)
@@ -3990,7 +4003,8 @@ clean: profile-clean coverage-clean cocciclean
 	$(RM) po/git.pot po/git-core.pot
 	$(RM) git.rc git.res
 	$(RM) $(OBJECTS)
-	$(RM) $(VEX_MYSQL_PROBE_OBJS) $(VEX_MYSQL_PROBE_BIN) VEX-MYSQL-BUILD
+	$(RM) $(VEX_MYSQL_PROBE_OBJS) $(VEX_MYSQL_PROBE_BIN) \
+		$(VEX_EPOCH_LEASE_OBJS) $(VEX_EPOCH_LEASE_BIN) VEX-MYSQL-BUILD
 	$(RM) headless-git.o
 	$(RM) $(LIB_FILE)
 	$(RM) $(ALL_PROGRAMS) $(SCRIPT_LIB) $(BUILT_INS) $(OTHER_PROGRAMS)

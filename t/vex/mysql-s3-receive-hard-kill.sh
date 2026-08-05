@@ -165,9 +165,9 @@ run_id="$(date +%s)-$$"
 run_fault_point() {
 	local point=$1
 	local slug repo_name origin repository_uri repo_id client tip tip_mysql verifier
-	local baseline_published baseline_objects baseline_claims baseline_open
+	local baseline_published baseline_objects baseline_claims baseline_open baseline_heartbeats
 	local baseline_aborted baseline_audit baseline_final baseline_staging
-	local ref_rows published objects claims open aborted audit tip_rows
+	local ref_rows published objects claims open heartbeat_rows aborted audit tip_rows
 	local final_after_fault staging_after_fault final_after_recovery staging_after_recovery
 	local remote_tip published_after_retry fault_env recovery_env
 
@@ -190,6 +190,7 @@ run_fault_point() {
 	baseline_objects=$(mysql_query "SELECT COUNT(*) FROM objects WHERE repo_id = UNHEX('$repo_id');")
 	baseline_claims=$(mysql_query "SELECT COUNT(*) FROM generation_objects WHERE repo_id = UNHEX('$repo_id');")
 	baseline_open=$(mysql_query "SELECT COUNT(*) FROM generations WHERE repo_id = UNHEX('$repo_id') AND state = 'open';")
+	baseline_heartbeats=$(mysql_query "SELECT COUNT(*) FROM generations WHERE repo_id = UNHEX('$repo_id') AND state = 'open' AND receive_heartbeat_at IS NOT NULL;")
 	baseline_aborted=$(mysql_query "SELECT COUNT(*) FROM generations WHERE repo_id = UNHEX('$repo_id') AND state = 'aborted';")
 	baseline_audit=$(mysql_query "SELECT COUNT(*) FROM ref_updates WHERE repo_id = UNHEX('$repo_id');")
 	baseline_final=$(minio_prefix_count "git/v1/$repo_id/objects/")
@@ -226,6 +227,7 @@ run_fault_point() {
 	objects=$(mysql_query "SELECT COUNT(*) FROM objects WHERE repo_id = UNHEX('$repo_id');")
 	claims=$(mysql_query "SELECT COUNT(*) FROM generation_objects WHERE repo_id = UNHEX('$repo_id');")
 	open=$(mysql_query "SELECT COUNT(*) FROM generations WHERE repo_id = UNHEX('$repo_id') AND state = 'open';")
+	heartbeat_rows=$(mysql_query "SELECT COUNT(*) FROM generations WHERE repo_id = UNHEX('$repo_id') AND state = 'open' AND receive_heartbeat_at IS NOT NULL;")
 	audit=$(mysql_query "SELECT COUNT(*) FROM ref_updates WHERE repo_id = UNHEX('$repo_id');")
 	tip_rows=$(mysql_query "SELECT COUNT(*) FROM objects WHERE repo_id = UNHEX('$repo_id') AND oid = UNHEX('$tip_mysql');")
 	assert_equal 0 "$ref_rows" "$point failed receive main ref rows"
@@ -233,6 +235,10 @@ run_fault_point() {
 	assert_equal "$baseline_audit" "$audit" "$point failed receive audit rows"
 	[ "$open" -gt "$baseline_open" ] || {
 		printf 'vex hard-kill E2E: %s did not leave an open receive epoch\n' "$point" >&2
+		return 1
+	}
+	[ "$heartbeat_rows" -gt "$baseline_heartbeats" ] || {
+		printf 'vex hard-kill E2E: %s did not leave a durable receive heartbeat\n' "$point" >&2
 		return 1
 	}
 	[ "$objects" -gt "$baseline_objects" ] || {
@@ -266,7 +272,7 @@ run_fault_point() {
 		;;
 	esac
 
-	# Let the durable creation time pass the configured one-second grace, then
+	# Let the last durable heartbeat pass the configured one-second grace, then
 	# restart the real gateway. A normal stock read activates recovery for this
 	# repository; the next receive runs only after that override is removed.
 	sleep 2
@@ -281,6 +287,7 @@ run_fault_point() {
 	objects=$(mysql_query "SELECT COUNT(*) FROM objects WHERE repo_id = UNHEX('$repo_id');")
 	claims=$(mysql_query "SELECT COUNT(*) FROM generation_objects WHERE repo_id = UNHEX('$repo_id');")
 	open=$(mysql_query "SELECT COUNT(*) FROM generations WHERE repo_id = UNHEX('$repo_id') AND state = 'open';")
+	heartbeat_rows=$(mysql_query "SELECT COUNT(*) FROM generations WHERE repo_id = UNHEX('$repo_id') AND state = 'open' AND receive_heartbeat_at IS NOT NULL;")
 	aborted=$(mysql_query "SELECT COUNT(*) FROM generations WHERE repo_id = UNHEX('$repo_id') AND state = 'aborted';")
 	audit=$(mysql_query "SELECT COUNT(*) FROM ref_updates WHERE repo_id = UNHEX('$repo_id');")
 	final_after_recovery=$(minio_prefix_count "git/v1/$repo_id/objects/")
@@ -290,6 +297,7 @@ run_fault_point() {
 	assert_equal "$baseline_objects" "$objects" "$point recovered object rows"
 	assert_equal "$baseline_claims" "$claims" "$point recovered generation claims"
 	assert_equal "$baseline_open" "$open" "$point recovered open epochs"
+	assert_equal "$baseline_heartbeats" "$heartbeat_rows" "$point recovered active heartbeats"
 	assert_equal "$((baseline_aborted + 1))" "$aborted" "$point recovered aborted epochs"
 	assert_equal "$baseline_audit" "$audit" "$point recovered audit rows"
 	assert_equal "$baseline_final" "$final_after_recovery" "$point recovered final S3 object count"

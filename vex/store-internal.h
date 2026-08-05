@@ -8,6 +8,8 @@
 #include "vex/meta-mysql.h"
 #include "lockfile.h"
 
+#include <time.h>
+
 struct vex_meta_fs;
 struct vex_blob_fs;
 
@@ -25,6 +27,12 @@ struct vex_meta_epoch {
 	char *push_id;
 	/* MySQL state snapshots preserve this so crash TTLs never reset on save. */
 	char *created_at;
+	/*
+	 * A live receive worker advances this durable activity timestamp.  Stale
+	 * epoch recovery must age this value rather than the allocation time so a
+	 * large, continuously receiving push is not mistaken for a dead worker.
+	 */
+	char *receive_heartbeat_at;
 	/* The sealed-generation grace must survive normal state rewrites too. */
 	char *sealed_at;
 };
@@ -118,6 +126,8 @@ struct vex_epoch {
 	int active;
 	/* An attached child must never compensate its parent's durable epoch. */
 	int owner;
+	/* Local throttle only; MySQL is the durable heartbeat authority. */
+	time_t last_heartbeat;
 };
 
 struct vex_ref_transaction {

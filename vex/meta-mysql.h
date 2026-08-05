@@ -172,6 +172,15 @@ int vex_meta_mysql_state_for_each_expired_open_locked(
 		vex_meta_mysql_generation_iter_fn fn, void *cb_data);
 
 /*
+ * Advance an open receive epoch's durable activity timestamp.  The caller
+ * must own vex_meta_mysql_state_lock() for this repository; that prevents a
+ * concurrent state-snapshot rewrite from losing the heartbeat.
+ */
+int vex_meta_mysql_state_refresh_receive_heartbeat_locked(
+		struct vex_meta_mysql *db, const char *repo_id,
+		uint64_t generation);
+
+/*
  * These destructive-sweep methods are valid only while the normal state
  * transaction owns the repository row.  MySQL server time is the authority
  * for both generation age and the tombstone delay.

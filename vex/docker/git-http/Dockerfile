@@ -20,7 +20,7 @@ RUN apt-get update \
 WORKDIR /src
 COPY . .
 RUN make -j"$(nproc)" VEX_MYSQL=YesPlease NO_RUST=YesPlease NO_TCLTK=YesPlease NO_PERL=YesPlease \
-	git git-http-backend vex-sweep-plan
+	git git-http-backend vex-sweep-plan vex-epoch-lease
 
 FROM debian:bookworm-slim
 
@@ -39,6 +39,7 @@ RUN apt-get update \
 COPY --from=vex-git-build /src/git /opt/vex-git/git
 COPY --from=vex-git-build /src/git-http-backend /opt/vex-git/git-http-backend
 COPY --from=vex-git-build /src/t/vex/bin/vex-sweep-plan /opt/vex-git/vex-sweep-plan
+COPY --from=vex-git-build /src/t/vex/bin/vex-epoch-lease /opt/vex-git/vex-epoch-lease
 COPY vex/docker/git-http/entrypoint.sh /usr/local/bin/vex-git-http-entrypoint
 COPY vex/docker/git-http/bootstrap_http.py /usr/local/lib/vex-git-http/bootstrap_http.py
 COPY vex/docker/git-http/vex_mysql_s3_http.py /usr/local/lib/vex-git-http/vex_mysql_s3_http.py

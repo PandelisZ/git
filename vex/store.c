@@ -871,6 +871,58 @@ static unsigned int vex_epoch_recovery_seconds(void)
 	return VEX_EPOCH_RECOVERY_SECONDS;
 }
 
+/*
+ * A live receiver updates MySQL at most this often.  Keep the refresh well
+ * inside the configured recovery grace, while bounding metadata traffic on a
+ * large pack import which stages hundreds of thousands of objects.
+ */
+static unsigned int vex_epoch_heartbeat_interval_seconds(void)
+{
+	unsigned int interval = vex_epoch_recovery_seconds() / 4;
+
+	if (!interval)
+		return 1;
+	return interval > 30 ? 30 : interval;
+}
+
+static int vex_epoch_heartbeat_now(struct vex_epoch *epoch, int force)
+{
+	struct vex_store *store;
+	struct vex_meta_lock lock;
+	time_t now;
+	unsigned int interval;
+	int ret;
+
+	if (!epoch || !epoch->active || !epoch->store)
+		return VEX_STORE_ERR_STATE;
+	store = epoch->store;
+	if (store->backend != VEX_STORE_BACKEND_MYSQL_S3)
+		return VEX_STORE_OK;
+	now = time(NULL);
+	interval = vex_epoch_heartbeat_interval_seconds();
+	if (!force && epoch->last_heartbeat && now != (time_t)-1 &&
+	    now >= epoch->last_heartbeat &&
+	    (uintmax_t)(now - epoch->last_heartbeat) < interval)
+		return VEX_STORE_OK;
+	if ((ret = meta_lock(store, &lock)))
+		return ret;
+	ret = meta_mysql_result(
+		vex_meta_mysql_state_refresh_receive_heartbeat_locked(
+			store->meta_mysql, store->repo_id, epoch->id));
+	if (!ret)
+		ret = meta_commit_locked(store, &lock);
+	if (lock.held)
+		meta_unlock(store, &lock);
+	if (!ret && now != (time_t)-1)
+		epoch->last_heartbeat = now;
+	return ret;
+}
+
+int vex_epoch_heartbeat(struct vex_epoch *epoch)
+{
+	return vex_epoch_heartbeat_now(epoch, 0);
+}
+
 static void vex_test_kill_at(const char *point)
 {
 	const char *value = getenv("GIT_VEX_TEST_KILL_AT");
@@ -946,6 +998,8 @@ static int index_commit_parents(struct vex_store *store, struct vex_epoch *epoch
 	size_t i;
 	int ret;
 
+	if ((ret = vex_epoch_heartbeat(epoch)))
+		return ret;
 	if ((ret = parse_commit_parents(store, data, size, &parents, &parents_nr)))
 		return ret;
 	if (!parents_nr) {
@@ -1151,6 +1205,7 @@ int vex_epoch_allocate(struct vex_store *store, const char *push_id,
 
 	if (!store || !epoch_out)
 		return VEX_STORE_ERR_INVALID;
+	*epoch_out = NULL;
 	if ((ret = vex_repo_ensure(store)) || (ret = load_locked(store, &lock, &state)))
 		return ret;
 	ALLOC_GROW(state.epochs, state.epochs_nr + 1, state.epochs_alloc);
@@ -1159,6 +1214,7 @@ int vex_epoch_allocate(struct vex_store *store, const char *push_id,
 	meta_epoch->state = VEX_EPOCH_OPEN;
 	meta_epoch->push_id = push_id ? xstrdup(push_id) : NULL;
 	meta_epoch->created_at = NULL;
+	meta_epoch->receive_heartbeat_at = NULL;
 	meta_epoch->sealed_at = NULL;
 	ret = meta_save_locked(store, &lock, &state);
 	if (ret) {
@@ -1170,6 +1226,13 @@ int vex_epoch_allocate(struct vex_store *store, const char *push_id,
 	epoch->id = meta_epoch->id;
 	epoch->active = 1;
 	epoch->owner = 1;
+	ret = vex_epoch_heartbeat_now(epoch, 1);
+	if (ret) {
+		/* The unleased open epoch is safe only if recovery can reclaim it. */
+		vex_epoch_free(epoch);
+		vex_meta_state_release(&state);
+		return ret;
+	}
 	*epoch_out = epoch;
 	vex_meta_state_release(&state);
 	return VEX_STORE_OK;
@@ -1203,6 +1266,12 @@ int vex_epoch_attach(struct vex_store *store, uint64_t epoch_id,
 	epoch->id = epoch_id;
 	epoch->active = 1;
 	epoch->owner = 0;
+	ret = vex_epoch_heartbeat_now(epoch, 1);
+	if (ret) {
+		vex_epoch_detach(epoch);
+		*epoch_out = NULL;
+		goto out;
+	}
 	*epoch_out = epoch;
 	ret = VEX_STORE_OK;
 out:
@@ -1230,6 +1299,8 @@ int vex_epoch_seal(struct vex_epoch *epoch)
 	if (!epoch || !epoch->active)
 		return VEX_STORE_ERR_STATE;
 	store = epoch->store;
+	if ((ret = vex_epoch_heartbeat(epoch)))
+		return ret;
 	if ((ret = load_locked(store, &lock, &state)))
 		return ret;
 	meta_epoch = find_epoch(&state, epoch->id);
@@ -1317,6 +1388,8 @@ int vex_blob_put_staging(struct vex_store *store, struct vex_epoch *epoch,
 
 	if ((ret = check_epoch(store, epoch)) || !oid)
 		return ret ? ret : VEX_STORE_ERR_INVALID;
+	if ((ret = vex_epoch_heartbeat(epoch)))
+		return ret;
 	if ((ret = verify_object(store, oid, type, data, size)))
 		return ret;
 	if ((ret = load_locked(store, &lock, &state)))
@@ -1342,6 +1415,8 @@ int vex_blob_promote(struct vex_store *store, struct vex_epoch *epoch)
 	int ret;
 
 	if ((ret = check_epoch(store, epoch)))
+		return ret;
+	if ((ret = vex_epoch_heartbeat(epoch)))
 		return ret;
 	if ((ret = load_locked(store, &lock, &state)))
 		return ret;
@@ -1384,6 +1459,8 @@ int vex_object_index_put_quarantine(struct vex_store *store,
 
 	if ((ret = check_epoch(store, epoch)) || !oid || !valid_object_type(type))
 		return ret ? ret : VEX_STORE_ERR_INVALID;
+	if ((ret = vex_epoch_heartbeat(epoch)))
+		return ret;
 	if ((ret = blob_available_for_epoch(store, epoch->id, oid)))
 		return ret;
 	if ((ret = load_locked(store, &lock, &state)))
@@ -1418,6 +1495,8 @@ int vex_object_index_publish(struct vex_store *store, struct vex_epoch *epoch)
 	int ret;
 
 	if ((ret = check_epoch(store, epoch)))
+		return ret;
+	if ((ret = vex_epoch_heartbeat(epoch)))
 		return ret;
 	if ((ret = load_locked(store, &lock, &state)))
 		return ret;
@@ -1553,8 +1632,12 @@ int vex_store_read_object_in_epoch(struct vex_store *store,
 			   const struct vex_epoch *epoch, const struct object_id *oid,
 			   enum object_type *type, unsigned long *size, void **data)
 {
-	if (check_epoch(store, epoch))
-		return VEX_STORE_ERR_STATE;
+	int ret;
+
+	if ((ret = check_epoch(store, epoch)))
+		return ret;
+	if ((ret = vex_epoch_heartbeat((struct vex_epoch *)epoch)))
+		return ret;
 	return read_object(store, epoch, oid, type, size, data);
 }
 
@@ -2629,6 +2712,8 @@ int vex_ref_transaction_begin(struct vex_store *store, struct vex_epoch *epoch,
 		return VEX_STORE_ERR_INVALID;
 	if ((ret = check_epoch(store, epoch)))
 		return ret;
+	if ((ret = vex_epoch_heartbeat(epoch)))
+		return ret;
 	CALLOC_ARRAY(transaction, 1);
 	transaction->store = store;
 	transaction->epoch = epoch;
@@ -2646,6 +2731,8 @@ int vex_ref_transaction_update(struct vex_ref_transaction *transaction,
 	if (!transaction || transaction->committed)
 		return VEX_STORE_ERR_STATE;
 	if ((ret = check_epoch(transaction->store, transaction->epoch)))
+		return ret;
+	if ((ret = vex_epoch_heartbeat(transaction->epoch)))
 		return ret;
 	if ((ret = ref_update_valid(update)))
 		return ret;
@@ -2674,6 +2761,7 @@ int vex_ref_transaction_commit(struct vex_ref_transaction *transaction)
 	store = transaction->store;
 	epoch = transaction->epoch;
 	if ((ret = check_epoch(store, epoch)) ||
+	    (ret = vex_epoch_heartbeat(epoch)) ||
 	    (ret = load_locked(store, &lock, &state)))
 		return ret;
 	meta_epoch = find_epoch(&state, epoch->id);

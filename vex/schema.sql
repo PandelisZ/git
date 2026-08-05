@@ -18,8 +18,12 @@ CREATE TABLE IF NOT EXISTS generations (
 	push_id BINARY(16) NULL,
 	created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
 	expires_at DATETIME(6) NULL,
+	-- A live receive worker advances this lease; recovery falls back to
+	-- created_at only for legacy rows which predate the heartbeat column.
+	receive_heartbeat_at DATETIME(6) NULL,
 	sealed_at DATETIME(6) NULL,
 	PRIMARY KEY (repo_id, generation),
+	KEY generations_open_heartbeat (repo_id, state, receive_heartbeat_at),
 	CONSTRAINT generations_repo_fk FOREIGN KEY (repo_id)
 		REFERENCES repositories (repo_id)
 ) ENGINE=InnoDB;

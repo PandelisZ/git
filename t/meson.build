@@ -274,6 +274,7 @@ integration_tests = [
   't1526-vex-compose-mysql-s3-precomputed-pack.sh',
   't1527-vex-compose-mysql-s3-streaming-http.sh',
   't1528-vex-compose-mysql-s3-sweep.sh',
+  't1529-vex-compose-mysql-s3-receive-heartbeat.sh',
   't1600-index.sh',
   't1601-index-bogus.sh',
   't1700-split-index.sh',

@@ -163,6 +163,16 @@ int vex_meta_mysql_state_for_each_expired_open_locked(
 	return mysql_unavailable();
 }
 
+int vex_meta_mysql_state_refresh_receive_heartbeat_locked(
+		struct vex_meta_mysql *db, const char *repo_id,
+		uint64_t generation)
+{
+	(void)db;
+	(void)repo_id;
+	(void)generation;
+	return mysql_unavailable();
+}
+
 int vex_meta_mysql_state_for_each_expired_sealed_locked(
 		struct vex_meta_mysql *db, const char *repo_id,
 		unsigned int min_age_seconds,
@@ -1116,6 +1126,55 @@ static int ensure_sweep_tombstones_table(struct vex_meta_mysql *db)
 	return mysql_exec(db, create_sql);
 }
 
+/*
+ * Existing Compose volumes predate live receive heartbeats.  Keep this
+ * additive migration here as well as schema.sql so a normal gateway restart
+ * gains the protection without resetting durable repository metadata.
+ */
+static int ensure_generations_receive_heartbeat_column(struct vex_meta_mysql *db)
+{
+	static const char column_sql[] =
+		"SELECT COUNT(*) FROM information_schema.columns "
+		"WHERE table_schema = DATABASE() AND table_name = 'generations' "
+		"AND column_name = 'receive_heartbeat_at'";
+	static const char index_sql[] =
+		"SELECT COUNT(DISTINCT index_name) FROM information_schema.statistics "
+		"WHERE table_schema = DATABASE() AND table_name = 'generations' "
+		"AND index_name = 'generations_open_heartbeat'";
+	static const char alter_sql[] =
+		"ALTER TABLE generations ADD COLUMN IF NOT EXISTS "
+		"receive_heartbeat_at DATETIME(6) NULL AFTER expires_at";
+	static const char add_index_sql[] =
+		"ALTER TABLE generations ADD INDEX IF NOT EXISTS "
+		"generations_open_heartbeat (repo_id, state, receive_heartbeat_at)";
+	uint64_t columns;
+	uint64_t indexes;
+	int found;
+	int ret;
+
+	ret = query_one_u64(db, column_sql, &columns, &found);
+	if (ret)
+		return ret;
+	if (!found || columns > 1)
+		return set_error(db, VEX_META_MYSQL_ERR_SCHEMA,
+				 "invalid Vex generations heartbeat schema");
+	if (columns == 1)
+		ret = VEX_META_MYSQL_OK;
+	else
+		ret = mysql_exec(db, alter_sql);
+	if (ret)
+		return ret;
+	ret = query_one_u64(db, index_sql, &indexes, &found);
+	if (ret)
+		return ret;
+	if (!found || indexes > 1)
+		return set_error(db, VEX_META_MYSQL_ERR_SCHEMA,
+				 "invalid Vex generations heartbeat index");
+	if (indexes == 1)
+		return VEX_META_MYSQL_OK;
+	return mysql_exec(db, add_index_sql);
+}
+
 int vex_meta_mysql_schema_check(struct vex_meta_mysql *db,
 				unsigned int *table_count)
 {
@@ -1130,13 +1189,21 @@ int vex_meta_mysql_schema_check(struct vex_meta_mysql *db,
 		"SELECT COUNT(*) FROM information_schema.columns "
 		"WHERE table_schema = DATABASE() AND table_name = 'objects' "
 		"AND column_name = 'blob_key' AND data_type = 'varbinary'";
+	static const char heartbeat_sql[] =
+		"SELECT COUNT(*) FROM information_schema.columns "
+		"WHERE table_schema = DATABASE() AND table_name = 'generations' "
+		"AND column_name = 'receive_heartbeat_at' AND data_type = 'datetime'";
 	uint64_t tables;
 	uint64_t blob_key;
+	uint64_t heartbeat;
 	int found;
 	int ret;
 
 	if (!db || !db->mysql)
 		return VEX_META_MYSQL_ERR_INVALID;
+	ret = ensure_generations_receive_heartbeat_column(db);
+	if (ret)
+		return ret;
 	ret = ensure_clone_leases_table(db);
 	if (ret)
 		return ret;
@@ -1162,6 +1229,12 @@ int vex_meta_mysql_schema_check(struct vex_meta_mysql *db,
 	if (!found || blob_key != 1)
 		return set_error(db, VEX_META_MYSQL_ERR_SCHEMA,
 				 "objects.blob_key is not VARBINARY metadata");
+	ret = query_one_u64(db, heartbeat_sql, &heartbeat, &found);
+	if (ret)
+		return ret;
+	if (!found || heartbeat != 1)
+		return set_error(db, VEX_META_MYSQL_ERR_SCHEMA,
+				 "generations.receive_heartbeat_at is not durable datetime metadata");
 	ret = ensure_ref_updates_id_index(db);
 	if (ret)
 		return ret;
@@ -1550,9 +1623,13 @@ int vex_meta_mysql_state_for_each_expired_open_locked(
 		goto out;
 	}
 	sql = vex_format("SELECT generation FROM generations WHERE repo_id = %s "
-			 "AND state = 'open' AND created_at <= "
-			 "DATE_SUB(CURRENT_TIMESTAMP(6), INTERVAL %u SECOND) "
-			 "ORDER BY generation FOR UPDATE", repo, min_age_seconds);
+			 "AND state = 'open' AND ("
+			 "(receive_heartbeat_at IS NOT NULL AND receive_heartbeat_at <= "
+			 "DATE_SUB(CURRENT_TIMESTAMP(6), INTERVAL %u SECOND)) OR "
+			 "(receive_heartbeat_at IS NULL AND created_at <= "
+			 "DATE_SUB(CURRENT_TIMESTAMP(6), INTERVAL %u SECOND))) "
+			 "ORDER BY generation FOR UPDATE", repo, min_age_seconds,
+			 min_age_seconds);
 	if (!sql) {
 		ret = set_error(db, VEX_META_MYSQL_ERR_NOMEM,
 				"could not allocate expired Vex epoch query");
@@ -1607,6 +1684,41 @@ out:
 	if (res)
 		mysql_free_result(res);
 	free(generations);
+	free(sql);
+	free(repo);
+	return ret;
+}
+
+int vex_meta_mysql_state_refresh_receive_heartbeat_locked(
+		struct vex_meta_mysql *db, const char *repo_id,
+		uint64_t generation)
+{
+	char *repo = NULL;
+	char *sql = NULL;
+	int ret;
+
+	if (!db || !db->mysql || !db->state_transaction || !generation)
+		return VEX_META_MYSQL_ERR_INVALID;
+	repo = sql_repo_literal(repo_id, NULL);
+	if (!repo)
+		return set_error(db, VEX_META_MYSQL_ERR_INVALID,
+				 "invalid Vex repository UUID");
+	sql = vex_format("UPDATE generations SET receive_heartbeat_at = "
+			 "CURRENT_TIMESTAMP(6) WHERE repo_id = %s "
+			 "AND generation = %" PRIu64 " AND state = 'open'",
+			 repo, generation);
+	if (!sql) {
+		ret = set_error(db, VEX_META_MYSQL_ERR_NOMEM,
+				"could not allocate receive heartbeat update query");
+		goto out;
+	}
+	ret = mysql_exec(db, sql);
+	if (ret)
+		goto out;
+	if (mysql_affected_rows(db->mysql) != 1)
+		ret = set_error(db, VEX_META_MYSQL_ERR_STATE,
+				"cannot heartbeat a missing or non-open Vex generation");
+out:
 	free(sql);
 	free(repo);
 	return ret;
@@ -3353,6 +3465,7 @@ static int state_load_epochs(struct vex_meta_mysql *db, const char *repo,
 
 	sql = vex_format("SELECT generation, state, push_id, "
 			 "DATE_FORMAT(created_at, '%%Y-%%m-%%d %%H:%%i:%%s.%%f'), "
+			 "DATE_FORMAT(receive_heartbeat_at, '%%Y-%%m-%%d %%H:%%i:%%s.%%f'), "
 			 "DATE_FORMAT(sealed_at, '%%Y-%%m-%%d %%H:%%i:%%s.%%f') "
 			 "FROM generations "
 			 "WHERE repo_id = %s ORDER BY generation", repo);
@@ -3374,6 +3487,7 @@ static int state_load_epochs(struct vex_meta_mysql *db, const char *repo,
 		    parse_epoch_state(row[1], &epoch_state) ||
 		    (row[2] && lengths[2] != 16) || !lengths[3] ||
 		    lengths[3] > 32 || (row[4] && lengths[4] > 32) ||
+		    (row[5] && lengths[5] > 32) ||
 		    id == UINT64_MAX) {
 			ret = set_error(db, VEX_META_MYSQL_ERR,
 					"MySQL returned invalid Vex generation metadata");
@@ -3385,13 +3499,20 @@ static int state_load_epochs(struct vex_meta_mysql *db, const char *repo,
 		epoch->state = (enum vex_epoch_state)epoch_state;
 		epoch->push_id = state_row_uuid(row[2], row[2] ? lengths[2] : 0);
 		epoch->created_at = state_row_text(row[3], lengths[3]);
-		epoch->sealed_at = row[4] ? state_row_text(row[4], lengths[4]) : NULL;
+		epoch->receive_heartbeat_at = row[4] ?
+			state_row_text(row[4], lengths[4]) : NULL;
+		epoch->sealed_at = row[5] ? state_row_text(row[5], lengths[5]) : NULL;
 		if ((row[2] && !epoch->push_id) || !epoch->created_at) {
 			ret = set_error(db, VEX_META_MYSQL_ERR_NOMEM,
 					"could not allocate Vex generation push id");
 			goto out;
 		}
-		if (row[4] && !epoch->sealed_at) {
+		if (row[4] && !epoch->receive_heartbeat_at) {
+			ret = set_error(db, VEX_META_MYSQL_ERR_NOMEM,
+					"could not allocate Vex generation heartbeat timestamp");
+			goto out;
+		}
+		if (row[5] && !epoch->sealed_at) {
 			ret = set_error(db, VEX_META_MYSQL_ERR_NOMEM,
 					"could not allocate Vex generation seal timestamp");
 			goto out;
@@ -4408,6 +4529,8 @@ static int state_insert_epochs(struct vex_meta_mysql *db, const char *repo,
 		char *created_at = epoch->created_at ?
 			sql_quote(db, epoch->created_at) :
 			vex_strdup("CURRENT_TIMESTAMP(6)");
+		char *heartbeat_at = epoch->receive_heartbeat_at ?
+			sql_quote(db, epoch->receive_heartbeat_at) : vex_strdup("NULL");
 		char *sealed_at = epoch->state == VEX_EPOCH_OPEN ?
 			vex_strdup("NULL") :
 			(epoch->sealed_at ? sql_quote(db, epoch->sealed_at) :
@@ -4415,19 +4538,23 @@ static int state_insert_epochs(struct vex_meta_mysql *db, const char *repo,
 		char *sql;
 		int ret;
 
-		if (!epoch->id || !name || !push || !created_at || !sealed_at) {
+		if (!epoch->id || !name || !push || !created_at || !heartbeat_at ||
+		    !sealed_at) {
 			free(sealed_at);
+			free(heartbeat_at);
 			free(created_at);
 			free(push);
 			return set_error(db, VEX_META_MYSQL_ERR_INVALID,
 					 "invalid Vex epoch state");
 		}
 		sql = vex_format("INSERT INTO generations "
-				 "(repo_id, generation, state, push_id, created_at, sealed_at) VALUES "
-				 "(%s, %" PRIu64 ", '%s', %s, %s, %s)",
+				 "(repo_id, generation, state, push_id, created_at, "
+				 "receive_heartbeat_at, sealed_at) VALUES "
+				 "(%s, %" PRIu64 ", '%s', %s, %s, %s, %s)",
 				 repo, epoch->id, name, push,
-				 created_at, sealed_at);
+				 created_at, heartbeat_at, sealed_at);
 		free(sealed_at);
+		free(heartbeat_at);
 		free(created_at);
 		free(push);
 		if (!sql)
@@ -4797,6 +4924,16 @@ int vex_meta_mysql_state_lock(struct vex_meta_mysql *db, const char *repo_id)
 void vex_meta_mysql_state_unlock(struct vex_meta_mysql *db)
 {
 	(void)db;
+}
+
+int vex_meta_mysql_state_refresh_receive_heartbeat_locked(
+		struct vex_meta_mysql *db, const char *repo_id,
+		uint64_t generation)
+{
+	(void)repo_id;
+	(void)generation;
+	return set_error(db, VEX_META_MYSQL_ERR_STATE,
+			 "Vex MySQL store adapter was not compiled into this binary");
 }
 
 int vex_meta_mysql_state_load(struct vex_meta_mysql *db, const char *repo_id,
