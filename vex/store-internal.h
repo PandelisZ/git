@@ -120,6 +120,18 @@ struct vex_store {
 	unsigned int epoch_recovery_checked:1;
 };
 
+/*
+ * Receive-side data held only until the next bounded S3/MySQL append.  It is
+ * process-local by design: a receive helper flushes before its inherited ODB
+ * transaction ends, while the parent sees only durable quarantine metadata.
+ */
+struct vex_pending_stage_object {
+	struct object_id oid;
+	enum object_type type;
+	unsigned long size;
+	void *data;
+};
+
 struct vex_epoch {
 	struct vex_store *store;
 	uint64_t id;
@@ -128,6 +140,11 @@ struct vex_epoch {
 	int owner;
 	/* Local throttle only; MySQL is the durable heartbeat authority. */
 	time_t last_heartbeat;
+	struct vex_pending_stage_object *pending_stages;
+	size_t pending_stages_nr;
+	size_t pending_stages_alloc;
+	size_t pending_stage_bytes;
+	unsigned int flushing_pending_stages:1;
 };
 
 struct vex_ref_transaction {

@@ -92,3 +92,62 @@ void test_vex_blob_s3__minio_put_read_promote_when_requested(void)
 	cl_must_pass(vex_blob_s3_delete_staging(blob, 47001, &oid));
 	vex_blob_s3_close(blob);
 }
+
+void test_vex_blob_s3__minio_parallel_receive_batch_is_all_or_nothing(void)
+{
+	const char *run = getenv("VEX_S3_INTEGRATION");
+	struct vex_blob_s3 *blob;
+	struct object_id oids[2];
+	struct vex_blob_s3_staged_object objects[2];
+	char payloads[2][128];
+	void *read_back;
+	unsigned long size;
+	size_t i;
+
+	if (!run || strcmp(run, "1")) {
+		cl_skip();
+		return;
+	}
+	for (i = 0; i < ARRAY_SIZE(objects); i++) {
+		xsnprintf(payloads[i], sizeof(payloads[i]),
+			  "Vex S3 receive batch payload=%zu pid=%ld\n", i,
+			  (long)getpid());
+		hash_object_file(hash_algo, payloads[i], strlen(payloads[i]),
+				 OBJ_BLOB, &oids[i]);
+		objects[i].oid = &oids[i];
+		objects[i].data = payloads[i];
+		objects[i].size = strlen(payloads[i]);
+	}
+	blob = open_test_blob();
+	cl_must_pass(vex_blob_s3_put_staging_batch(blob, 47002, objects,
+						     ARRAY_SIZE(objects)));
+	for (i = 0; i < ARRAY_SIZE(objects); i++) {
+		cl_must_pass(vex_blob_s3_read_staging(blob, 47002, &oids[i],
+						      &read_back, &size));
+		cl_assert_equal_i(size, objects[i].size);
+		cl_assert_equal_s(read_back, payloads[i]);
+		free(read_back);
+	}
+	cl_must_pass(vex_blob_s3_promote_batch(blob, 47002, oids,
+						ARRAY_SIZE(oids)));
+	for (i = 0; i < ARRAY_SIZE(objects); i++) {
+		cl_assert_equal_i(vex_blob_s3_has_final(blob, &oids[i]), 1);
+		cl_assert_equal_i(vex_blob_s3_read_staging(blob, 47002, &oids[i],
+							    &read_back, &size),
+				  VEX_BLOB_S3_ERR_NOT_FOUND);
+	}
+	vex_blob_s3_close(blob);
+
+	/* One real upload then a synthetic batch failure must leave no staging key. */
+	cl_must_pass(setenv("GIT_VEX_TEST_S3_FAIL_STAGE_BATCH_ONCE", "1", 1));
+	blob = open_test_blob();
+	cl_must_pass(unsetenv("GIT_VEX_TEST_S3_FAIL_STAGE_BATCH_ONCE"));
+	cl_assert_equal_i(vex_blob_s3_put_staging_batch(blob, 47003, objects,
+							   ARRAY_SIZE(objects)),
+			  VEX_BLOB_S3_ERR);
+	for (i = 0; i < ARRAY_SIZE(objects); i++)
+		cl_assert_equal_i(vex_blob_s3_read_staging(blob, 47003, &oids[i],
+							    &read_back, &size),
+				  VEX_BLOB_S3_ERR_NOT_FOUND);
+	vex_blob_s3_close(blob);
+}

@@ -8,6 +8,13 @@
 #include "trace.h"
 #include "wrapper.h"
 
+/*
+ * Bound receive memory and SQL statement size while amortizing S3 process and
+ * connection setup across enough small immutable objects to matter.
+ */
+#define VEX_RECEIVE_STAGE_BATCH_OBJECTS 256
+#define VEX_RECEIVE_STAGE_BATCH_BYTES (32UL * 1024UL * 1024UL)
+
 static int normalize_repo_id(const char *repo_id, struct strbuf *normalized)
 {
 	size_t i;
@@ -512,6 +519,8 @@ static int blob_backend_promote_epoch(struct vex_store *store,
 				      const struct vex_meta_state *state,
 				      uint64_t epoch)
 {
+	struct object_id batch[VEX_RECEIVE_STAGE_BATCH_OBJECTS];
+	size_t batch_nr = 0;
 	size_t i;
 
 	if (store->backend == VEX_STORE_BACKEND_FS)
@@ -521,15 +530,22 @@ static int blob_backend_promote_epoch(struct vex_store *store,
 		return VEX_STORE_ERR_INVALID;
 	for (i = 0; i < state->epoch_objects_nr; i++) {
 		const struct vex_meta_epoch_object *entry = &state->epoch_objects[i];
-		int ret;
 
 		if (entry->epoch != epoch)
 			continue;
-		ret = blob_s3_result(vex_blob_s3_promote_object(store->blob_s3,
-								epoch, &entry->oid));
-		if (ret)
-			return ret;
+		oidcpy(&batch[batch_nr++], &entry->oid);
+		if (batch_nr == ARRAY_SIZE(batch)) {
+			int ret = blob_s3_result(vex_blob_s3_promote_batch(
+				store->blob_s3, epoch, batch, batch_nr));
+
+			if (ret)
+				return ret;
+			batch_nr = 0;
+		}
 	}
+	if (batch_nr)
+		return blob_s3_result(vex_blob_s3_promote_batch(store->blob_s3,
+				epoch, batch, batch_nr));
 	return VEX_STORE_OK;
 }
 
@@ -1025,6 +1041,216 @@ out:
 	return ret;
 }
 
+static void release_pending_stages(struct vex_epoch *epoch)
+{
+	size_t i;
+
+	if (!epoch)
+		return;
+	for (i = 0; i < epoch->pending_stages_nr; i++)
+		free(epoch->pending_stages[i].data);
+	free(epoch->pending_stages);
+	epoch->pending_stages = NULL;
+	epoch->pending_stages_nr = 0;
+	epoch->pending_stages_alloc = 0;
+	epoch->pending_stage_bytes = 0;
+}
+
+struct vex_pending_commit_parent {
+	struct object_id commit_oid;
+	struct object_id parent_oid;
+	unsigned int position;
+};
+
+static int flush_pending_commit_parents(struct vex_store *store,
+					const struct vex_epoch *epoch)
+{
+	struct vex_pending_commit_parent *pending = NULL;
+	size_t pending_nr = 0;
+	size_t pending_alloc = 0;
+	size_t i;
+	int ret = VEX_STORE_OK;
+
+	for (i = 0; i < epoch->pending_stages_nr; i++) {
+		const struct vex_pending_stage_object *object =
+			&epoch->pending_stages[i];
+		struct object_id *parents = NULL;
+		size_t parents_nr = 0;
+		size_t j;
+
+		if (object->type != OBJ_COMMIT)
+			continue;
+		ret = parse_commit_parents(store, object->data, object->size,
+					   &parents, &parents_nr);
+		if (ret) {
+			free(parents);
+			goto out;
+		}
+		for (j = 0; j < parents_nr; j++) {
+			struct vex_pending_commit_parent *entry;
+
+			ALLOC_GROW(pending, pending_nr + 1, pending_alloc);
+			entry = &pending[pending_nr++];
+			oidcpy(&entry->commit_oid, &object->oid);
+			oidcpy(&entry->parent_oid, &parents[j]);
+			entry->position = (unsigned int)j;
+		}
+		free(parents);
+	}
+	for (i = 0; i < pending_nr;) {
+		struct vex_meta_mysql_commit_parent metadata[512];
+		size_t nr = pending_nr - i;
+		size_t j;
+
+		if (nr > ARRAY_SIZE(metadata))
+			nr = ARRAY_SIZE(metadata);
+		for (j = 0; j < nr; j++) {
+			const struct vex_pending_commit_parent *entry = &pending[i + j];
+
+			metadata[j].commit_oid = entry->commit_oid.hash;
+			metadata[j].commit_oid_len = store->hash_algo->rawsz;
+			metadata[j].parent_pos = entry->position;
+			metadata[j].parent_oid = entry->parent_oid.hash;
+			metadata[j].parent_oid_len = store->hash_algo->rawsz;
+		}
+		ret = meta_mysql_result(vex_meta_mysql_stage_commit_parents(
+			store->meta_mysql, store->repo_id, metadata, nr));
+		if (ret)
+			goto out;
+		i += nr;
+	}
+out:
+	free(pending);
+	return ret;
+}
+
+/*
+ * The child `unpack-objects` process calls write_object once per pack entry.
+ * For MySQL+S3, queue bounded copies locally and make them durable in one
+ * transport batch followed by one metadata transaction.  This retains the
+ * receive-pack quarantine boundary: the parent gets only fully staged,
+ * metadata-claimed objects after its child transaction has committed.
+ */
+int vex_store_flush_staged(struct vex_store *store, struct vex_epoch *epoch)
+{
+	struct vex_blob_s3_staged_object *blobs = NULL;
+	struct vex_meta_mysql_staged_object *metadata = NULL;
+	char **keys = NULL;
+	size_t stages_nr;
+	size_t i;
+	int staged_to_s3 = 0;
+	int ret;
+
+	if ((ret = check_epoch(store, epoch)))
+		return ret;
+	if (store->backend != VEX_STORE_BACKEND_MYSQL_S3 ||
+	    !epoch->pending_stages_nr)
+		return VEX_STORE_OK;
+	if (epoch->flushing_pending_stages)
+		return VEX_STORE_ERR_STATE;
+	if ((ret = vex_epoch_heartbeat(epoch)))
+		return ret;
+	stages_nr = epoch->pending_stages_nr;
+	epoch->flushing_pending_stages = 1;
+	CALLOC_ARRAY(blobs, stages_nr);
+	CALLOC_ARRAY(metadata, stages_nr);
+	CALLOC_ARRAY(keys, stages_nr);
+	for (i = 0; i < stages_nr; i++) {
+		struct vex_pending_stage_object *object = &epoch->pending_stages[i];
+		struct strbuf key = STRBUF_INIT;
+
+		blobs[i].oid = &object->oid;
+		blobs[i].data = object->data;
+		blobs[i].size = object->size;
+		if ((ret = vex_blob_key(store, &object->oid, &key))) {
+			strbuf_release(&key);
+			goto out;
+		}
+		keys[i] = strbuf_detach(&key, NULL);
+		metadata[i].oid = object->oid.hash;
+		metadata[i].oid_len = store->hash_algo->rawsz;
+		metadata[i].object_type = object->type;
+		metadata[i].size = object->size;
+		metadata[i].blob_key = keys[i];
+	}
+	ret = blob_s3_result(vex_blob_s3_put_staging_batch(
+		store->blob_s3, epoch->id, blobs, stages_nr));
+	if (ret)
+		goto out;
+	staged_to_s3 = 1;
+	ret = meta_mysql_result(vex_meta_mysql_stage_objects(
+		store->meta_mysql, store->repo_id, epoch->id, metadata,
+		stages_nr));
+	if (ret)
+		goto out;
+	/*
+	 * The batch is now durably claimed by the epoch.  If parsing or writing
+	 * commit-parent edges fails below, leave its staging keys for the normal
+	 * epoch compensation path, which removes both the claims and their blobs.
+	 * That avoids making an in-process retry observe metadata whose staging
+	 * object we deleted here.
+	 */
+	staged_to_s3 = 0;
+	ret = flush_pending_commit_parents(store, epoch);
+	if (ret)
+		goto out;
+	release_pending_stages(epoch);
+out:
+	if (ret && staged_to_s3) {
+		/* The metadata transaction rolled back; remove this unknown batch. */
+		for (i = 0; i < stages_nr; i++)
+			(void)vex_blob_s3_delete_staging(store->blob_s3, epoch->id,
+						 &epoch->pending_stages[i].oid);
+	}
+	for (i = 0; keys && i < stages_nr; i++)
+		free(keys[i]);
+	free(keys);
+	free(metadata);
+	free(blobs);
+	epoch->flushing_pending_stages = 0;
+	return ret;
+}
+
+static int queue_mysql_s3_stage(struct vex_store *store,
+				struct vex_epoch *epoch, const struct object_id *oid,
+				enum object_type type, const void *data,
+				unsigned long size)
+{
+	struct vex_pending_stage_object *object;
+	size_t i;
+	int ret;
+
+	if ((ret = check_epoch(store, epoch)) || !oid)
+		return ret ? ret : VEX_STORE_ERR_INVALID;
+	if ((ret = vex_epoch_heartbeat(epoch)) ||
+	    (ret = verify_object(store, oid, type, data, size)))
+		return ret;
+	/*
+	 * A received pack can repeat an already-seen object.  The old per-object
+	 * path treated that as an idempotent staging overwrite, so retain that
+	 * behavior without giving the SQL batch duplicate primary keys.
+	 */
+	for (i = 0; i < epoch->pending_stages_nr; i++)
+		if (oideq(&epoch->pending_stages[i].oid, oid))
+			return epoch->pending_stages[i].type == type &&
+			       epoch->pending_stages[i].size == size ?
+			       VEX_STORE_OK : VEX_STORE_ERR_CORRUPT;
+	if (size > SIZE_MAX - epoch->pending_stage_bytes)
+		return VEX_STORE_ERR_STATE;
+	ALLOC_GROW(epoch->pending_stages, epoch->pending_stages_nr + 1,
+		   epoch->pending_stages_alloc);
+	object = &epoch->pending_stages[epoch->pending_stages_nr++];
+	oidcpy(&object->oid, oid);
+	object->type = type;
+	object->size = size;
+	object->data = xmemdupz(data ? data : "", size);
+	epoch->pending_stage_bytes += size;
+	if (epoch->pending_stages_nr >= VEX_RECEIVE_STAGE_BATCH_OBJECTS ||
+	    epoch->pending_stage_bytes >= VEX_RECEIVE_STAGE_BATCH_BYTES)
+		return vex_store_flush_staged(store, epoch);
+	return VEX_STORE_OK;
+}
+
 int vex_store_open(struct vex_store **store_out,
 		   const struct vex_store_options *opts)
 {
@@ -1283,6 +1509,7 @@ void vex_epoch_detach(struct vex_epoch *epoch)
 {
 	if (!epoch)
 		return;
+	release_pending_stages(epoch);
 	epoch->active = 0;
 	free(epoch);
 }
@@ -1299,6 +1526,8 @@ int vex_epoch_seal(struct vex_epoch *epoch)
 	if (!epoch || !epoch->active)
 		return VEX_STORE_ERR_STATE;
 	store = epoch->store;
+	if ((ret = vex_store_flush_staged(store, epoch)))
+		return ret;
 	if ((ret = vex_epoch_heartbeat(epoch)))
 		return ret;
 	if ((ret = load_locked(store, &lock, &state)))
@@ -1344,6 +1573,8 @@ int vex_epoch_compensate(struct vex_epoch *epoch)
 	if (!epoch || !epoch->active)
 		return VEX_STORE_ERR_STATE;
 	store = epoch->store;
+	/* Not-yet-flushed local data has no S3/metadata side effect to compensate. */
+	release_pending_stages(epoch);
 	if ((ret = load_locked(store, &lock, &state)))
 		return ret;
 	meta_epoch = find_epoch(&state, epoch->id);
@@ -1375,6 +1606,7 @@ void vex_epoch_free(struct vex_epoch *epoch)
 		return;
 	if (epoch->active && epoch->owner)
 		vex_epoch_compensate(epoch);
+	release_pending_stages(epoch);
 	free(epoch);
 }
 
@@ -1415,6 +1647,8 @@ int vex_blob_promote(struct vex_store *store, struct vex_epoch *epoch)
 	int ret;
 
 	if ((ret = check_epoch(store, epoch)))
+		return ret;
+	if ((ret = vex_store_flush_staged(store, epoch)))
 		return ret;
 	if ((ret = vex_epoch_heartbeat(epoch)))
 		return ret;
@@ -1496,6 +1730,8 @@ int vex_object_index_publish(struct vex_store *store, struct vex_epoch *epoch)
 
 	if ((ret = check_epoch(store, epoch)))
 		return ret;
+	if ((ret = vex_store_flush_staged(store, epoch)))
+		return ret;
 	if ((ret = vex_epoch_heartbeat(epoch)))
 		return ret;
 	if ((ret = load_locked(store, &lock, &state)))
@@ -1546,6 +1782,13 @@ int vex_store_stage_object(struct vex_store *store, struct vex_epoch *epoch,
 {
 	int ret;
 
+	/*
+	 * MySQL+S3 receive helpers accumulate bounded local batches.  The flush
+	 * below is forced at their ODB transaction boundary, before the parent can
+	 * run connectivity/hook/ref work, so this never relaxes quarantine.
+	 */
+	if (store && store->backend == VEX_STORE_BACKEND_MYSQL_S3)
+		return queue_mysql_s3_stage(store, epoch, oid, type, data, size);
 	if ((ret = vex_blob_put_staging(store, epoch, oid, type, data, size)))
 		return ret;
 	if ((ret = vex_object_index_put_quarantine(store, epoch, oid, type, size)))
@@ -1635,6 +1878,8 @@ int vex_store_read_object_in_epoch(struct vex_store *store,
 	int ret;
 
 	if ((ret = check_epoch(store, epoch)))
+		return ret;
+	if ((ret = vex_store_flush_staged(store, (struct vex_epoch *)epoch)))
 		return ret;
 	if ((ret = vex_epoch_heartbeat((struct vex_epoch *)epoch)))
 		return ret;
@@ -2761,6 +3006,7 @@ int vex_ref_transaction_commit(struct vex_ref_transaction *transaction)
 	store = transaction->store;
 	epoch = transaction->epoch;
 	if ((ret = check_epoch(store, epoch)) ||
+	    (ret = vex_store_flush_staged(store, epoch)) ||
 	    (ret = vex_epoch_heartbeat(epoch)) ||
 	    (ret = load_locked(store, &lock, &state)))
 		return ret;

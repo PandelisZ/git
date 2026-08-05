@@ -985,9 +985,17 @@ static int odb_transaction_vex_commit(struct odb_transaction *base)
 	 * epoch; this final call merely releases the parent's local handle.
 	 */
 	if (transaction->inherited_handoff) {
+		/*
+		 * receive-pack's unpack-objects child owns the final local batch
+		 * flush.  Its successful exit is the handoff proof the parent needs
+		 * before connectivity checks, hooks, and ref publication run.
+		 */
+		ret = vex_store_flush_staged(source->store, transaction->epoch);
+		if (ret)
+			error(_("unable to flush Vex receive object batch"));
 		vex_epoch_detach(transaction->epoch);
 		transaction->epoch = NULL;
-		return 0;
+		return ret;
 	}
 	if (transaction->receive_handoff) {
 		if (!transaction->handoff_finished) {
@@ -1147,6 +1155,11 @@ static void odb_source_vex_close(struct odb_source *base)
 {
 	struct odb_source_vex *source = container_of(base, struct odb_source_vex, base);
 
+	/* Defensive fallback for a helper that wrote through an inherited epoch
+	 * without opening its normal ODB transaction. */
+	if (source->inherited_epoch &&
+	    vex_store_flush_staged(source->store, source->inherited_epoch))
+		die(_("unable to flush Vex receive object batch during source close"));
 	vex_epoch_detach(source->inherited_epoch);
 	source->inherited_epoch = NULL;
 	vex_source_release_pack_cache(source);

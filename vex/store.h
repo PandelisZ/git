@@ -260,6 +260,14 @@ int vex_store_stage_object(struct vex_store *store,
 			     const struct object_id *oid,
 			     enum object_type type, const void *data,
 			     unsigned long size);
+
+/*
+ * Make this process's bounded MySQL+S3 receive queue durable.  The inherited
+ * unpack-objects child calls this at its ODB transaction boundary, before the
+ * parent can run connectivity checks or publish refs.  Other backends are a
+ * no-op.
+ */
+int vex_store_flush_staged(struct vex_store *store, struct vex_epoch *epoch);
 /* Returns 1 when a published object exists, 0 when it does not, or an error. */
 int vex_store_has_object(struct vex_store *store,
 			   const struct object_id *oid);

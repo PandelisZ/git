@@ -2,6 +2,7 @@
 
 #ifdef VEX_META_MYSQL_STORE
 #include "git-compat-util.h"
+#include "strbuf.h"
 #include "trace.h"
 #include "vex/store-internal.h"
 #endif
@@ -286,6 +287,29 @@ int vex_meta_mysql_stage_object(struct vex_meta_mysql *db,
 	(void)object_type;
 	(void)size;
 	(void)blob_key;
+	return mysql_unavailable();
+}
+
+int vex_meta_mysql_stage_objects(
+	struct vex_meta_mysql *db, const char *repo_id, uint64_t generation,
+	const struct vex_meta_mysql_staged_object *objects, size_t objects_nr)
+{
+	(void)db;
+	(void)repo_id;
+	(void)generation;
+	(void)objects;
+	(void)objects_nr;
+	return mysql_unavailable();
+}
+
+int vex_meta_mysql_stage_commit_parents(
+	struct vex_meta_mysql *db, const char *repo_id,
+	const struct vex_meta_mysql_commit_parent *parents, size_t parents_nr)
+{
+	(void)db;
+	(void)repo_id;
+	(void)parents;
+	(void)parents_nr;
 	return mysql_unavailable();
 }
 
@@ -2274,47 +2298,75 @@ out:
 	return ret;
 }
 
-int vex_meta_mysql_stage_object(struct vex_meta_mysql *db,
-			 const char *repo_id, uint64_t generation,
-			 const unsigned char *oid, size_t oid_len,
-			 unsigned int object_type, uint64_t size,
-			 const char *blob_key)
+/*
+ * Append a receive batch without materializing and rewriting the repository's
+ * complete state snapshot for every object.  The normal state adapter still
+ * owns ref publication; this is intentionally limited to durable quarantine
+ * object/claim metadata after the matching S3 staging batch has succeeded.
+ */
+int vex_meta_mysql_stage_objects(
+	struct vex_meta_mysql *db, const char *repo_id, uint64_t generation,
+	const struct vex_meta_mysql_staged_object *objects, size_t objects_nr)
 {
 	char *repo = NULL;
-	char *object = NULL;
-	char *quoted_key = NULL;
-	char *sql = NULL;
+	struct strbuf sql = STRBUF_INIT;
+	unsigned char (*normalized)[VEX_META_MYSQL_OID_BYTES] = NULL;
+	unsigned char *matched = NULL;
+	MYSQL_RES *res = NULL;
+	MYSQL_ROW row;
 	uint64_t checked_generation;
+	size_t i;
 	int found;
 	int in_transaction = 0;
-	int ret;
+	int ret = VEX_META_MYSQL_ERR;
 
-	if (!db || !db->mysql || !generation || object_type < 1 || object_type > 4 ||
-	    !blob_key || strlen(blob_key) > 512)
+	if (!db || !db->mysql || db->state_transaction || !generation ||
+	    (!objects && objects_nr))
 		return VEX_META_MYSQL_ERR_INVALID;
+	if (!objects_nr)
+		return VEX_META_MYSQL_OK;
+	/* Keep the SQL values well below a normal MySQL packet and lock window. */
+	if (objects_nr > 512)
+		return set_error(db, VEX_META_MYSQL_ERR_INVALID,
+				 "Vex receive metadata batch exceeds 512 objects");
+	CALLOC_ARRAY(normalized, objects_nr);
+	CALLOC_ARRAY(matched, objects_nr);
+	for (i = 0; i < objects_nr; i++) {
+		size_t j;
+
+		if (objects[i].object_type < 1 || objects[i].object_type > 4 ||
+		    !objects[i].blob_key || strlen(objects[i].blob_key) > 512 ||
+		    normalize_oid(objects[i].oid, objects[i].oid_len, normalized[i])) {
+			ret = set_error(db, VEX_META_MYSQL_ERR_INVALID,
+					"invalid Vex receive object metadata");
+			goto out;
+		}
+		for (j = 0; j < i; j++)
+			if (!memcmp(normalized[i], normalized[j],
+				    VEX_META_MYSQL_OID_BYTES)) {
+				ret = set_error(db, VEX_META_MYSQL_ERR_INVALID,
+						"duplicate object in Vex receive metadata batch");
+				goto out;
+			}
+	}
 	repo = sql_repo_literal(repo_id, NULL);
-	object = sql_oid_literal(oid, oid_len);
-	quoted_key = sql_quote(db, blob_key);
-	if (!repo || !object || !quoted_key) {
+	if (!repo) {
 		ret = set_error(db, VEX_META_MYSQL_ERR_INVALID,
-				"invalid Vex object metadata");
+				"invalid Vex repository UUID");
 		goto out;
 	}
 	ret = mysql_begin(db);
 	if (ret)
 		goto out;
 	in_transaction = 1;
-	sql = vex_format("SELECT generation FROM generations WHERE repo_id = %s "
-			 "AND generation = %" PRIu64 " AND state = 'open' FOR UPDATE",
-			 repo, generation);
-	if (!sql) {
-		ret = set_error(db, VEX_META_MYSQL_ERR_NOMEM,
-				"could not allocate epoch state query");
+	/* Serialize with snapshot saves so an append cannot be rewritten away. */
+	if ((ret = require_repository_locked(db, repo)))
 		goto out;
-	}
-	ret = query_one_u64(db, sql, &checked_generation, &found);
-	free(sql);
-	sql = NULL;
+	strbuf_addf(&sql, "SELECT generation FROM generations WHERE repo_id = %s "
+			    "AND generation = %" PRIu64 " AND state = 'open' FOR UPDATE",
+			    repo, generation);
+	ret = query_one_u64(db, sql.buf, &checked_generation, &found);
+	strbuf_reset(&sql);
 	if (ret)
 		goto out;
 	if (!found || checked_generation != generation) {
@@ -2322,32 +2374,119 @@ int vex_meta_mysql_stage_object(struct vex_meta_mysql *db,
 				"cannot stage metadata in a non-open Vex generation");
 		goto out;
 	}
-	/* blob_key is a location; this query deliberately has no byte payload. */
-	sql = vex_format("INSERT IGNORE INTO objects "
-			 "(repo_id, oid, obj_type, size, blob_key, generation, state) VALUES "
-			 "(%s, %s, %u, %" PRIu64 ", %s, %" PRIu64 ", 'quarantine')",
-			 repo, object, object_type, size, quoted_key, generation);
-	if (!sql) {
-		ret = set_error(db, VEX_META_MYSQL_ERR_NOMEM,
-				"could not allocate object metadata insert query");
-		goto out;
+
+	/* blob_key is a location; this SQL deliberately has no Git byte payload. */
+	strbuf_addstr(&sql, "INSERT IGNORE INTO objects "
+		       "(repo_id, oid, obj_type, size, blob_key, generation, state) VALUES ");
+	for (i = 0; i < objects_nr; i++) {
+		char *object = sql_hex_literal(normalized[i], sizeof(normalized[i]));
+		char *key = sql_quote(db, objects[i].blob_key);
+
+		if (!object || !key) {
+			free(key);
+			free(object);
+			ret = set_error(db, VEX_META_MYSQL_ERR_NOMEM,
+					"could not encode Vex receive object batch");
+			goto out;
+		}
+		strbuf_addf(&sql, "%s(%s, %s, %u, %" PRIu64 ", %s, %" PRIu64 ", "
+				    "'quarantine')", i ? "," : "", repo, object,
+				    objects[i].object_type, objects[i].size, key, generation);
+		free(key);
+		free(object);
 	}
-	ret = mysql_exec(db, sql);
-	free(sql);
-	sql = NULL;
+	ret = mysql_exec(db, sql.buf);
+	strbuf_reset(&sql);
 	if (ret)
 		goto out;
-	sql = vex_format("INSERT IGNORE INTO generation_objects "
-			 "(repo_id, generation, oid) VALUES (%s, %" PRIu64 ", %s)",
-			 repo, generation, object);
-	if (!sql) {
-		ret = set_error(db, VEX_META_MYSQL_ERR_NOMEM,
-				"could not allocate generation object insert query");
+
+	/*
+	 * INSERT IGNORE is concurrency-friendly; this locked read turns a hidden
+	 * duplicate-key conflict into an explicit type/size/key integrity check.
+	 */
+	strbuf_addf(&sql, "SELECT oid, obj_type, size, blob_key FROM objects "
+			    "WHERE repo_id = %s AND oid IN (", repo);
+	for (i = 0; i < objects_nr; i++) {
+		char *object = sql_hex_literal(normalized[i], sizeof(normalized[i]));
+
+		if (!object) {
+			ret = set_error(db, VEX_META_MYSQL_ERR_NOMEM,
+					"could not encode Vex receive object lookup");
+			goto out;
+		}
+		strbuf_addf(&sql, "%s%s", i ? "," : "", object);
+		free(object);
+	}
+	strbuf_addstr(&sql, ") FOR UPDATE");
+	if (mysql_query(db->mysql, sql.buf)) {
+		ret = set_mysql_error(db, "MySQL receive object verification failed");
 		goto out;
 	}
-	ret = mysql_exec(db, sql);
-	free(sql);
-	sql = NULL;
+	strbuf_reset(&sql);
+	res = mysql_store_result(db->mysql);
+	if (!res) {
+		ret = set_mysql_error(db, "MySQL receive object verification result failed");
+		goto out;
+	}
+	if (mysql_num_fields(res) != 4) {
+		ret = set_error(db, VEX_META_MYSQL_ERR,
+				"MySQL returned invalid Vex receive object columns");
+		goto out;
+	}
+	while ((row = mysql_fetch_row(res))) {
+		unsigned long *lengths = mysql_fetch_lengths(res);
+		uint64_t object_type;
+		uint64_t size;
+		size_t at = objects_nr;
+
+		if (!row[0] || !row[1] || !row[2] || !row[3] || !lengths ||
+		    lengths[0] != VEX_META_MYSQL_OID_BYTES ||
+		    parse_u64(row[1], &object_type) || parse_u64(row[2], &size)) {
+			ret = set_error(db, VEX_META_MYSQL_ERR,
+					"MySQL returned invalid Vex receive object metadata");
+			goto out;
+		}
+		for (i = 0; i < objects_nr; i++)
+			if (!memcmp(row[0], normalized[i], VEX_META_MYSQL_OID_BYTES)) {
+				at = i;
+				break;
+			}
+		if (at == objects_nr || matched[at] ||
+		    object_type != objects[at].object_type ||
+		    size != objects[at].size ||
+		    lengths[3] != strlen(objects[at].blob_key) ||
+		    memcmp(row[3], objects[at].blob_key, lengths[3])) {
+			ret = set_error(db, VEX_META_MYSQL_ERR_CONFLICT,
+					"Vex receive object conflicts with existing metadata");
+			goto out;
+		}
+		matched[at] = 1;
+	}
+	mysql_free_result(res);
+	res = NULL;
+	for (i = 0; i < objects_nr; i++)
+		if (!matched[i]) {
+			ret = set_error(db, VEX_META_MYSQL_ERR_STATE,
+					"Vex receive object disappeared during staging");
+			goto out;
+		}
+
+	strbuf_addstr(&sql, "INSERT IGNORE INTO generation_objects "
+		       "(repo_id, generation, oid) VALUES ");
+	for (i = 0; i < objects_nr; i++) {
+		char *object = sql_hex_literal(normalized[i], sizeof(normalized[i]));
+
+		if (!object) {
+			ret = set_error(db, VEX_META_MYSQL_ERR_NOMEM,
+					"could not encode Vex receive generation claim");
+			goto out;
+		}
+		strbuf_addf(&sql, "%s(%s, %" PRIu64 ", %s)",
+				    i ? "," : "", repo, generation, object);
+		free(object);
+	}
+	ret = mysql_exec(db, sql.buf);
+	strbuf_reset(&sql);
 	if (ret)
 		goto out;
 	ret = vex_mysql_commit(db);
@@ -2356,11 +2495,115 @@ int vex_meta_mysql_stage_object(struct vex_meta_mysql *db,
 	in_transaction = 0;
 
 out:
-	free(sql);
+	if (res)
+		mysql_free_result(res);
 	if (in_transaction)
 		vex_mysql_rollback(db);
-	free(quoted_key);
-	free(object);
+	free(matched);
+	free(normalized);
+	strbuf_release(&sql);
+	free(repo);
+	return ret;
+}
+
+int vex_meta_mysql_stage_object(struct vex_meta_mysql *db,
+			 const char *repo_id, uint64_t generation,
+			 const unsigned char *oid, size_t oid_len,
+			 unsigned int object_type, uint64_t size,
+			 const char *blob_key)
+{
+	const struct vex_meta_mysql_staged_object object = {
+		.oid = oid,
+		.oid_len = oid_len,
+		.object_type = object_type,
+		.size = size,
+		.blob_key = blob_key,
+	};
+
+	return vex_meta_mysql_stage_objects(db, repo_id, generation, &object, 1);
+}
+
+int vex_meta_mysql_stage_commit_parents(
+	struct vex_meta_mysql *db, const char *repo_id,
+	const struct vex_meta_mysql_commit_parent *parents, size_t parents_nr)
+{
+	char *repo = NULL;
+	struct strbuf sql = STRBUF_INIT;
+	size_t i;
+	int in_transaction = 0;
+	int ret = VEX_META_MYSQL_ERR;
+
+	if (!db || !db->mysql || db->state_transaction ||
+	    (!parents && parents_nr))
+		return VEX_META_MYSQL_ERR_INVALID;
+	if (!parents_nr)
+		return VEX_META_MYSQL_OK;
+	if (parents_nr > 4096)
+		return set_error(db, VEX_META_MYSQL_ERR_INVALID,
+				 "Vex receive commit-parent batch exceeds 4096 edges");
+	for (i = 0; i < parents_nr; i++) {
+		unsigned char checked[VEX_META_MYSQL_OID_BYTES];
+
+		if (normalize_oid(parents[i].commit_oid, parents[i].commit_oid_len,
+				  checked) ||
+		    normalize_oid(parents[i].parent_oid, parents[i].parent_oid_len,
+				  checked))
+			return set_error(db, VEX_META_MYSQL_ERR_INVALID,
+					 "invalid Vex receive commit-parent metadata");
+	}
+	repo = sql_repo_literal(repo_id, NULL);
+	if (!repo) {
+		ret = set_error(db, VEX_META_MYSQL_ERR_INVALID,
+				"invalid Vex repository UUID");
+		goto out;
+	}
+	ret = mysql_begin(db);
+	if (ret)
+		goto out;
+	in_transaction = 1;
+	if ((ret = require_repository_locked(db, repo)))
+		goto out;
+	strbuf_addstr(&sql, "INSERT IGNORE INTO commit_parents "
+		       "(repo_id, commit_oid, parent_pos, parent_oid) VALUES ");
+	for (i = 0; i < parents_nr; i++) {
+		unsigned char commit[VEX_META_MYSQL_OID_BYTES];
+		unsigned char parent[VEX_META_MYSQL_OID_BYTES];
+		char *commit_literal;
+		char *parent_literal;
+
+		/* Validation above means these normalizations cannot fail. */
+		if (normalize_oid(parents[i].commit_oid, parents[i].commit_oid_len,
+				  commit) ||
+		    normalize_oid(parents[i].parent_oid, parents[i].parent_oid_len,
+				  parent)) {
+			ret = VEX_META_MYSQL_ERR_INVALID;
+			goto out;
+		}
+		commit_literal = sql_hex_literal(commit, sizeof(commit));
+		parent_literal = sql_hex_literal(parent, sizeof(parent));
+		if (!commit_literal || !parent_literal) {
+			free(parent_literal);
+			free(commit_literal);
+			ret = set_error(db, VEX_META_MYSQL_ERR_NOMEM,
+					"could not encode Vex receive commit-parent batch");
+			goto out;
+		}
+		strbuf_addf(&sql, "%s(%s, %s, %u, %s)", i ? "," : "", repo,
+				    commit_literal, parents[i].parent_pos, parent_literal);
+		free(parent_literal);
+		free(commit_literal);
+	}
+	ret = mysql_exec(db, sql.buf);
+	if (ret)
+		goto out;
+	ret = vex_mysql_commit(db);
+	if (ret)
+		goto out;
+	in_transaction = 0;
+out:
+	if (in_transaction)
+		vex_mysql_rollback(db);
+	strbuf_release(&sql);
 	free(repo);
 	return ret;
 }
@@ -2512,7 +2755,7 @@ int vex_meta_mysql_add_commit_parent(struct vex_meta_mysql *db,
 				"invalid Vex commit parent metadata");
 		goto out;
 	}
-	sql = vex_format("INSERT INTO commit_parents "
+	sql = vex_format("INSERT IGNORE INTO commit_parents "
 			 "(repo_id, commit_oid, parent_pos, parent_oid) VALUES "
 			 "(%s, %s, %u, %s)", repo, commit, parent_pos, parent);
 	if (!sql) {

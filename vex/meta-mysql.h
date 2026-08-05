@@ -64,6 +64,28 @@ struct vex_meta_mysql_object {
 };
 
 /*
+ * Metadata-only description of a receive batch.  The raw object data never
+ * crosses this interface: callers first make each S3 staging key durable,
+ * then atomically append these rows and generation claims.
+ */
+struct vex_meta_mysql_staged_object {
+	const unsigned char *oid;
+	size_t oid_len;
+	unsigned int object_type;
+	uint64_t size;
+	const char *blob_key;
+};
+
+/* Metadata-only commit graph edge collected while staging a receive batch. */
+struct vex_meta_mysql_commit_parent {
+	const unsigned char *commit_oid;
+	size_t commit_oid_len;
+	unsigned int parent_pos;
+	const unsigned char *parent_oid;
+	size_t parent_oid_len;
+};
+
+/*
  * Metadata-only description of one derived pack which is safe to select for
  * the repository's current sealed generation.  pack_id uses the schema's
  * BINARY(32) form: SHA-1 IDs are zero-padded and SHA-256 IDs fill the array.
@@ -227,6 +249,20 @@ int vex_meta_mysql_stage_object(struct vex_meta_mysql *db,
 			 const unsigned char *oid, size_t oid_len,
 			 unsigned int object_type, uint64_t size,
 			 const char *blob_key);
+
+/*
+ * Atomically append a bounded set of object records and claims for one open
+ * generation.  Existing content-addressed records must match type, size, and
+ * key exactly; otherwise the whole batch rolls back.
+ */
+int vex_meta_mysql_stage_objects(
+	struct vex_meta_mysql *db, const char *repo_id, uint64_t generation,
+	const struct vex_meta_mysql_staged_object *objects, size_t objects_nr);
+
+/* Atomically append bounded commit-parent metadata after its objects exist. */
+int vex_meta_mysql_stage_commit_parents(
+	struct vex_meta_mysql *db, const char *repo_id,
+	const struct vex_meta_mysql_commit_parent *parents, size_t parents_nr);
 
 /*
  * Fetch metadata only if it is public, or if visible_generation is the same

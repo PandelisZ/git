@@ -23,6 +23,18 @@
 struct strbuf;
 struct vex_blob_s3;
 
+/*
+ * One transient receive-side upload.  The caller owns `data` until
+ * vex_blob_s3_put_staging_batch() returns.  This is deliberately a transport
+ * batching shape only: every entry still lands at its own immutable staging
+ * key and no Git payload is folded into metadata.
+ */
+struct vex_blob_s3_staged_object {
+	const struct object_id *oid;
+	const void *data;
+	unsigned long size;
+};
+
 enum vex_blob_s3_result {
 	VEX_BLOB_S3_OK = 0,
 	VEX_BLOB_S3_ERR = -1,
@@ -62,9 +74,24 @@ int vex_blob_s3_staging_key(const struct vex_blob_s3 *blob, uint64_t epoch,
 int vex_blob_s3_put_staging(struct vex_blob_s3 *blob, uint64_t epoch,
 			    const struct object_id *oid,
 			    const void *data, unsigned long size);
+/*
+ * Upload a bounded set of distinct objects concurrently.  On any failure it
+ * removes every staging key attempted by this call before returning an error;
+ * callers can therefore leave metadata untouched until this succeeds.
+ */
+int vex_blob_s3_put_staging_batch(
+	struct vex_blob_s3 *blob, uint64_t epoch,
+	const struct vex_blob_s3_staged_object *objects, size_t objects_nr);
 /* Copy one staged object to its final content-addressed key, then delete it. */
 int vex_blob_s3_promote_object(struct vex_blob_s3 *blob, uint64_t epoch,
 			       const struct object_id *oid);
+/*
+ * Promote a bounded set of staging objects concurrently.  It never makes
+ * metadata visible; callers still publish only after the entire batch has
+ * succeeded.  A failed batch is safe to retry or compensate.
+ */
+int vex_blob_s3_promote_batch(struct vex_blob_s3 *blob, uint64_t epoch,
+			      const struct object_id *oids, size_t oids_nr);
 /* Idempotent compensation for one staged object. */
 int vex_blob_s3_delete_staging(struct vex_blob_s3 *blob, uint64_t epoch,
 			       const struct object_id *oid);

@@ -35,7 +35,11 @@ struct vex_blob_s3 {
 	int test_fail_reads;
 	/* Test-only fault for proving metadata deletion never depends on S3 success. */
 	int test_fail_final_delete;
+	/* Test-only partial staging fault for the bounded receive batch. */
+	int test_fail_stage_batch_once;
 };
+
+#define VEX_S3_BATCH_PARALLEL 16
 
 static int contains_control(const char *value)
 {
@@ -269,6 +273,97 @@ static int run_curl(struct vex_blob_s3 *blob, const char *method,
 	return ret;
 }
 
+/*
+ * The receive path spends most of its time writing many tiny immutable
+ * objects.  Keep curl as the one AWS-SigV4 implementation in this binary,
+ * but hand it a bounded parallel batch instead of paying one process start
+ * and connection setup per object.  Every request stays an ordinary S3 PUT,
+ * COPY, or DELETE at its own key; batching changes transport concurrency, not
+ * the object layout or visibility rules.
+ */
+struct vex_s3_batch_request {
+	const char *method;
+	const char *url;
+	const char *input_file;
+	const char *header;
+};
+
+static int curl_config_add_request(struct strbuf *config,
+				   struct vex_blob_s3 *blob,
+				   const struct vex_s3_batch_request *request,
+				   int more)
+{
+	struct strbuf auth = STRBUF_INIT;
+	struct strbuf signing = STRBUF_INIT;
+	int ret = -1;
+
+	if (!request || !request->method || !request->url)
+		goto out;
+	strbuf_addf(&auth, "%s:%s", blob->access_key, blob->secret_key);
+	strbuf_addf(&signing, "aws:amz:%s:s3", blob->region);
+	if (curl_config_add(config, "url", request->url) ||
+	    curl_config_add(config, "request", request->method) ||
+	    curl_config_add(config, "user", auth.buf) ||
+	    curl_config_add(config, "aws-sigv4", signing.buf) ||
+	    (request->input_file &&
+	     curl_config_add(config, "upload-file", request->input_file)) ||
+	    (request->header &&
+	     curl_config_add(config, "header", request->header)) ||
+	    curl_config_add(config, "output", "/dev/null"))
+		goto out;
+	/* `--next` makes --fail local, so spell it out for every transfer. */
+	strbuf_addstr(config, "fail\n");
+	if (more)
+		strbuf_addstr(config, "next\n");
+	ret = 0;
+out:
+	secure_strbuf_release(&auth);
+	strbuf_release(&signing);
+	return ret;
+}
+
+static int run_curl_parallel(struct vex_blob_s3 *blob,
+			     const struct vex_s3_batch_request *requests,
+			     size_t requests_nr)
+{
+	struct child_process curl = CHILD_PROCESS_INIT;
+	struct strbuf config = STRBUF_INIT;
+	struct tempfile *config_file = NULL;
+	char parallel[32];
+	size_t i;
+	int ret = VEX_BLOB_S3_ERR;
+
+	if (!requests_nr)
+		return VEX_BLOB_S3_OK;
+	if (!exists_in_PATH("curl"))
+		return VEX_BLOB_S3_ERR_UNAVAILABLE;
+	for (i = 0; i < requests_nr; i++)
+		if (curl_config_add_request(&config, blob, &requests[i],
+					    i + 1 < requests_nr)) {
+			ret = VEX_BLOB_S3_ERR_INVALID;
+			goto out;
+		}
+	config_file = mks_tempfile_t("vex-s3-curl-batch-XXXXXX");
+	if (!config_file ||
+	    write_in_full(config_file->fd, config.buf, config.len) < 0 ||
+	    close_tempfile_gently(config_file) < 0)
+		goto out;
+
+	xsnprintf(parallel, sizeof(parallel), "%u", VEX_S3_BATCH_PARALLEL);
+	strvec_pushl(&curl.args, "curl", "--config", config_file->filename.buf,
+		     "--silent", "--show-error", "--fail", "--parallel",
+		     "--parallel-max", parallel, NULL);
+	if (blob->ca_file)
+		strvec_pushl(&curl.args, "--cacert", blob->ca_file, NULL);
+	if (blob->insecure_tls)
+		strvec_push(&curl.args, "--insecure");
+	ret = run_command(&curl) ? VEX_BLOB_S3_ERR : VEX_BLOB_S3_OK;
+out:
+	delete_tempfile(&config_file);
+	secure_strbuf_release(&config);
+	return ret;
+}
+
 static int make_url(const struct vex_blob_s3 *blob, const char *key,
 		    struct strbuf *url)
 {
@@ -472,6 +567,13 @@ int vex_blob_s3_open(struct vex_blob_s3 **blob_out,
 	 */
 	blob->test_fail_final_delete =
 		git_env_bool("GIT_VEX_TEST_S3_FAIL_FINAL_DELETE", 0) == 1;
+	/*
+	 * This hook exercises the only awkward batch outcome: a request subset
+	 * reached S3 but the batch as a whole failed before metadata was written.
+	 * The driver must remove every attempted staging key in that case.
+	 */
+	blob->test_fail_stage_batch_once =
+		git_env_bool("GIT_VEX_TEST_S3_FAIL_STAGE_BATCH_ONCE", 0) == 1;
 	*blob_out = blob;
 	return VEX_BLOB_S3_OK;
 }
@@ -537,6 +639,94 @@ int vex_blob_s3_put_staging(struct vex_blob_s3 *blob, uint64_t epoch,
 	return ret;
 }
 
+struct vex_s3_batch_upload {
+	struct tempfile *temp;
+	struct strbuf staging;
+	struct strbuf url;
+};
+
+static void release_batch_uploads(struct vex_s3_batch_upload *uploads,
+				  size_t uploads_nr)
+{
+	size_t i;
+
+	for (i = 0; i < uploads_nr; i++) {
+		delete_tempfile(&uploads[i].temp);
+		strbuf_release(&uploads[i].url);
+		strbuf_release(&uploads[i].staging);
+	}
+	free(uploads);
+}
+
+int vex_blob_s3_put_staging_batch(
+	struct vex_blob_s3 *blob, uint64_t epoch,
+	const struct vex_blob_s3_staged_object *objects, size_t objects_nr)
+{
+	struct vex_s3_batch_upload *uploads = NULL;
+	struct vex_s3_batch_request *requests = NULL;
+	static const char content_type[] = "Content-Type: application/octet-stream";
+	size_t i;
+	int ret = VEX_BLOB_S3_ERR;
+
+	if (!blob || (!objects && objects_nr))
+		return VEX_BLOB_S3_ERR_INVALID;
+	if (!objects_nr)
+		return VEX_BLOB_S3_OK;
+	CALLOC_ARRAY(uploads, objects_nr);
+	CALLOC_ARRAY(requests, objects_nr);
+	for (i = 0; i < objects_nr; i++) {
+		const struct vex_blob_s3_staged_object *object = &objects[i];
+		struct vex_s3_batch_upload *upload = &uploads[i];
+
+		if (!object->oid || (object->size && !object->data)) {
+			ret = VEX_BLOB_S3_ERR_INVALID;
+			goto cleanup;
+		}
+		upload->temp = mks_tempfile_t("vex-s3-put-batch-XXXXXX");
+		if (!upload->temp ||
+		    (object->size && write_in_full(upload->temp->fd, object->data,
+						 object->size) < 0) ||
+		    close_tempfile_gently(upload->temp) < 0)
+			goto cleanup;
+		ret = vex_blob_s3_staging_key(blob, epoch, object->oid,
+					      &upload->staging);
+		if (ret)
+			goto cleanup;
+		ret = make_url(blob, upload->staging.buf, &upload->url);
+		if (ret)
+			goto cleanup;
+		requests[i].method = "PUT";
+		requests[i].url = upload->url.buf;
+		requests[i].input_file = upload->temp->filename.buf;
+		requests[i].header = content_type;
+	}
+
+	if (blob->test_fail_stage_batch_once) {
+		/* Write one real key, then exercise all-or-nothing cleanup. */
+		blob->test_fail_stage_batch_once = 0;
+		ret = run_curl_parallel(blob, requests, 1);
+		if (!ret)
+			ret = VEX_BLOB_S3_ERR;
+		goto cleanup;
+	}
+	ret = run_curl_parallel(blob, requests, objects_nr);
+cleanup:
+	if (ret) {
+		/*
+		 * No metadata was written yet.  Best-effort deletion of every
+		 * attempt leaves a failed receive with no discoverable quarantine
+		 * state; the caller can fail atomically rather than publishing a
+		 * partial batch.
+		 */
+		for (i = 0; i < objects_nr; i++)
+			if (uploads[i].staging.len)
+				(void)delete_key(blob, uploads[i].staging.buf);
+	}
+	release_batch_uploads(uploads, objects_nr);
+	free(requests);
+	return ret;
+}
+
 int vex_blob_s3_delete_staging(struct vex_blob_s3 *blob, uint64_t epoch,
 			       const struct object_id *oid)
 {
@@ -568,47 +758,94 @@ int vex_blob_s3_delete_final(struct vex_blob_s3 *blob,
 int vex_blob_s3_promote_object(struct vex_blob_s3 *blob, uint64_t epoch,
 			       const struct object_id *oid)
 {
-	struct strbuf staged = STRBUF_INIT;
-	struct strbuf final = STRBUF_INIT;
-	struct strbuf url = STRBUF_INIT;
-	struct strbuf copy_source = STRBUF_INIT;
-	int exists;
-	int ret;
+	return vex_blob_s3_promote_batch(blob, epoch, oid, 1);
+}
 
+struct vex_s3_batch_promotion {
+	struct strbuf staging;
+	struct strbuf final;
+	struct strbuf final_url;
+	struct strbuf staging_url;
+	struct strbuf copy_source;
+};
+
+static void release_batch_promotions(struct vex_s3_batch_promotion *promotions,
+				     size_t promotions_nr)
+{
+	size_t i;
+
+	for (i = 0; i < promotions_nr; i++) {
+		strbuf_release(&promotions[i].copy_source);
+		strbuf_release(&promotions[i].staging_url);
+		strbuf_release(&promotions[i].final_url);
+		strbuf_release(&promotions[i].final);
+		strbuf_release(&promotions[i].staging);
+	}
+	free(promotions);
+}
+
+int vex_blob_s3_promote_batch(struct vex_blob_s3 *blob, uint64_t epoch,
+			      const struct object_id *oids, size_t oids_nr)
+{
+	struct vex_s3_batch_promotion *promotions = NULL;
+	struct vex_s3_batch_request *requests = NULL;
+	size_t i;
+	int ret = VEX_BLOB_S3_ERR;
+
+	if (!blob || (!oids && oids_nr))
+		return VEX_BLOB_S3_ERR_INVALID;
+	if (!oids_nr)
+		return VEX_BLOB_S3_OK;
 	if (blob->test_fail_promote_once) {
 		blob->test_fail_promote_once = 0;
 		return VEX_BLOB_S3_ERR;
 	}
+	CALLOC_ARRAY(promotions, oids_nr);
+	CALLOC_ARRAY(requests, oids_nr);
+	for (i = 0; i < oids_nr; i++) {
+		struct vex_s3_batch_promotion *promotion = &promotions[i];
 
-	ret = vex_blob_s3_staging_key(blob, epoch, oid, &staged);
-	if (ret)
-		goto done;
-	ret = vex_blob_s3_final_key(blob, oid, &final);
-	if (ret)
-		goto done;
-	exists = head_key(blob, final.buf);
-	if (exists == VEX_BLOB_S3_OK) {
-		ret = delete_key(blob, staged.buf);
-		goto done;
+		ret = vex_blob_s3_staging_key(blob, epoch, &oids[i],
+					      &promotion->staging);
+		if (ret)
+			goto done;
+		ret = vex_blob_s3_final_key(blob, &oids[i], &promotion->final);
+		if (ret)
+			goto done;
+		ret = make_url(blob, promotion->final.buf, &promotion->final_url);
+		if (ret)
+			goto done;
+		ret = make_url(blob, promotion->staging.buf, &promotion->staging_url);
+		if (ret)
+			goto done;
+		/*
+		 * The source was hash-verified before staging.  Copying it over an
+		 * existing content-addressed key is therefore idempotent (and repairs
+		 * a stale orphan) without a serialized HEAD round trip per object.
+		 */
+		strbuf_addf(&promotion->copy_source,
+			    "x-amz-copy-source: /%s/%s", blob->bucket,
+			    promotion->staging.buf);
+		requests[i].method = "PUT";
+		requests[i].url = promotion->final_url.buf;
+		requests[i].input_file = NULL;
+		requests[i].header = promotion->copy_source.buf;
 	}
-	if (exists != VEX_BLOB_S3_ERR_NOT_FOUND) {
-		ret = exists;
-		goto done;
-	}
-	ret = make_url(blob, final.buf, &url);
+
+	ret = run_curl_parallel(blob, requests, oids_nr);
 	if (ret)
 		goto done;
-	strbuf_addf(&copy_source, "x-amz-copy-source: /%s/%s", blob->bucket,
-		    staged.buf);
-	ret = run_curl(blob, "PUT", url.buf, NULL, "/dev/null",
-		       copy_source.buf);
-	if (!ret)
-		ret = delete_key(blob, staged.buf);
-	done:
-	strbuf_release(&staged);
-	strbuf_release(&final);
-	strbuf_release(&url);
-	strbuf_release(&copy_source);
+	for (i = 0; i < oids_nr; i++) {
+		requests[i].method = "DELETE";
+		requests[i].url = promotions[i].staging_url.buf;
+		requests[i].input_file = NULL;
+		requests[i].header = NULL;
+	}
+	ret = run_curl_parallel(blob, requests, oids_nr);
+done:
+	/* A failed copy/delete leaves no metadata visible and is retryable. */
+	free(requests);
+	release_batch_promotions(promotions, oids_nr);
 	return ret;
 }
 
