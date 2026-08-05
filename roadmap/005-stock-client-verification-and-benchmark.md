@@ -1,7 +1,7 @@
 # Stock Client Verification & git/git Benchmark PRD
 
-**Status:** Draft
-**Current Stage:** 0 - Verification design
+**Status:** Active
+**Current Stage:** 7 - executable evidence harness; git/git acceptance run pending
 **Owner:** Codex
 **Created:** 2026-08-05
 **Updated:** 2026-08-05
@@ -141,7 +141,7 @@ All functional verification and the **reproducible** benchmark path run against 
 scripts/vex/up.sh                  # compose up --wait
 scripts/vex/seed-git-git.sh        # mirror import
 t/vex/compat-stock-client.sh
-scripts/vex/bench-clone.sh         # SLO harness
+# then invoke bench-clone.sh with explicit Vex/disk origins (below)
 ```
 
 - **No AWS account** required for merge gates.
@@ -152,7 +152,8 @@ scripts/vex/bench-clone.sh         # SLO harness
 ### Methodology (must be automated)
 
 1. **Machine:** fixed bench host **or** any Docker-capable laptop; document CPU, RAM, disk, Docker version.
-2. **Stack:** Compose project `gitcloud` healthy (006); pin image tags.
+2. **Stack:** Compose project `vex` healthy (006); pin image tags and record
+   the Compose file SHA-256 in the result.
 3. **Client:** same `git --version` for all clones; stock git only.
 4. **Cold client:** new target dir each run; no existing repo.
 5. **Server modes:**
@@ -404,19 +405,61 @@ Document at import: commit count, object count, uncompressed/compressed pack siz
 
 ---
 
-## Automated harness sketch (Compose-backed)
+## Executable benchmark harness (Compose-backed)
 
-All harnesses assume `scripts/vex/up.sh` already succeeded (or they call it).
+`scripts/vex/bench-clone.sh` is the Stage 7 evidence runner. Seeding and
+Compose lifecycle remain separate operator steps: the benchmark accepts
+explicit endpoints and never starts, rebuilds, or silently reconfigures the
+stack it is timing.
 
-`scripts/vex/bench-clone.sh` → wraps `t/vex/perf-clone-git-git.sh` (Stage 7+):
+1. Seed `git/git` with `scripts/vex/seed-git-git.sh`; it writes the redacted
+   `t/vex/out/seed-manifest.json` used to bind a result to the imported graph.
+2. Supply a Vex HTTPS origin and, for the L4-shaped structural gate, a classic
+   disk control exposed through the **same HTTPS frontend** using
+   `--disk-origin`. The temporary `--baseline` local-path mode is useful for
+   fixture/smoke measurement only and deliberately cannot pass
+   `--require-disk-gate`.
+3. The runner discards only explicitly recorded warmups, then takes N fresh
+   cold-client clones in rotating source order. It records every warmup,
+   measured clone, push, fetch, and restoration command in `trials[]`; there
+   is no best-of selection.
+4. The JSON has a benchmark UUID/time, source Git commit and dirty bit,
+   Compose file SHA-256/project identity, sanitized source URLs, seed-manifest
+   SHA-256, raw trial records, p50/p90/p95/p99, mean/stdev/CV, integrity
+   results, and evaluated gate policy. A failed trial or gate still writes the
+   artifact before the process exits non-zero.
+5. `--require-disk-gate` enforces Vex p50 ≤ 1.5× disk p50 and automatically
+   enforces N≥5 plus CV≤15%. `--require-github` adds the same exact-ref
+   GitHub control and implies disk/stability requirements.
+6. `BENCH_INCLUDE_GITHUB=1` (or `--include-github`) records the optional
+   GitHub comparison. It only becomes an exit gate with `--require-github`;
+   the runner rejects a comparison if GitHub, Vex, and disk do not name the
+   exact same branch tip.
+7. `--fetch-after-push` creates matching tiny commits on the Vex and disk
+   controls, measures reader fetches, runs `fsck`, and by default restores the
+   benchmark branch with `--force-with-lease`. The L4 invocation adds
+   `--require-fetch-after-push-gate` for Vex fetch p50 ≤ 2.0× disk fetch p50.
 
-1. Resolve from env/compose: `US_URL` (cloud), `DISK_URL` (classic bare on same front), optional `GH_URL`.
-2. Discard 1 warmup clone; time N≥5 (prefer ≥10) cold-client clones.
-3. Emit JSON with **required fields**:
-   `benchmark_id, timestamp_utc, git_commit, manifest_seed, compose_hash, n_trials, trials[], p50_wall_s, p90_wall_s, p99_wall_s, cv, baselines, ratios, env, optional_github_gate`.
-4. Fail if CV>15% (unstable) or gates fail.
-5. `--require-github` for full L4 release; CI uses disk gate only.
-6. Publish **raw trials** (no best-of cherry-pick).
+Example acceptance-shaped invocation (not a statement that it has been run):
+
+```sh
+BENCH_INCLUDE_GITHUB=1 scripts/vex/bench-clone.sh \
+  --origin "$GIT_VEX_ORIGIN" \
+  --disk-origin "$GIT_VEX_DISK_ORIGIN" \
+  --branch "$GIT_VEX_DEFAULT_BRANCH" \
+  --fixture git-git \
+  --seed-manifest t/vex/out/seed-manifest.json \
+  --runs 5 --warmups 1 \
+  --require-disk-gate \
+  --require-github \
+  --fetch-after-push \
+  --require-fetch-after-push-gate \
+  --output roadmap/evidence/perf-git-git.json
+```
+
+The artifact always sets `l4_success_claim:false`: numerical results are
+necessary evidence, not an automatic substitute for the P0/P1, seed fidelity,
+pack-serving, and release-review checks.
 
 `t/vex/compat-stock-client.sh`:
 
@@ -466,6 +509,11 @@ All harnesses assume `scripts/vex/up.sh` already succeeded (or they call it).
 - Protocol surface: smart HTTP upload-pack/receive-pack (upstream docs).
 - Industry: GitHub clone performance depends on packed representation + edge caching — forces L4 pack/bundle/bitmap work as acceptance, not stretch.
 - **Local Docker Compose** mandated for MySQL + MinIO (+ Valkey) tests/benchmarks (user follow-up; PRD 006).
+- The executable benchmark now writes schema-v2 raw trial evidence, source and
+  Compose identity, p50/p90/p95/p99 plus CV, explicit disk/GitHub/fetch gate
+  outcomes, and an artifact on failure. Its small Compose smoke validates the
+  shape and safe fetch-branch restoration only. No git/git timing, GitHub
+  comparison, same-HTTPS disk control, or L4 claim has been made.
 
 ## Open Questions
 

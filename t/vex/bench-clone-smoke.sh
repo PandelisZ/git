@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 
-# Small opt-in smoke for the clone measurement harness.  It creates one Vex
-# MySQL+S3 repository and a matching local bare baseline, then only checks
-# that the benchmark emits sound measurements.  No latency threshold is an
-# acceptance criterion here.
+# Small opt-in smoke for the clone measurement harness. It creates one Vex
+# MySQL+S3 repository and a matching local bare baseline, then checks the raw
+# trial, identity, gate, and fetch-after-push artifact shape. The tiny fixture
+# deliberately does not enforce a latency threshold or claim L4.
 set -euo pipefail
 
 root=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
@@ -103,6 +103,9 @@ VEX_STOCK_GIT="$stock_git" "$root/scripts/vex/bench-clone.sh" \
 	--baseline "$baseline" \
 	--branch main \
 	--runs 3 \
+	--warmups 1 \
+	--fetch-after-push \
+	--fetch-runs 2 \
 	--output "$result" \
 	--git-config "$git_config"
 
@@ -115,34 +118,77 @@ result_path, stock_git, expected_tip = sys.argv[1:]
 with open(result_path, encoding="utf-8") as handle:
     result = json.load(handle)
 
-assert result["benchmark"] == "vex-stock-git-https-clone-vs-local-disk", result
+assert result["schema_version"] == 2, result
+assert result["benchmark"] == "vex-stock-git-https-clone-controls", result
 assert result["measurement_only"] is True, result
 assert result["l4_success_claim"] is False, result
 assert result["stock_git"] == stock_git, result
-assert result["runs"] == 3, result
+assert result["policy"]["clone_trials"] == 3, result
+assert result["policy"]["warmups_per_source"] == 1, result
+assert result["identity"]["source"]["git_commit"], result
+assert len(result["identity"]["compose"]["sha256"]) == 64, result
 assert result["ref"] == {
     "name": "refs/heads/main",
     "oid": expected_tip,
     "stable_across_measurement": True,
 }, result
 assert len(result["sample_order"]) == 3, result
-for transport in ("vex_https", "local_disk"):
+assert len(result["warmups"]) == 2, result
+assert result["sources"]["disk_control"]["transport"] == "local_path", result
+assert result["sources"]["disk_control"]["same_https_frontend"] is False, result
+assert result["gates"]["stability"]["evaluated"] is True, result
+assert result["gates"]["stability"]["required"] is False, result
+assert result["gates"]["disk_control"]["evaluated"] is True, result
+assert result["gates"]["disk_control"]["required"] is False, result
+for transport in ("vex_https", "disk_control"):
     values = result[transport]
     assert len(values["samples"]) == 3, values
     assert values["p50_ms"] > 0, values
     assert values["p90_ms"] > 0, values
+    assert values["p95_ms"] > 0, values
+    assert math.isfinite(values["cv_percent"]), values
     assert all(sample["elapsed_ms"] > 0 for sample in values["samples"]), values
-for percentile in ("p50", "p90"):
-    assert math.isfinite(result["ratio_vex_to_local_disk"][percentile]), result
-    assert result["ratio_vex_to_local_disk"][percentile] > 0, result
+for percentile in ("p50", "p90", "p95"):
+    assert math.isfinite(result["ratio_vex_to_disk_control"][percentile]), result
+    assert result["ratio_vex_to_disk_control"][percentile] > 0, result
+raw_trials = result["trials"]
+assert len(raw_trials) >= 16, raw_trials
+assert all(trial["status"] == "passed" for trial in raw_trials), raw_trials
+assert all(trial["trial_id"] and trial["started_at_utc"] and trial["completed_at_utc"] for trial in raw_trials), raw_trials
+fetch = result["fetch_after_push"]
+assert fetch["enabled"] is True, fetch
+assert fetch["original_tip"] == expected_tip, fetch
+assert fetch["runs"] == 2, fetch
+assert fetch["restoration"]["vex_https"]["status"] == "passed", fetch
+assert fetch["restoration"]["disk_control"]["status"] == "passed", fetch
+assert fetch["vex_https"]["n"] == 2, fetch
+assert fetch["disk_control"]["n"] == 2, fetch
+assert fetch["ratio_vex_to_disk_control"]["p50"] > 0, fetch
+assert result["gates"]["fetch_after_push"]["evaluated"] is True, result
+assert result["gates"]["fetch_after_push"]["required"] is False, result
 
 print(json.dumps({
-    "local_disk_p50_ms": result["local_disk"]["p50_ms"],
-    "ratio_p50": result["ratio_vex_to_local_disk"]["p50"],
-    "ratio_p90": result["ratio_vex_to_local_disk"]["p90"],
+    "disk_control_p50_ms": result["disk_control"]["p50_ms"],
+    "fetch_ratio_p50": fetch["ratio_vex_to_disk_control"]["p50"],
+    "ratio_p50": result["ratio_vex_to_disk_control"]["p50"],
+    "ratio_p90": result["ratio_vex_to_disk_control"]["p90"],
     "vex_https_p50_ms": result["vex_https"]["p50_ms"],
 }, sort_keys=True))
 PY
+
+restored_tip=$(GIT_CONFIG_GLOBAL="$git_config" GIT_CONFIG_NOSYSTEM=1 \
+	"$stock_git" ls-remote "$origin" refs/heads/main | awk 'NR == 1 { print $1 }')
+[ "$restored_tip" = "$tip" ] || {
+	printf 'vex clone benchmark smoke: fetch benchmark did not restore Vex main (%s != %s)\n' \
+		"$restored_tip" "$tip" >&2
+	exit 1
+}
+restored_baseline_tip=$("$stock_git" -C "$baseline" rev-parse refs/heads/main)
+[ "$restored_baseline_tip" = "$tip" ] || {
+	printf 'vex clone benchmark smoke: fetch benchmark did not restore disk main (%s != %s)\n' \
+		"$restored_baseline_tip" "$tip" >&2
+	exit 1
+}
 
 final_health=$(curl --fail --silent --show-error --cacert "$ca_file" \
 	"https://localhost:${GIT_HTTPS_PORT}/healthz")

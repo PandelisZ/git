@@ -29,6 +29,61 @@ VEX_TEST_COMPOSE_MYSQL_S3=1 make -C t T=t1497-vex-compose-mysql-s3.sh
 VEX_TEST_COMPOSE_MYSQL_S3=1 make -C t T=t1524-vex-compose-mysql-s3-hard-kill.sh
 ```
 
+## git/git seed and disk control
+
+For the real-repository read-path fixture, first start the active local Vex
+stack, then seed it with normal stock-Git HTTPS receive-pack traffic:
+
+```sh
+scripts/vex/up.sh
+scripts/vex/seed-git-git.sh
+```
+
+The seed script caches a host-side `--mirror` clone under
+`t/vex/out/git-git-mirror.git`, imports it into `git/git.git`, creates a
+separate `t/vex/out/git-git-disk.git` control using
+`git repack -adf --write-bitmap-index`, builds the immutable Vex S3 pack, and
+writes a redacted `t/vex/out/seed-manifest.json`. Use `--refresh` to update the
+cached mirror. It refuses to replace a non-empty Vex target with a different
+ref set unless `--replace` is explicit, and it never starts Compose itself.
+When an older local `.env` caps smart-HTTP bodies below 8 GiB, it temporarily
+recreates only `git-http` at that admission limit for the mirror push, verifies
+the active data plane, then restores the gateway's previous running limit.
+
+These artifacts make the full-sized fixture reproducible; they do not by
+themselves satisfy the L4 latency or direct-pack-serving gates.
+
+## Benchmark evidence
+
+`scripts/vex/bench-clone.sh` is an explicit-input evidence runner. It does not
+start or alter Compose while timing; it records source/Compose identity,
+every raw warmup and trial, clone/fetch `fsck` results, p50/p90/p95/p99, CV,
+and the evaluated policy in JSON. Failed trials and enforced gates still leave
+an artifact.
+
+The seed's bare disk control supports a reproducible local-path measurement,
+but is intentionally not the same-HTTPS-front-end L4 control:
+
+```sh
+scripts/vex/bench-clone.sh \
+  --origin "$GIT_VEX_ORIGIN" \
+  --baseline t/vex/out/git-git-disk.git \
+  --branch "$GIT_VEX_DEFAULT_BRANCH" \
+  --fixture git-git \
+  --seed-manifest t/vex/out/seed-manifest.json \
+  --runs 5 --warmups 1 \
+  --output roadmap/evidence/perf-git-git-local-control.json
+```
+
+Once a classic disk control is exposed through the same HTTPS gateway, use
+`--disk-origin` plus `--require-disk-gate`; the runner then requires p50 Vex
+clone time ≤1.5× disk p50 and at least five trials with CV≤15%. Add
+`BENCH_INCLUDE_GITHUB=1 --require-github` for the exact-ref GitHub gate, and
+`--fetch-after-push --require-fetch-after-push-gate` for the ≤2× disk fetch
+gate. Fetch measurement briefly moves the chosen branch and restores it with
+`--force-with-lease` by default. A passing artifact always keeps
+`l4_success_claim:false`; it is evidence for, not completion of, L4.
+
 ## FS smart-HTTP integration gate
 
 `scripts/vex/fs-http.py` is a loopback-only test gateway for a bare repository

@@ -292,8 +292,27 @@ scripts/vex/push-stress.sh --profile t/vex/push-stress/profiles/ramp.env
 ### Layer 3 — compose benchmark (local bench host + optional nightly)
 
 ```sh
-scripts/vex/bench-clone.sh
-# writes roadmap/evidence/perf-<date>.json (or t/vex/out/)
+# Current reproducible measurement control (not the same-HTTPS L4 gate):
+scripts/vex/bench-clone.sh \
+  --origin "$GIT_VEX_ORIGIN" \
+  --baseline t/vex/out/git-git-disk.git \
+  --branch "$GIT_VEX_DEFAULT_BRANCH" \
+  --fixture git-git \
+  --seed-manifest t/vex/out/seed-manifest.json \
+  --runs 5 --warmups 1 \
+  --output roadmap/evidence/perf-git-git-local-control.json
+
+# Once a classic disk control is exposed through the same HTTPS frontend:
+BENCH_INCLUDE_GITHUB=1 scripts/vex/bench-clone.sh \
+  --origin "$GIT_VEX_ORIGIN" \
+  --disk-origin "$GIT_VEX_DISK_ORIGIN" \
+  --branch "$GIT_VEX_DEFAULT_BRANCH" \
+  --fixture git-git \
+  --seed-manifest t/vex/out/seed-manifest.json \
+  --runs 5 --warmups 1 \
+  --require-disk-gate --require-github \
+  --fetch-after-push --require-fetch-after-push-gate \
+  --output roadmap/evidence/perf-git-git-l4-candidate.json
 ```
 
 **CI policy:**
@@ -328,33 +347,49 @@ Creates repo `smoke.git` with a few commits via stock git push to receive-pack �
 
 ## Benchmark integration with Compose
 
-`scripts/vex/bench-clone.sh` must:
+The `git/git` seed and the benchmark are intentionally separate. Operators
+start/verify Compose and run `scripts/vex/seed-git-git.sh`; the benchmark then
+receives the exact Vex/disk endpoints rather than changing a stack while it is
+being timed.
 
-1. Ensure compose **bench** profile up and seeded.
-2. Start/ensure **disk control** bare repo served on same HTTPS front at `/disk/git.git` (classic objects on volume) for \(T_{disk}\).
-3. Run N cold-client clones to:
-   - `$GIT_VEX_ORIGIN` → \(T_{us}\)
-   - disk control URL → \(T_{disk}\)
-   - optional `https://github.com/git/git` → \(T_{gh}\) if `BENCH_INCLUDE_GITHUB=1`
-4. Emit JSON:
+`scripts/vex/bench-clone.sh` currently:
+
+1. Takes a Vex HTTPS origin, branch, output path, and either
+   `--disk-origin HTTPS_URL` or a legacy local `--baseline` bare repository.
+2. Records a deterministic source identity (Git commit/dirty bit), Compose
+   file SHA-256/project, environment, optional seed-manifest SHA-256, exact
+   branch OID, and every raw warmup/measured trial.
+3. Verifies the exact Vex/disk/GitHub branch tip before and after clones, and
+   runs `git fsck` for every clone/fetch.
+4. Reports p50/p90/p95/p99, mean/stdev/CV and policy outcomes in schema-v2
+   JSON. It writes the artifact before a failed trial or enforced gate exits.
+5. Makes the disk p50≤1.5× gate executable only with `--require-disk-gate`;
+   that flag requires an HTTPS disk control so a host-local bare path cannot
+   accidentally satisfy the same-frontend L4 rule.
+6. Includes the optional exact-ref GitHub comparison through
+   `BENCH_INCLUDE_GITHUB=1`; `--require-github` turns it into the 1.5× exit
+   gate. `--fetch-after-push` measures small-push reader fetches and restores
+   the branch by force-with-lease unless explicitly disabled.
+
+The current seed creates `t/vex/out/git-git-disk.git`, a host-local,
+bitmap-repacked bare control. It is a reproducible immediate measurement
+baseline, but not yet the required same-HTTPS route. Adding that route and
+running the hard gates remain open work; no L4 performance result is implied.
+
+Representative accepted-result shape:
 
 ```json
 {
-  "git_version": "...",
-  "host": "...",
-  "compose_project": "gitcloud",
-  "n": 5,
-  "T_us_ms": {"p50": 0, "p95": 0, "samples": []},
-  "T_disk_ms": {"p50": 0, "p95": 0, "samples": []},
-  "T_gh_ms": {"p50": 0, "p95": 0, "samples": [], "skipped": false},
-  "pass_disk_gate": true,
-  "pass_github_gate": true,
-  "bytes_us": 0,
-  "head": "..."
+  "schema_version": 2,
+  "benchmark_id": "vex-clone-...",
+  "identity": {"source": {"git_commit": "..."}, "compose": {"sha256": "..."}},
+  "trials": [{"operation": "clone", "phase": "measured", "elapsed_ms": 0}],
+  "vex_https": {"p50_ms": 0, "p95_ms": 0, "cv_percent": 0},
+  "disk_control": {"p50_ms": 0, "p95_ms": 0, "cv_percent": 0},
+  "gates": {"disk_control": {"threshold_ratio": 1.5, "pass": true}},
+  "l4_success_claim": false
 }
 ```
-
-5. Exit non-zero if gates fail when requested.
 
 ---
 
