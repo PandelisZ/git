@@ -311,8 +311,12 @@ static int curl_config_add_request(struct strbuf *config,
 	     curl_config_add(config, "header", request->header)) ||
 	    curl_config_add(config, "output", "/dev/null"))
 		goto out;
-	/* `--next` makes --fail local, so spell it out for every transfer. */
-	strbuf_addstr(config, "fail\n");
+	/*
+	 * `--next` restores transfer-local options.  Keep each request quiet and
+	 * fail-fast so curl's parallel progress meter cannot enter Git's stderr
+	 * (which receive-pack would otherwise relay to a stock client).
+	 */
+	strbuf_addstr(config, "silent\nshow-error\nfail\n");
 	if (more)
 		strbuf_addstr(config, "next\n");
 	ret = 0;
