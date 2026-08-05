@@ -436,6 +436,7 @@ libgit_sources = [
   'vex/store.c',
   'vex/meta-fs.c',
   'vex/blob-fs.c',
+  'vex/blob-s3.c',
   'odb/source-files.c',
   'odb/source-inmemory.c',
   'odb/source-loose.c',

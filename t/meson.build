@@ -27,6 +27,7 @@ clar_test_suites = [
   'unit-tests/u-trailer.c',
   'unit-tests/u-urlmatch-normalization.c',
   'unit-tests/u-utf8-width.c',
+  'unit-tests/u-vex-blob-s3.c',
   'unit-tests/u-vex-store.c',
 ]
 
