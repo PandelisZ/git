@@ -95,6 +95,23 @@ actual_one=$("$stock_git" -C "$verifier" rev-parse refs/remotes/origin/main)
 	exit 1
 }
 
+# Smart-HTTP protocol v2 is negotiated by forwarding the stock client's
+# Git-Protocol request header to git-http-backend as HTTP_GIT_PROTOCOL.  The
+# trace proves both sides of that wire negotiation instead of merely relying
+# on the successful v0-compatible clone above.
+protocol_v2_trace="$scratch/protocol-v2.trace"
+protocol_v2_curl_trace="$scratch/protocol-v2-curl.trace"
+GIT_TRACE_PACKET="$protocol_v2_trace" \
+	GIT_TRACE_CURL="$protocol_v2_curl_trace" GIT_TRACE_CURL_NO_DATA=1 \
+	"$stock_git" \
+	-c protocol.version=2 -c http.sslCAInfo="$ca_file" \
+	ls-remote "$origin" refs/heads/main >/dev/null
+grep -F 'Git-Protocol: version=2' "$protocol_v2_curl_trace" >/dev/null &&
+	grep -F 'ls-remote< version 2' "$protocol_v2_trace" >/dev/null || {
+	printf '%s\n' 'vex mysql-s3 E2E: smart-HTTP did not negotiate protocol v2' >&2
+	exit 1
+}
+
 printf 'second Vex MySQL+S3 stock-client commit\n' >>"$client/README"
 "$stock_git" -C "$client" add README
 "$stock_git" -C "$client" -c commit.gpgSign=false commit -q -m 'second Vex MySQL+S3 E2E commit'

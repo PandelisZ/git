@@ -48,10 +48,47 @@ READY_REPOSITORY = os.environ.get("VEX_STORAGE_READY_REPO", "vex-health.git")
 
 REPO_COMPONENT_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 VEX_URI_RE = re.compile(r"vex://([0-9a-fA-F]{32})\Z")
+GIT_PROTOCOL_HEADER = "Git-Protocol"
+# This is far larger than the normal ``version=2`` request while preventing a
+# client-controlled HTTP field from becoming an unbounded CGI environment
+# value.  The protocol specification carries its extra parameters in this
+# one colon-separated field.
+MAX_GIT_PROTOCOL_HEADER_BYTES = 1024
 
 
 def fail(message: str) -> "None":
     raise SystemExit(f"vex mysql-s3-http: {message}")
+
+
+def sanitized_git_protocol_header(headers: object) -> str | None:
+    """Return one safe Git-Protocol request header for CGI forwarding.
+
+    ``git-http-backend`` recognizes protocol-v2 negotiation only after its
+    CGI ``HTTP_GIT_PROTOCOL`` variable is populated.  Keep the original
+    printable-ASCII value (including colon-separated extra parameters), but
+    reject ambiguous repeated headers, controls such as CR/LF, and oversized
+    values before putting client input in the child environment.
+    """
+    get_all = getattr(headers, "get_all", None)
+    if get_all is None:
+        return None
+    values = get_all(GIT_PROTOCOL_HEADER, [])
+    if len(values) != 1:
+        return None
+    value = values[0].strip()
+    if not value or len(value) > MAX_GIT_PROTOCOL_HEADER_BYTES:
+        return None
+    if not all(" " <= char <= "~" for char in value):
+        return None
+    return value
+
+
+def set_cgi_git_protocol(environ: dict[str, str], headers: object) -> None:
+    """Set the one request-scoped protocol CGI variable, if it is valid."""
+    environ.pop("HTTP_GIT_PROTOCOL", None)
+    value = sanitized_git_protocol_header(headers)
+    if value is not None:
+        environ["HTTP_GIT_PROTOCOL"] = value
 
 
 def split_cgi_response(raw: bytes) -> tuple[int, list[tuple[str, str]], bytes]:
@@ -361,6 +398,7 @@ class VexMySQLS3HTTPRequestHandler(BaseHTTPRequestHandler):
             }
         )
         environ["PATH"] = HELPER_PATH + os.pathsep + environ.get("PATH", "")
+        set_cgi_git_protocol(environ, self.headers)
         if self._authorized():
             environ["REMOTE_USER"] = BASIC_USER
         try:
