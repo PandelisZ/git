@@ -84,6 +84,13 @@ struct vex_pack_artifact {
 	uint64_t covering_generation;
 };
 
+/* Opaque TTL-bounded protection for one packed-object serving session. */
+#define VEX_PACK_LEASE_ID_BYTES 16
+struct vex_pack_lease {
+	unsigned char id[VEX_PACK_LEASE_ID_BYTES];
+	unsigned int active:1;
+};
+
 struct vex_ref_target {
 	enum vex_ref_target_type type;
 	struct object_id oid;
@@ -116,15 +123,17 @@ struct vex_ref_update {
 
 /*
  * A sweep plan is intentionally read-only.  It performs a complete object
- * graph mark from live ref tips and durable MySQL pins, reading canonical
- * bytes from the configured blob backend.  `sealed_candidates` is therefore
- * an auditable input to a later grace-period/pack-aware deletion phase, not a
- * deletion authorization by itself.
+ * graph mark from live ref tips, durable MySQL pins, current pack members,
+ * and active clone-lease members, reading canonical bytes from the configured
+ * blob backend. `sealed_candidates` is therefore an auditable input to a
+ * later grace-period deletion phase, not a deletion authorization by itself.
  */
 struct vex_sweep_plan {
 	uint64_t published_objects;
 	uint64_t ref_roots;
 	uint64_t pin_roots;
+	uint64_t pack_roots;
+	uint64_t lease_roots;
 	uint64_t reachable_objects;
 	uint64_t sealed_candidates;
 };
@@ -236,6 +245,19 @@ int vex_store_download_pack(struct vex_store *store,
 			    const struct vex_pack_artifact *artifact,
 			    const char *pack_destination,
 			    const char *idx_destination);
+
+/*
+ * Hold an expiring metadata lease for a derived pack during server-side
+ * serving. The lease never stores pack/object bytes and can be released early
+ * once the packed source is closed. ttl_seconds must be in the bounded range
+ * accepted by the MySQL driver.
+ */
+int vex_store_pack_lease_acquire(struct vex_store *store,
+				 const struct vex_pack_artifact *artifact,
+				 unsigned int ttl_seconds,
+				 struct vex_pack_lease *lease);
+int vex_store_pack_lease_release(struct vex_store *store,
+				 struct vex_pack_lease *lease);
 
 /*
  * Enumerate visible metadata records in object-id order.  A nonzero callback

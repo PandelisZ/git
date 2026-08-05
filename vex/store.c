@@ -1422,6 +1422,49 @@ int vex_store_download_pack(struct vex_store *store,
 		idx_destination));
 }
 
+int vex_store_pack_lease_acquire(struct vex_store *store,
+				 const struct vex_pack_artifact *artifact,
+				 unsigned int ttl_seconds,
+				 struct vex_pack_lease *lease)
+{
+	int ret;
+
+	if (!store || !artifact || !lease || !ttl_seconds ||
+	    store->backend != VEX_STORE_BACKEND_MYSQL_S3)
+		return VEX_STORE_ERR_INVALID;
+	memset(lease, 0, sizeof(*lease));
+	if (csprng_bytes(lease->id, sizeof(lease->id), 0) < 0)
+		return VEX_STORE_ERR;
+	ret = meta_mysql_result(vex_meta_mysql_clone_lease_acquire(
+		store->meta_mysql, store->repo_id, artifact->pack_id.hash,
+		store->hash_algo->rawsz, lease->id, ttl_seconds));
+	if (ret) {
+		memset(lease, 0, sizeof(*lease));
+		return ret;
+	}
+	lease->active = 1;
+	return VEX_STORE_OK;
+}
+
+int vex_store_pack_lease_release(struct vex_store *store,
+				 struct vex_pack_lease *lease)
+{
+	int ret;
+
+	if (!store || !lease || store->backend != VEX_STORE_BACKEND_MYSQL_S3)
+		return VEX_STORE_ERR_INVALID;
+	if (!lease->active)
+		return VEX_STORE_OK;
+	ret = meta_mysql_result(vex_meta_mysql_clone_lease_release(
+		store->meta_mysql, store->repo_id, lease->id));
+	/* A TTL can expire after a request ended; release remains idempotent. */
+	if (ret == VEX_STORE_ERR_NOT_FOUND)
+		ret = VEX_STORE_OK;
+	if (!ret)
+		memset(lease, 0, sizeof(*lease));
+	return ret;
+}
+
 static int compare_object_ptrs(const void *a, const void *b)
 {
 	const struct vex_meta_object *const *left = a;
@@ -1561,8 +1604,15 @@ struct vex_sweep_walk {
 	struct oidset reachable;
 	struct oidset ref_roots;
 	struct oidset pin_roots;
+	struct oidset pack_roots;
+	struct oidset lease_roots;
 	struct oid_array pending;
 	int result;
+};
+
+struct vex_sweep_root_collect {
+	struct vex_sweep_walk *walk;
+	struct oidset *roots;
 };
 
 static int sweep_enqueue(struct vex_sweep_walk *walk,
@@ -1727,10 +1777,11 @@ out:
 	return ret;
 }
 
-static int sweep_collect_pin(
+static int sweep_collect_root(
 	const unsigned char raw_oid[VEX_META_MYSQL_OID_BYTES], void *cb_data)
 {
-	struct vex_sweep_walk *walk = cb_data;
+	struct vex_sweep_root_collect *collect = cb_data;
+	struct vex_sweep_walk *walk = collect->walk;
 	struct object_id oid;
 	unsigned int i;
 
@@ -1741,7 +1792,7 @@ static int sweep_collect_pin(
 			return VEX_META_MYSQL_ERR_STATE;
 		}
 	oidread(&oid, raw_oid, walk->store->hash_algo);
-	if (!oidset_insert(&walk->pin_roots, &oid))
+	if (!oidset_insert(collect->roots, &oid))
 		sweep_enqueue(walk, &oid);
 	return VEX_META_MYSQL_OK;
 }
@@ -1773,6 +1824,9 @@ int vex_store_sweep_plan(struct vex_store *store, struct vex_sweep_plan *plan)
 	struct vex_meta_lock lock;
 	struct vex_meta_state state;
 	struct vex_sweep_walk walk = { 0 };
+	struct vex_sweep_root_collect pin_collect;
+	struct vex_sweep_root_collect pack_collect;
+	struct vex_sweep_root_collect lease_collect;
 	size_t at = 0;
 	size_t i;
 	int ret;
@@ -1788,6 +1842,14 @@ int vex_store_sweep_plan(struct vex_store *store, struct vex_sweep_plan *plan)
 	oidset_init(&walk.reachable, state.objects_nr);
 	oidset_init(&walk.ref_roots, state.refs_nr);
 	oidset_init(&walk.pin_roots, state.objects_nr);
+	oidset_init(&walk.pack_roots, state.objects_nr);
+	oidset_init(&walk.lease_roots, state.objects_nr);
+	pin_collect.walk = &walk;
+	pin_collect.roots = &walk.pin_roots;
+	pack_collect.walk = &walk;
+	pack_collect.roots = &walk.pack_roots;
+	lease_collect.walk = &walk;
+	lease_collect.roots = &walk.lease_roots;
 	for (i = 0; i < state.refs_nr; i++) {
 		const struct vex_meta_ref *ref = &state.refs[i];
 
@@ -1796,8 +1858,28 @@ int vex_store_sweep_plan(struct vex_store *store, struct vex_sweep_plan *plan)
 		if (!oidset_insert(&walk.ref_roots, &ref->target.oid))
 			sweep_enqueue(&walk, &ref->target.oid);
 	}
+	ret = vex_meta_mysql_for_each_active_pack_object(
+		store->meta_mysql, store->repo_id, sweep_collect_root, &pack_collect);
+	if (walk.result) {
+		ret = walk.result;
+		goto out;
+	}
+	if (ret) {
+		ret = meta_mysql_result(ret);
+		goto out;
+	}
+	ret = vex_meta_mysql_for_each_active_clone_lease_object(
+		store->meta_mysql, store->repo_id, sweep_collect_root, &lease_collect);
+	if (walk.result) {
+		ret = walk.result;
+		goto out;
+	}
+	if (ret) {
+		ret = meta_mysql_result(ret);
+		goto out;
+	}
 	ret = vex_meta_mysql_for_each_active_pin(store->meta_mysql, store->repo_id,
-						   sweep_collect_pin, &walk);
+					   sweep_collect_root, &pin_collect);
 	if (walk.result) {
 		ret = walk.result;
 		goto out;
@@ -1826,10 +1908,14 @@ int vex_store_sweep_plan(struct vex_store *store, struct vex_sweep_plan *plan)
 	}
 	plan->ref_roots = oidset_size(&walk.ref_roots);
 	plan->pin_roots = oidset_size(&walk.pin_roots);
+	plan->pack_roots = oidset_size(&walk.pack_roots);
+	plan->lease_roots = oidset_size(&walk.lease_roots);
 	plan->reachable_objects = oidset_size(&walk.reachable);
 	ret = VEX_STORE_OK;
 out:
 	oid_array_clear(&walk.pending);
+	oidset_clear(&walk.lease_roots);
+	oidset_clear(&walk.pack_roots);
 	oidset_clear(&walk.pin_roots);
 	oidset_clear(&walk.ref_roots);
 	oidset_clear(&walk.reachable);

@@ -293,3 +293,103 @@ This does not satisfy any pack-serving or L4 checkbox. There is no
 pack invalidation on tip move, clone lease, local pack cache, bitmap/MIDX
 acceleration, direct pack stream, `git/git` fixture, or accepted clone SLO
 yet.
+
+## 2026-08-05 — Verified current S3 pack cache
+
+Added a bounded server-side read accelerator while preserving MySQL metadata
+and S3 as the durable split:
+
+- The MySQL selector returns only a `sealed` artifact whose
+  `covering_generation` exactly equals the newest sealed generation. It also
+  validates the schema's padded object-id representation and the cache reader
+  independently derives the expected per-repository S3 pack/index keys, so
+  metadata cannot redirect a pack download.
+- `odb_source_vex` streams the selected pack and index into a named scratch
+  volume, verifies the Git index and pack checksum, and exposes it as a
+  disposable packed-object source. Any cache miss, invalid artifact, or
+  download failure falls through to canonical Vex object reads.
+- The global pack bookkeeping recognizes the Vex-owned packed source, keeping
+  normal window and file-descriptor eviction safe without treating scratch as
+  a source of truth.
+- `t1522` first materializes the pair, then restarts only `git-http` with
+  `GIT_VEX_TEST_S3_FAIL_READS=1`. The hook rejects every S3 byte GET,
+  including derived-pack download; a fresh host stock-Git clone and `fsck`
+  still pass from the persisted verified cache.
+
+Verified locally:
+
+```sh
+make -j4 VEX_MYSQL=YesPlease git git-http-backend vex-sweep-plan
+# PASS
+
+make -C t unit-tests && t/unit-tests/bin/unit-tests -r vex_store
+# PASS: 262/262 full unit tests; Vex store 4/4
+
+VEX_COMPOSE_NO_BUILD=1 VEX_TEST_COMPOSE_MYSQL_S3=1 \
+  make -C t T=t1522-vex-compose-mysql-s3-pack-cache.sh
+# PASS: materialized current cache serves stock clone/fsck with all S3 byte reads faulted
+
+VEX_COMPOSE_NO_BUILD=1 VEX_TEST_COMPOSE_MYSQL_S3=1 \
+  make -C t T=t1521-vex-compose-mysql-s3-pack-artifact.sh
+# PASS: a subsequent receive retains membership and obsoletes the stale artifact
+
+VEX_COMPOSE_NO_BUILD=1 VEX_TEST_COMPOSE_MYSQL_S3=1 \
+  make -C t T=t1519-vex-compose-mysql-s3-workflows.sh
+# PASS: stock rebase, force-with-lease, and no-ff merge workflow
+```
+
+This is not direct precomputed-pack streaming or an L4 performance claim. The
+next safety work is grace-period deletion rooted in tips, pins, pack members,
+and live clone leases; cache lifecycle reclamation and direct pack serving stay
+open.
+
+## 2026-08-05 — Pack and clone-lease sweep roots
+
+Added the Stage 6 retention-root slice without enabling any deletion:
+
+- `clone_leases` stores a random opaque 16-byte lease id, pack id, and bounded
+  expiry in MySQL. It has no foreign key to `pack_envelopes`, because normal
+  Vex state saves temporarily replace pack rows; raw Git object and pack bytes
+  remain in MinIO/S3.
+- The read-only sweep plan now marks current sealed-pack members and
+  non-expired clone-lease members alongside tips and durable pins. It reports
+  separate `pack_roots` and `lease_roots` counts before emitting conservative
+  sealed candidates.
+- `odb_source_vex` acquires a 900-second clone lease before installing a local
+  verified packed cache and attempts release when the source closes. The TTL
+  is also the safe fallback for short-lived CGI processes or crashes. Test-only
+  controls shorten automatic CGI leases and disable the derived cache in the
+  planner process so root behaviour is observable; neither changes the
+  production default.
+- `vex-sweep-plan` adds `--lease-current-pack=<seconds>` and
+  `--release-pack-lease=<id>` for the operator/test path.
+
+Verified locally:
+
+```sh
+make -j4 VEX_MYSQL=YesPlease git git-http-backend vex-sweep-plan
+# PASS
+
+cd t && VEX_TEST_COMPOSE_MYSQL_S3=1 \
+  ./t1503-vex-compose-mysql-s3-sweep-plan.sh
+# PASS: 1/1
+
+cd t && VEX_TEST_COMPOSE_MYSQL_S3=1 \
+  ./t1521-vex-compose-mysql-s3-pack-artifact.sh
+# PASS: 1/1
+
+cd t && VEX_TEST_COMPOSE_MYSQL_S3=1 \
+  ./t1522-vex-compose-mysql-s3-pack-cache.sh
+# PASS: 1/1
+
+cd t && VEX_TEST_COMPOSE_MYSQL_S3=1 \
+  ./t1523-vex-compose-mysql-s3-pack-lease.sh
+# PASS: 1/1
+```
+
+`t1523` builds a three-object current pack, acquires a 900-second lease,
+force-updates the tip so that pack becomes obsolete, verifies `lease_roots=3`
+and zero candidates, releases the lease, and verifies `lease_roots=0` with
+three conservative candidates. It then fresh-clones and fscks with stock Git.
+No blob or metadata deletion, direct pack serving, or L4 performance claim is
+made.

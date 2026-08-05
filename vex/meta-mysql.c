@@ -296,6 +296,54 @@ int vex_meta_mysql_for_each_active_pin(struct vex_meta_mysql *db,
 	return mysql_unavailable();
 }
 
+int vex_meta_mysql_clone_lease_acquire(struct vex_meta_mysql *db,
+				       const char *repo_id,
+				       const unsigned char *pack_id, size_t pack_id_len,
+				       const unsigned char lease_id[VEX_META_MYSQL_LEASE_ID_BYTES],
+				       unsigned int ttl_seconds)
+{
+	(void)db;
+	(void)repo_id;
+	(void)pack_id;
+	(void)pack_id_len;
+	(void)lease_id;
+	(void)ttl_seconds;
+	return mysql_unavailable();
+}
+
+int vex_meta_mysql_clone_lease_release(struct vex_meta_mysql *db,
+				       const char *repo_id,
+				       const unsigned char lease_id[VEX_META_MYSQL_LEASE_ID_BYTES])
+{
+	(void)db;
+	(void)repo_id;
+	(void)lease_id;
+	return mysql_unavailable();
+}
+
+int vex_meta_mysql_for_each_active_pack_object(struct vex_meta_mysql *db,
+						const char *repo_id,
+						vex_meta_mysql_oid_iter_fn fn,
+						void *cb_data)
+{
+	(void)db;
+	(void)repo_id;
+	(void)fn;
+	(void)cb_data;
+	return mysql_unavailable();
+}
+
+int vex_meta_mysql_for_each_active_clone_lease_object(
+					struct vex_meta_mysql *db, const char *repo_id,
+					vex_meta_mysql_oid_iter_fn fn, void *cb_data)
+{
+	(void)db;
+	(void)repo_id;
+	(void)fn;
+	(void)cb_data;
+	return mysql_unavailable();
+}
+
 int vex_meta_mysql_state_lock(struct vex_meta_mysql *db, const char *repo_id)
 {
 	(void)db;
@@ -873,6 +921,30 @@ static int ensure_ref_updates_id_index(struct vex_meta_mysql *db)
 	return ret;
 }
 
+/*
+ * Compose volumes predate clone leases.  Keep the additive migration in the
+ * driver as well as schema.sql so an existing local MySQL volume becomes
+ * usable on restart; a lease deliberately has no pack-row FK because normal
+ * Vex state saves temporarily replace immutable pack rows.
+ */
+static int ensure_clone_leases_table(struct vex_meta_mysql *db)
+{
+	static const char create_sql[] =
+		"CREATE TABLE IF NOT EXISTS clone_leases ("
+		"repo_id BINARY(16) NOT NULL, "
+		"lease_id BINARY(16) NOT NULL, "
+		"pack_id BINARY(32) NOT NULL, "
+		"expires_at DATETIME(6) NOT NULL, "
+		"created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6), "
+		"PRIMARY KEY (repo_id, lease_id), "
+		"KEY clone_leases_active (repo_id, expires_at, pack_id), "
+		"CONSTRAINT clone_leases_repo_fk FOREIGN KEY (repo_id) "
+		"REFERENCES repositories (repo_id)"
+		") ENGINE=InnoDB";
+
+	return mysql_exec(db, create_sql);
+}
+
 int vex_meta_mysql_schema_check(struct vex_meta_mysql *db,
 				unsigned int *table_count)
 {
@@ -881,7 +953,7 @@ int vex_meta_mysql_schema_check(struct vex_meta_mysql *db,
 		"WHERE table_schema = DATABASE() AND table_name IN "
 		"('repositories','generations','objects','generation_objects',"
 		"'commit_parents','refs','ref_updates','object_pins',"
-		"'pack_envelopes','pack_objects')";
+		"'pack_envelopes','pack_objects','clone_leases')";
 	static const char blob_key_sql[] =
 		"SELECT COUNT(*) FROM information_schema.columns "
 		"WHERE table_schema = DATABASE() AND table_name = 'objects' "
@@ -893,14 +965,17 @@ int vex_meta_mysql_schema_check(struct vex_meta_mysql *db,
 
 	if (!db || !db->mysql)
 		return VEX_META_MYSQL_ERR_INVALID;
+	ret = ensure_clone_leases_table(db);
+	if (ret)
+		return ret;
 	ret = query_one_u64(db, table_sql, &tables, &found);
 	if (ret)
 		return ret;
-	if (!found || tables != 10) {
+	if (!found || tables != 11) {
 		if (table_count)
 			*table_count = found && tables <= UINT_MAX ? tables : 0;
 		return set_error(db, VEX_META_MYSQL_ERR_SCHEMA,
-				 "expected 10 Vex metadata tables, found %" PRIu64,
+				 "expected 11 Vex metadata tables, found %" PRIu64,
 				 found ? tables : 0);
 	}
 	ret = query_one_u64(db, blob_key_sql, &blob_key, &found);
@@ -1949,6 +2024,242 @@ out:
 	if (res)
 		mysql_free_result(res);
 	free(sql);
+	free(repo);
+	return ret;
+}
+
+static int for_each_oid_query(struct vex_meta_mysql *db, const char *repo_id,
+			      const char *query_format,
+			      vex_meta_mysql_oid_iter_fn fn, void *cb_data,
+			      const char *context)
+{
+	char *repo = NULL;
+	char *sql = NULL;
+	MYSQL_RES *res = NULL;
+	MYSQL_ROW row;
+	unsigned long *lengths;
+	int ret = VEX_META_MYSQL_OK;
+
+	if (!db || !db->mysql || !query_format || !fn)
+		return VEX_META_MYSQL_ERR_INVALID;
+	repo = sql_repo_literal(repo_id, NULL);
+	if (!repo) {
+		ret = set_error(db, VEX_META_MYSQL_ERR_INVALID,
+				"invalid Vex repository UUID");
+		goto out;
+	}
+	sql = vex_format(query_format, repo);
+	if (!sql) {
+		ret = set_error(db, VEX_META_MYSQL_ERR_NOMEM,
+				"could not allocate Vex %s query", context);
+		goto out;
+	}
+	if (mysql_query(db->mysql, sql)) {
+		ret = set_mysql_error(db, context);
+		goto out;
+	}
+	res = mysql_store_result(db->mysql);
+	if (!res) {
+		ret = set_mysql_error(db, "MySQL Vex root result retrieval failed");
+		goto out;
+	}
+	if (mysql_num_fields(res) != 1) {
+		ret = set_error(db, VEX_META_MYSQL_ERR,
+				"MySQL returned invalid Vex %s metadata", context);
+		goto out;
+	}
+	while ((row = mysql_fetch_row(res))) {
+		lengths = mysql_fetch_lengths(res);
+		if (!row[0] || !lengths ||
+		    lengths[0] != VEX_META_MYSQL_OID_BYTES) {
+			ret = set_error(db, VEX_META_MYSQL_ERR,
+					"MySQL returned invalid Vex %s object ID", context);
+			goto out;
+		}
+		ret = fn((const unsigned char *)row[0], cb_data);
+		if (ret)
+			goto out;
+	}
+
+out:
+	if (res)
+		mysql_free_result(res);
+	free(sql);
+	free(repo);
+	return ret;
+}
+
+int vex_meta_mysql_for_each_active_pack_object(struct vex_meta_mysql *db,
+						const char *repo_id,
+						vex_meta_mysql_oid_iter_fn fn,
+						void *cb_data)
+{
+	static const char query_format[] =
+		"SELECT DISTINCT po.oid FROM pack_envelopes AS p "
+		"INNER JOIN pack_objects AS po "
+		"ON po.repo_id = p.repo_id AND po.pack_id = p.pack_id "
+		"WHERE p.repo_id = %s AND p.state = 'sealed' ORDER BY po.oid";
+
+	return for_each_oid_query(db, repo_id, query_format, fn, cb_data,
+				  "MySQL active-pack root read failed");
+}
+
+int vex_meta_mysql_for_each_active_clone_lease_object(
+					struct vex_meta_mysql *db, const char *repo_id,
+					vex_meta_mysql_oid_iter_fn fn, void *cb_data)
+{
+	static const char query_format[] =
+		"SELECT DISTINCT po.oid FROM clone_leases AS l "
+		"INNER JOIN pack_objects AS po "
+		"ON po.repo_id = l.repo_id AND po.pack_id = l.pack_id "
+		"WHERE l.repo_id = %s AND l.expires_at > CURRENT_TIMESTAMP(6) "
+		"ORDER BY po.oid";
+
+	return for_each_oid_query(db, repo_id, query_format, fn, cb_data,
+				  "MySQL active-clone-lease root read failed");
+}
+
+int vex_meta_mysql_clone_lease_acquire(struct vex_meta_mysql *db,
+				       const char *repo_id,
+				       const unsigned char *pack_id, size_t pack_id_len,
+				       const unsigned char lease_id[VEX_META_MYSQL_LEASE_ID_BYTES],
+				       unsigned int ttl_seconds)
+{
+	char *repo = NULL;
+	char *pack = NULL;
+	char *lease = NULL;
+	char *sql = NULL;
+	uint64_t packs;
+	int found;
+	int in_transaction = 0;
+	int ret;
+
+	if (!db || !db->mysql || db->state_transaction || !lease_id ||
+	    !ttl_seconds || ttl_seconds > 86400)
+		return VEX_META_MYSQL_ERR_INVALID;
+	repo = sql_repo_literal(repo_id, NULL);
+	pack = sql_oid_literal(pack_id, pack_id_len);
+	lease = sql_hex_literal(lease_id, VEX_META_MYSQL_LEASE_ID_BYTES);
+	if (!repo || !pack || !lease) {
+		ret = set_error(db, VEX_META_MYSQL_ERR_INVALID,
+				"invalid Vex clone lease metadata");
+		goto out;
+	}
+	if ((ret = mysql_begin(db)))
+		goto out;
+	in_transaction = 1;
+	if ((ret = require_repository_locked(db, repo)))
+		goto out;
+	/* Expiry is the crash fallback; keep the table bounded on normal traffic. */
+	sql = vex_format("DELETE FROM clone_leases WHERE repo_id = %s "
+			 "AND expires_at <= CURRENT_TIMESTAMP(6)", repo);
+	if (!sql) {
+		ret = set_error(db, VEX_META_MYSQL_ERR_NOMEM,
+				"could not allocate expired Vex clone-lease cleanup");
+		goto out;
+	}
+	ret = mysql_exec(db, sql);
+	free(sql);
+	sql = NULL;
+	if (ret)
+		goto out;
+	sql = vex_format("SELECT COUNT(*) FROM pack_envelopes WHERE repo_id = %s "
+			 "AND pack_id = %s AND state IN ('sealed', 'obsolete')", repo, pack);
+	if (!sql) {
+		ret = set_error(db, VEX_META_MYSQL_ERR_NOMEM,
+				"could not allocate Vex clone-lease pack check");
+		goto out;
+	}
+	ret = query_one_u64(db, sql, &packs, &found);
+	free(sql);
+	sql = NULL;
+	if (ret)
+		goto out;
+	if (!found || packs != 1) {
+		ret = set_error(db, VEX_META_MYSQL_ERR_NOT_FOUND,
+				"Vex derived pack is not leaseable");
+		goto out;
+	}
+	sql = vex_format("INSERT INTO clone_leases "
+			 "(repo_id, lease_id, pack_id, expires_at) VALUES "
+			 "(%s, %s, %s, DATE_ADD(CURRENT_TIMESTAMP(6), "
+			 "INTERVAL %u SECOND))", repo, lease, pack, ttl_seconds);
+	if (!sql) {
+		ret = set_error(db, VEX_META_MYSQL_ERR_NOMEM,
+				"could not allocate Vex clone-lease insert");
+		goto out;
+	}
+	ret = mysql_exec(db, sql);
+	free(sql);
+	sql = NULL;
+	if (ret)
+		goto out;
+	ret = vex_mysql_commit(db);
+	if (ret)
+		goto out;
+	in_transaction = 0;
+
+out:
+	free(sql);
+	if (in_transaction)
+		vex_mysql_rollback(db);
+	free(lease);
+	free(pack);
+	free(repo);
+	return ret;
+}
+
+int vex_meta_mysql_clone_lease_release(struct vex_meta_mysql *db,
+				       const char *repo_id,
+				       const unsigned char lease_id[VEX_META_MYSQL_LEASE_ID_BYTES])
+{
+	char *repo = NULL;
+	char *lease = NULL;
+	char *sql = NULL;
+	int in_transaction = 0;
+	int ret;
+
+	if (!db || !db->mysql || db->state_transaction || !lease_id)
+		return VEX_META_MYSQL_ERR_INVALID;
+	repo = sql_repo_literal(repo_id, NULL);
+	lease = sql_hex_literal(lease_id, VEX_META_MYSQL_LEASE_ID_BYTES);
+	if (!repo || !lease) {
+		ret = set_error(db, VEX_META_MYSQL_ERR_INVALID,
+				"invalid Vex clone lease release metadata");
+		goto out;
+	}
+	if ((ret = mysql_begin(db)))
+		goto out;
+	in_transaction = 1;
+	if ((ret = require_repository_locked(db, repo)))
+		goto out;
+	sql = vex_format("DELETE FROM clone_leases WHERE repo_id = %s "
+			 "AND lease_id = %s", repo, lease);
+	if (!sql) {
+		ret = set_error(db, VEX_META_MYSQL_ERR_NOMEM,
+				"could not allocate Vex clone-lease release");
+		goto out;
+	}
+	ret = mysql_exec(db, sql);
+	free(sql);
+	sql = NULL;
+	if (ret)
+		goto out;
+	if (mysql_affected_rows(db->mysql) != 1) {
+		ret = set_error(db, VEX_META_MYSQL_ERR_NOT_FOUND,
+				"Vex clone lease does not exist");
+		goto out;
+	}
+	ret = vex_mysql_commit(db);
+	if (ret)
+		goto out;
+	in_transaction = 0;
+
+out:
+	free(sql);
+	if (in_transaction)
+		vex_mysql_rollback(db);
+	free(lease);
 	free(repo);
 	return ret;
 }

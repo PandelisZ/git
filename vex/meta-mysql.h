@@ -18,6 +18,7 @@
 
 #define VEX_META_MYSQL_REPO_ID_HEXSZ 32
 #define VEX_META_MYSQL_OID_BYTES 32
+#define VEX_META_MYSQL_LEASE_ID_BYTES 16
 #define VEX_META_MYSQL_VERSION_ABSENT UINT64_MAX
 
 struct vex_meta_mysql;
@@ -93,6 +94,10 @@ struct vex_meta_mysql_options {
 typedef int (*vex_meta_mysql_pin_iter_fn)(
 	const unsigned char oid[VEX_META_MYSQL_OID_BYTES], void *cb_data);
 
+/* Pack and lease roots use the same padded BINARY(32) object-id shape. */
+typedef int (*vex_meta_mysql_oid_iter_fn)(
+	const unsigned char oid[VEX_META_MYSQL_OID_BYTES], void *cb_data);
+
 /*
  * Decode either 32 lower-case hexadecimal digits or a lower-case hyphenated
  * UUID into the BINARY(16) repository key used by schema.sql.
@@ -107,7 +112,7 @@ const char *vex_meta_mysql_error(const struct vex_meta_mysql *db);
 
 int vex_meta_mysql_ping(struct vex_meta_mysql *db);
 
-/* Verify the ten Vex metadata tables and objects.blob_key's metadata type. */
+/* Verify the eleven Vex metadata tables and objects.blob_key's metadata type. */
 int vex_meta_mysql_schema_check(struct vex_meta_mysql *db,
 				unsigned int *table_count);
 
@@ -219,6 +224,29 @@ int vex_meta_mysql_for_each_active_pin(struct vex_meta_mysql *db,
 					const char *repo_id,
 					vex_meta_mysql_pin_iter_fn fn,
 					void *cb_data);
+
+/*
+ * Clone leases protect every object in a pack while an upload-pack/cache
+ * reader can still serve it. `lease_id` is an opaque random BINARY(16) token;
+ * expiry is a bounded crash fallback, not a source of object data.
+ */
+int vex_meta_mysql_clone_lease_acquire(struct vex_meta_mysql *db,
+				       const char *repo_id,
+				       const unsigned char *pack_id, size_t pack_id_len,
+				       const unsigned char lease_id[VEX_META_MYSQL_LEASE_ID_BYTES],
+				       unsigned int ttl_seconds);
+int vex_meta_mysql_clone_lease_release(struct vex_meta_mysql *db,
+				       const char *repo_id,
+				       const unsigned char lease_id[VEX_META_MYSQL_LEASE_ID_BYTES]);
+
+/* Enumerate objects retained by current sealed packs and non-expired leases. */
+int vex_meta_mysql_for_each_active_pack_object(struct vex_meta_mysql *db,
+						const char *repo_id,
+						vex_meta_mysql_oid_iter_fn fn,
+						void *cb_data);
+int vex_meta_mysql_for_each_active_clone_lease_object(
+					struct vex_meta_mysql *db, const char *repo_id,
+					vex_meta_mysql_oid_iter_fn fn, void *cb_data);
 
 /*
  * Store adapter boundary.  These methods project the existing Vex metadata

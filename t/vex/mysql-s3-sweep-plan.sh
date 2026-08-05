@@ -23,7 +23,11 @@ up_args=()
 case "${VEX_COMPOSE_NO_BUILD:-}" in
 1|true|yes) up_args+=(--no-build) ;;
 esac
-"$root/scripts/vex/up.sh" "${up_args[@]}" >/dev/null
+if [ "${#up_args[@]}" -eq 0 ]; then
+	"$root/scripts/vex/up.sh" >/dev/null
+else
+	"$root/scripts/vex/up.sh" "${up_args[@]}" >/dev/null
+fi
 [ -f "$env_file" ] || env_file="$docker_dir/.env.example"
 set -a
 # shellcheck disable=SC1090

@@ -150,3 +150,20 @@ CREATE TABLE IF NOT EXISTS pack_objects (
 	CONSTRAINT pack_objects_object_fk FOREIGN KEY (repo_id, oid)
 		REFERENCES objects (repo_id, oid)
 ) ENGINE=InnoDB;
+
+-- A live upload-pack/cache reader leases one immutable pack while it may
+-- serve its members. There is intentionally no foreign key to pack_envelopes:
+-- the state adapter rewrites immutable pack rows inside its repository
+-- transaction, while a lease must survive that short rewrite and expire by
+-- its TTL if a server process dies.
+CREATE TABLE IF NOT EXISTS clone_leases (
+	repo_id BINARY(16) NOT NULL,
+	lease_id BINARY(16) NOT NULL,
+	pack_id BINARY(32) NOT NULL,
+	expires_at DATETIME(6) NOT NULL,
+	created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+	PRIMARY KEY (repo_id, lease_id),
+	KEY clone_leases_active (repo_id, expires_at, pack_id),
+	CONSTRAINT clone_leases_repo_fk FOREIGN KEY (repo_id)
+		REFERENCES repositories (repo_id)
+) ENGINE=InnoDB;

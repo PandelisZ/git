@@ -1,7 +1,7 @@
 # Vex Stage Playbooks PRD
 
 **Status:** Active
-**Current Stage:** 4 - MySQL metadata + S3 object-byte Compose data plane
+**Current Stage:** 4 + Stage 6 read-only retention roots
 **Owner:** Codex
 **Created:** 2026-08-05
 **Updated:** 2026-08-05
@@ -302,15 +302,18 @@ Acceptance: FLUSHALL safe; default profile still passes without Valkey.
 Tasks:
 
 1. [x] Seal published generations
-2. [~] Read-only graph mark from tips and durable pins; grace-period policy
-   remains pending
-3. Delete blob+index **only if** not in tips ∪ pins ∪ **active advertised packs**
+2. [x] Read-only graph mark from tips, durable pins, current sealed packs,
+   and non-expired clone leases; grace-period policy remains pending
+3. Delete blob+index **only if** not in tips ∪ pins ∪ **active advertised
+   packs** ∪ **live clone leases**
 4. [x] Durable pins
 5. Optional auto-pin previous default-branch tip on force (open product flag)
-6. Test: object only reachable via advertised pack is not swept
+6. [x] Test: a pack becomes obsolete after a stock-Git state rewrite, but its
+   members remain roots while a clone lease is live and return as candidates
+   after release
 
-Acceptance: **not reached**. Pins and the conservative mark proof are green,
-but deletion and pack/lease roots remain required.
+Acceptance: **not reached**. Pins, current packs, and clone leases are proven
+conservative roots, but deletion remains required.
 
 ### Stage 6 add-on — push stress soak
 
@@ -402,7 +405,7 @@ Tasks:
 
 - Playbooks derived from 001 stages + 003 passes 02,05,13,14,16,21,25,26,28,35.
 - receive-pack quarantine/`odb_transaction` integration requirement confirmed in-tree.
-- Compose Stage 4 data plane: source-built Vex Git, MySQL metadata, and MinIO canonical bytes verified by `t1497`; `t1498` is green for the serial 20× smoke plus reconciliation and the 500-commit ramp; `t1499` is green for receive compensation; `t1500` is green for two concurrent repositories; `t1501` forces S3-promotion compensation; `t1502` hashes canonical bytes; `t1503` proves pin/mark protection; `t1518` runs eight readers during twenty writer pushes; `t1519` covers rebase/lease/merge workflows; `t1520` verifies measurement-only p50/p90 benchmark JSON; `t1521` builds/records a per-repository S3 pack artifact that survives a later receive; and `t1522` proves a fresh stock clone and `fsck` use the verified current packed cache when every S3 byte read is faulted. The cache remains a server-side normal-object-read accelerator, not a direct precomputed-pack client stream. Hard-kill chaos, destructive pack/lease-aware sweeping, cache lifecycle invalidation, direct pack serve, and the L4 SLO remain next.
+- Compose Stage 4 data plane: source-built Vex Git, MySQL metadata, and MinIO canonical bytes verified by `t1497`; `t1498` is green for the serial 20× smoke plus reconciliation and the 500-commit ramp; `t1499` is green for receive compensation; `t1500` is green for two concurrent repositories; `t1501` forces S3-promotion compensation; `t1502` hashes canonical bytes; `t1503` proves pin/mark protection; `t1518` runs eight readers during twenty writer pushes; `t1519` covers rebase/lease/merge workflows; `t1520` verifies measurement-only p50/p90 benchmark JSON; `t1521` builds/records a per-repository S3 pack artifact that survives a later receive; `t1522` proves a fresh stock clone and `fsck` use the verified current packed cache when every S3 byte read is faulted; and `t1523` proves current pack plus live clone-lease members remain read-only sweep roots across a stock-Git state rewrite and return as candidates only after release. The cache remains a server-side normal-object-read accelerator, not a direct precomputed-pack client stream. Hard-kill chaos, destructive pack/lease-aware sweeping, cache lifecycle invalidation, direct pack serve, and the L4 SLO remain next.
 
 ## Open Questions
 

@@ -112,6 +112,9 @@ services:
       # Test-only: reject all S3 byte reads after a derived pack has been
       # materialized, proving that normal Git object reads use the cache.
       GIT_VEX_TEST_S3_FAIL_READS: ${GIT_VEX_TEST_S3_FAIL_READS:-}
+      # Test-only: shorten CGI/cache pack leases without weakening the
+      # production 900-second retention window.
+      GIT_VEX_TEST_PACK_LEASE_SECONDS: ${GIT_VEX_TEST_PACK_LEASE_SECONDS:-}
       GIT_VEX_SCRATCH: /var/git-scratch
       GIT_VEX_REPO_GIT_GIT_UUID: ${GIT_VEX_REPO_GIT_GIT_UUID}
       VEX_GIT_HTTP_COMMAND: ${VEX_GIT_HTTP_COMMAND:-/usr/local/lib/vex-git-http/vex_mysql_s3_http.py}

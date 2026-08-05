@@ -15,6 +15,7 @@
 #include "odb/source-vex.h"
 #include "odb/streaming.h"
 #include "odb/transaction.h"
+#include "parse.h"
 #include "path.h"
 #include "repository.h"
 #include "strbuf.h"
@@ -22,6 +23,8 @@
 #include "tempfile.h"
 #include "trace.h"
 #include "wrapper.h"
+
+#define VEX_DERIVED_PACK_CACHE_LEASE_SECONDS 900
 
 /*
  * The Vex source deliberately keeps source.path pointed at the thin
@@ -41,6 +44,8 @@ struct odb_source_vex {
 	struct odb_source_packed *pack_cache;
 	char *pack_cache_id;
 	char *pack_cache_path;
+	/* Protect the selected pack while this source can serve it locally. */
+	struct vex_pack_lease pack_lease;
 };
 
 struct odb_transaction_vex {
@@ -219,6 +224,8 @@ int vex_store_open_for_repository(struct repository *repo, const char *gitdir,
 
 static void vex_source_release_pack_cache(struct odb_source_vex *source)
 {
+	int ret;
+
 	if (source->pack_cache) {
 		odb_source_close(&source->pack_cache->base);
 		odb_source_free(&source->pack_cache->base);
@@ -228,6 +235,37 @@ static void vex_source_release_pack_cache(struct odb_source_vex *source)
 	source->pack_cache_id = NULL;
 	free(source->pack_cache_path);
 	source->pack_cache_path = NULL;
+	if (!source->pack_lease.active)
+		return;
+	ret = source->store ?
+		vex_store_pack_lease_release(source->store, &source->pack_lease) :
+		VEX_STORE_ERR_INVALID;
+	if (ret)
+		trace_printf("vex: could not release derived pack lease repo=%s (%d)",
+			     source->store ? vex_store_repo_id(source->store) : "unknown", ret);
+	/* A failed release is safely bounded by the durable lease TTL. */
+	memset(&source->pack_lease, 0, sizeof(source->pack_lease));
+}
+
+static unsigned int vex_source_pack_cache_lease_seconds(void)
+{
+	const char *value = getenv("GIT_VEX_TEST_PACK_LEASE_SECONDS");
+	unsigned long ttl;
+
+	/* Test-only override; production always uses the conservative default. */
+	if (!value || !*value)
+		return VEX_DERIVED_PACK_CACHE_LEASE_SECONDS;
+	ttl = git_env_ulong("GIT_VEX_TEST_PACK_LEASE_SECONDS",
+				    VEX_DERIVED_PACK_CACHE_LEASE_SECONDS);
+	if (!ttl || ttl > 86400)
+		return VEX_DERIVED_PACK_CACHE_LEASE_SECONDS;
+	return ttl;
+}
+
+static int vex_source_derived_pack_cache_enabled(void)
+{
+	/* A planner test can exercise metadata roots without creating a cache lease. */
+	return !git_env_bool("GIT_VEX_TEST_DISABLE_DERIVED_PACK_CACHE", 0);
 }
 
 static char *vex_source_pack_cache_root(const struct odb_source_vex *source)
@@ -408,6 +446,7 @@ out:
 static int vex_source_refresh_pack_cache(struct odb_source_vex *source)
 {
 	struct vex_pack_artifact artifact;
+	struct vex_pack_lease new_lease = { 0 };
 	char pack_id[GIT_MAX_HEXSZ + 1];
 	int ret;
 
@@ -421,9 +460,34 @@ static int vex_source_refresh_pack_cache(struct odb_source_vex *source)
 	hash_to_hex_algop_r(pack_id, artifact.pack_id.hash,
 			    source->base.odb->repo->hash_algo);
 	if (source->pack_cache && source->pack_cache_id &&
-	    !strcmp(source->pack_cache_id, pack_id))
+	    !strcmp(source->pack_cache_id, pack_id) && source->pack_lease.active)
 		return 0;
+	/*
+	 * Acquire before installing so a sweep can never see a locally serving
+	 * cache without a durable retention root.  install_pack_cache() releases
+	 * the old cache/lease only after the replacement has verified.
+	 */
+	ret = vex_store_pack_lease_acquire(source->store, &artifact,
+					 vex_source_pack_cache_lease_seconds(),
+					 &new_lease);
+	if (ret)
+		return ret;
+	if (source->pack_cache && source->pack_cache_id &&
+	    !strcmp(source->pack_cache_id, pack_id)) {
+		source->pack_lease = new_lease;
+		return 0;
+	}
 	ret = vex_source_install_pack_cache(source, &artifact, pack_id);
+	if (ret) {
+		int release_ret = vex_store_pack_lease_release(source->store,
+							       &new_lease);
+
+		if (release_ret)
+			trace_printf("vex: could not release failed derived pack lease repo=%s (%d)",
+				     vex_store_repo_id(source->store), release_ret);
+		return ret;
+	}
+	source->pack_lease = new_lease;
 	if (!ret)
 		trace_printf("vex: activated derived pack cache repo=%s pack=%s generation=%"PRIu64,
 			     vex_store_repo_id(source->store), pack_id,
@@ -443,6 +507,8 @@ static int vex_source_open(struct odb_source_vex *source)
 	if (ret)
 		return ret;
 	/* The cache is strictly opportunistic: canonical Vex reads stay available. */
+	if (!vex_source_derived_pack_cache_enabled())
+		return 0;
 	ret = vex_source_refresh_pack_cache(source);
 	if (ret)
 		trace_printf("vex: derived pack cache unavailable repo=%s (%d)",
@@ -610,7 +676,8 @@ static int odb_source_vex_read_object_info(struct odb_source *base,
 
 	if (vex_source_open(source))
 		return -1;
-	if (flags & OBJECT_INFO_SECOND_READ) {
+	if ((flags & OBJECT_INFO_SECOND_READ) &&
+	    vex_source_derived_pack_cache_enabled()) {
 		ret = vex_source_refresh_pack_cache(source);
 		if (ret)
 			trace_printf("vex: derived pack cache refresh unavailable repo=%s (%d)",
@@ -1096,7 +1163,8 @@ static void odb_source_vex_prepare(struct odb_source *base,
 
 	if (vex_source_open(source))
 		return;
-	if (flags & ODB_PREPARE_FLUSH_CACHES) {
+	if ((flags & ODB_PREPARE_FLUSH_CACHES) &&
+	    vex_source_derived_pack_cache_enabled()) {
 		ret = vex_source_refresh_pack_cache(source);
 		if (ret)
 			trace_printf("vex: derived pack cache refresh unavailable repo=%s (%d)",

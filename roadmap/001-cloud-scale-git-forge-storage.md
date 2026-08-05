@@ -1,7 +1,7 @@
 # Vex Git Forge Storage (Cloud-Scale PoC) PRD
 
 **Status:** Active
-**Current Stage:** 4 - MySQL metadata + S3 object-byte data plane; L3 safety foundation
+**Current Stage:** 4 - MySQL metadata + S3 object-byte data plane; L3 read-only retention roots
 **Owner:** Codex
 **Created:** 2026-08-05
 **Updated:** 2026-08-05
@@ -17,9 +17,11 @@ artifact now reaches per-repository S3 keys with a MySQL envelope/object map;
 the current sealed artifact is downloaded into a verified, disposable local
 packed-object cache for normal server-side object reads. `t1522` proves a
 fresh stock clone and `fsck` still succeed after all S3 byte reads are faulted.
-This is not direct precomputed-pack streaming to the client or an L4 result.
-Hard-kill chaos, destructive grace-period sweeping, pack/lease roots, cache
-lifecycle invalidation, and the sealed-pack L4 serve path remain pending.
+The read-only sweep plan now marks current sealed-pack members and live
+clone-lease members in addition to tips and pins. This is not direct
+precomputed-pack streaming to the client, destructive sweeping, or an L4
+result. Hard-kill chaos, grace-period deletion, cache lifecycle invalidation,
+and the sealed-pack L4 serve path remain pending.
 
 **Implementation identity:** this experiment is the **Vex backend**.  “Cloud
 storage” describes its MySQL + blob-store architecture; code, extension URIs,
@@ -75,7 +77,7 @@ Git durable state is disk-native (loose/pack objects, file/reftable refs, reacha
 | S4 | Clone SLO | Mirror of `github.com/git/git`: \(T_{us} \le 1.5\,T_{gh}\) and \(T_{us} \le 1.5\,T_{disk}\) (p50, N≥5) |
 | S4b | Fetch-after-push SLO | After one small push invalidates tip pack coverage, incremental fetch p50 ≤ **2.0×** disk control (secondary; product rejection mode) |
 | S5 | Crash safety | Kill mid-push ⇒ no tip advance; no index without blob; hooks before publish |
-| S6 | GC | `git gc`/repack/midx **safe-fail** with operator message; sweeper respects tips/pins/**active packs** |
+| S6 | GC | `git gc`/repack/midx **safe-fail** with operator message; sweeper respects tips/pins/**active packs**/**live clone leases** |
 | S7 | Loss domains | Redis flush or scratch wipe ⇒ still correct |
 | S8 | Dev loop | fs backend unit tests without Docker |
 | S9 | Local integrate | Docker Compose MySQL + MinIO (+ optional Valkey); no AWS required for tests ([006](006-local-docker-compose-test-environment.md)) |
@@ -423,16 +425,19 @@ Acceptance: FLUSHALL safe on compose Valkey; stale cache cannot resurrect tips; 
 
 ### Stage 6: sealer / sweeper / pins
 
-**Status:** Active — durable pins and read-only reachability mark
+**Status:** Active — pins plus pack/clone-lease roots in a read-only mark
 **Owned Paths:** `vex/store.[ch]`, `vex/meta-mysql.[ch]`, operator helper,
 Compose tests
 
 - [x] Durable MySQL pins survive later MySQL state writes.
 - [x] Read-only graph mark walks refs and pins through canonical S3 bytes.
+- [x] Current sealed pack members are durable read-only sweep roots.
+- [x] Opaque TTL-bound clone leases retain obsolete pack members across a
+  normal MySQL state rewrite; the local packed cache acquires one before use.
 - [ ] Grace-period deletion of blob+index only after tip/pin/**pack/lease** roots.
 
-Acceptance: **not reached**. Pin protection and conservative candidates are
-proven; destructive grace-period sweeping and pack/lease roots are pending.
+Acceptance: **not reached**. Tips, pins, current packs, and live leases are
+proven roots; destructive grace-period sweeping remains pending.
 
 ### Stage 7: Bundle URI / pack path + git/git SLO (L4) — **acceptance stage**
 
@@ -537,8 +542,22 @@ scripts/vex/bench-clone.sh
   reconciliation.
 
 These are L3 foundations only. Hard-kill chaos, grace-period deletion,
-pack/clone-lease roots, sealed-pack serving, `git/git` import, and clone SLOs
-remain open.
+sealed-pack serving, `git/git` import, and clone SLOs remain open.
+
+### 2026-08-05 - Stage 6 pack and clone-lease roots
+
+- `clone_leases` stores only `(repo_id, opaque lease id, pack id, expiry)`;
+  it deliberately has no foreign key to temporary pack-row rewrites, while
+  raw object and pack bytes remain in S3.
+- The read-only planner marks members of current sealed packs and non-expired
+  clone leases before calculating sealed candidates. The local packed-object
+  cache acquires a 900-second lease before it can serve a selected pack; a
+  failed process is bounded by that TTL.
+- `t1523-vex-compose-mysql-s3-pack-lease.sh` passes: a three-object pack
+  becomes obsolete after a stock-Git force update, its three members remain
+  roots while leased, and release restores three conservative candidates.
+- `t1503`, `t1521`, and `t1522` remain green after the root change.
+- No deletion path is implemented or claimed.
 
 ---
 

@@ -22,10 +22,10 @@ set -a
 set +a
 compose=(docker compose -f "$docker_dir/compose.yaml" --env-file "$env_file")
 
-expected_tables=10
+expected_tables=11
 table_count=$("${compose[@]}" exec -T mysql \
 	mysql --protocol=TCP -h 127.0.0.1 -u "$MYSQL_USER" -p"$MYSQL_PASSWORD" -N -B "$MYSQL_DATABASE" \
-	-e "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name IN ('repositories','generations','objects','generation_objects','commit_parents','refs','ref_updates','object_pins','pack_envelopes','pack_objects');")
+	-e "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name IN ('repositories','generations','objects','generation_objects','commit_parents','refs','ref_updates','object_pins','pack_envelopes','pack_objects','clone_leases');")
 [ "$table_count" = "$expected_tables" ] || {
 	printf 'vex integration: expected %s Vex metadata tables, found %s; use scripts/vex/reset.sh after schema changes\n' "$expected_tables" "$table_count" >&2
 	exit 1
