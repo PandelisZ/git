@@ -57,6 +57,8 @@ def main() -> int:
             # repository and discover the nested fake repository.  Health
             # discovery must stop at the git/git scaffold instead.
             write_repository(stalled / "objects", "unreachable.git", hidden_uri)
+            # Health also must not follow a repository-shaped symlink.
+            (root / "linked.git").symlink_to(stalled, target_is_directory=True)
 
             gateway.ROOT = root
             gateway.HEALTH_SCAN_MAX_REPOSITORIES = 16
