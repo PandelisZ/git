@@ -272,6 +272,7 @@ integration_tests = [
   't1524-vex-compose-mysql-s3-hard-kill.sh',
   't1525-vex-git-protocol-http.sh',
   't1526-vex-compose-mysql-s3-precomputed-pack.sh',
+  't1527-vex-compose-mysql-s3-streaming-http.sh',
   't1600-index.sh',
   't1601-index-bogus.sh',
   't1700-split-index.sh',

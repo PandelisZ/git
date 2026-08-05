@@ -20,11 +20,12 @@ import signal
 import ssl
 import subprocess
 import sys
+import tempfile
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Iterable
+from typing import BinaryIO, Iterable
 from urllib.parse import unquote, urlsplit
 
 
@@ -36,7 +37,18 @@ ALLOW_HTTP = os.environ.get("GIT_ALLOW_HTTP", "1") == "1"
 REQUIRE_PUSH_AUTH = os.environ.get("VEX_HTTP_REQUIRE_PUSH_AUTH", "1") == "1"
 BASIC_USER = os.environ.get("VEX_HTTP_BASIC_USER", "vex")
 BASIC_PASSWORD = os.environ.get("VEX_HTTP_BASIC_PASSWORD", "")
-MAX_REQUEST_BYTES = int(os.environ.get("VEX_HTTP_MAX_REQUEST_BYTES", "67108864"))
+# A git/git mirror import is materially larger than the original 64 MiB
+# bootstrap limit.  The request is relayed incrementally below, so this is a
+# disk/network admission limit rather than a RAM allocation.  Operators can
+# still lower it for a tightly bounded deployment.
+DEFAULT_MAX_REQUEST_BYTES = 8 * 1024 * 1024 * 1024
+MAX_REQUEST_BYTES = int(os.environ.get("VEX_HTTP_MAX_REQUEST_BYTES", str(DEFAULT_MAX_REQUEST_BYTES)))
+MAX_CGI_HEADER_BYTES = int(os.environ.get("VEX_HTTP_MAX_CGI_HEADER_BYTES", "65536"))
+MAX_CHUNK_LINE_BYTES = int(os.environ.get("VEX_HTTP_MAX_CHUNK_LINE_BYTES", "8192"))
+MAX_CHUNK_TRAILER_BYTES = int(os.environ.get("VEX_HTTP_MAX_CHUNK_TRAILER_BYTES", "65536"))
+STREAM_CHUNK_BYTES = int(os.environ.get("VEX_HTTP_STREAM_CHUNK_BYTES", "65536"))
+CGI_TIMEOUT_SECONDS = int(os.environ.get("VEX_HTTP_CGI_TIMEOUT_SECONDS", "300"))
+IO_TIMEOUT_SECONDS = int(os.environ.get("VEX_HTTP_IO_TIMEOUT_SECONDS", "300"))
 CERT = os.environ.get("VEX_HTTP_TLS_CERT", "/certs/localhost.pem")
 KEY = os.environ.get("VEX_HTTP_TLS_KEY", "/certs/localhost.key")
 GIT = os.environ.get("VEX_GIT", "/opt/vex-git/git")
@@ -54,6 +66,49 @@ GIT_PROTOCOL_HEADER = "Git-Protocol"
 # value.  The protocol specification carries its extra parameters in this
 # one colon-separated field.
 MAX_GIT_PROTOCOL_HEADER_BYTES = 1024
+CGI_HOP_BY_HOP_HEADERS = frozenset(
+    {
+        "connection",
+        "keep-alive",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
+    }
+)
+HTTP_TOKEN_RE = re.compile(r"[!#$%&'*+\-.^_`|~0-9A-Za-z]+\Z")
+
+
+class RequestBodyError(Exception):
+    """A client body did not match the declared safe HTTP framing."""
+
+
+class CGIResponseError(Exception):
+    """The CGI child did not produce a bounded, valid response header."""
+
+
+@dataclass
+class RequestBody:
+    """A decoded request source which can be copied to CGI incrementally."""
+
+    length: int
+    source: BinaryIO
+    close_source: bool = False
+
+    def close(self) -> None:
+        if self.close_source:
+            self.source.close()
+
+
+@dataclass
+class StdinPumpResult:
+    """Outcome shared between the request relay and the response relay."""
+
+    bytes_copied: int = 0
+    error: BaseException | None = None
+    done: threading.Event = field(default_factory=threading.Event)
 
 
 def fail(message: str) -> "None":
@@ -91,38 +146,146 @@ def set_cgi_git_protocol(environ: dict[str, str], headers: object) -> None:
         environ["HTTP_GIT_PROTOCOL"] = value
 
 
+def _malformed_cgi_response() -> CGIResponseError:
+    return CGIResponseError("git-http-backend returned malformed CGI output")
+
+
+def parse_cgi_headers(header_bytes: bytes) -> tuple[int, list[tuple[str, str]]]:
+    """Validate the bounded CGI header block before sending any HTTP bytes."""
+    if not header_bytes:
+        raise _malformed_cgi_response()
+
+    lines = header_bytes.split(b"\r\n") if b"\r\n" in header_bytes else header_bytes.split(b"\n")
+    status = 200
+    headers: list[tuple[str, str]] = []
+    content_length: str | None = None
+    for line in lines:
+        if not line or b":" not in line:
+            raise _malformed_cgi_response()
+        name, value = line.split(b":", 1)
+        try:
+            name_text = name.decode("ascii")
+            value_text = value.decode("latin-1").strip()
+        except UnicodeDecodeError as error:
+            raise _malformed_cgi_response() from error
+        if not HTTP_TOKEN_RE.fullmatch(name_text):
+            raise _malformed_cgi_response()
+        if any(ord(character) < 32 and character != "\t" or ord(character) == 127 for character in value_text):
+            raise _malformed_cgi_response()
+
+        lowered = name_text.lower()
+        if lowered == "status":
+            try:
+                status = int(value_text.split(None, 1)[0])
+            except (IndexError, ValueError) as error:
+                raise _malformed_cgi_response() from error
+            if status < 100 or status > 599:
+                raise _malformed_cgi_response()
+            continue
+        if lowered in CGI_HOP_BY_HOP_HEADERS:
+            continue
+        if lowered == "content-length":
+            if not value_text.isdecimal():
+                raise _malformed_cgi_response()
+            if content_length is not None and content_length != value_text:
+                raise _malformed_cgi_response()
+            content_length = value_text
+        headers.append((name_text, value_text))
+    return status, headers
+
+
 def split_cgi_response(raw: bytes) -> tuple[int, list[tuple[str, str]], bytes]:
-    """Return a validated CGI status, headers, and body."""
+    """Return a validated CGI status, headers, and body for small callers.
+
+    The gateway itself uses :func:`read_cgi_response_headers` so a large pack
+    body is never accumulated here.  Retaining this helper makes the malformed
+    CGI contract easy to exercise in a focused test.
+    """
     if b"\r\n\r\n" in raw:
         header_bytes, body = raw.split(b"\r\n\r\n", 1)
-        lines = header_bytes.split(b"\r\n")
     elif b"\n\n" in raw:
         header_bytes, body = raw.split(b"\n\n", 1)
-        lines = header_bytes.split(b"\n")
     else:
         return (
             502,
             [("Content-Type", "text/plain; charset=utf-8")],
             b"git-http-backend returned malformed CGI output\n",
         )
-
-    status = 200
-    headers: list[tuple[str, str]] = []
-    for line in lines:
-        if not line or b":" not in line:
-            continue
-        name, value = line.split(b":", 1)
-        name_text = name.decode("latin-1").strip()
-        value_text = value.decode("latin-1").strip()
-        if name_text.lower() == "status":
-            try:
-                status = int(value_text.split(None, 1)[0])
-            except (IndexError, ValueError):
-                status = 502
-            continue
-        if name_text.lower() not in {"connection", "transfer-encoding"}:
-            headers.append((name_text, value_text))
+    try:
+        status, headers = parse_cgi_headers(header_bytes)
+    except CGIResponseError:
+        return (
+            502,
+            [("Content-Type", "text/plain; charset=utf-8")],
+            b"git-http-backend returned malformed CGI output\n",
+        )
     return status, headers, body
+
+
+def read_cgi_response_headers(
+    stream: BinaryIO,
+    max_header_bytes: int = MAX_CGI_HEADER_BYTES,
+) -> tuple[int, list[tuple[str, str]], bytes]:
+    """Read exactly one bounded CGI header block and retain any body prefix.
+
+    ``BufferedReader.read1`` avoids waiting for an arbitrary pack-sized read.
+    It can still return bytes after the header delimiter, which are returned as
+    ``body_prefix`` and relayed before subsequent stream reads.
+    """
+    raw = bytearray()
+    reader = getattr(stream, "read1", stream.read)
+    while True:
+        crlf_end = raw.find(b"\r\n\r\n")
+        lf_end = raw.find(b"\n\n")
+        if crlf_end >= 0 and (lf_end < 0 or crlf_end <= lf_end):
+            delimiter_length = 4
+            header_end = crlf_end
+        elif lf_end >= 0:
+            delimiter_length = 2
+            header_end = lf_end
+        else:
+            if len(raw) > max_header_bytes:
+                raise _malformed_cgi_response()
+            chunk = reader(min(STREAM_CHUNK_BYTES, max_header_bytes + 4 - len(raw)))
+            if not chunk:
+                raise _malformed_cgi_response()
+            raw.extend(chunk)
+            continue
+
+        if header_end > max_header_bytes:
+            raise _malformed_cgi_response()
+        status, headers = parse_cgi_headers(bytes(raw[:header_end]))
+        return status, headers, bytes(raw[header_end + delimiter_length :])
+
+
+def copy_request_body(source: BinaryIO, destination: BinaryIO, length: int) -> int:
+    """Copy a declared request length without creating a whole-body buffer."""
+    remaining = length
+    copied = 0
+    while remaining:
+        chunk = source.read(min(STREAM_CHUNK_BYTES, remaining))
+        if not chunk:
+            raise RequestBodyError("truncated request body")
+        destination.write(chunk)
+        destination.flush()
+        copied += len(chunk)
+        remaining -= len(chunk)
+    return copied
+
+
+def drain_child_stderr(stream: BinaryIO) -> None:
+    """Relay CGI diagnostics continuously so stderr can never fill its pipe."""
+    while True:
+        chunk = stream.read(STREAM_CHUNK_BYTES)
+        if not chunk:
+            return
+        destination = getattr(sys.stderr, "buffer", None)
+        if destination is not None:
+            destination.write(chunk)
+            destination.flush()
+        else:
+            sys.stderr.write(chunk.decode("utf-8", "replace"))
+            sys.stderr.flush()
 
 
 @dataclass(frozen=True)
@@ -232,6 +395,12 @@ class VexMySQLS3HTTPRequestHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "VexMySQLS3HTTP/0"
 
+    def setup(self) -> None:
+        super().setup()
+        # The relay has bounded byte and header limits, but a client must also
+        # make progress while it holds a worker thread or a CGI stdin pipe.
+        self.connection.settimeout(IO_TIMEOUT_SECONDS)
+
     @property
     def vex_server(self) -> VexMySQLS3HTTPServer:
         return self.server  # type: ignore[return-value]
@@ -306,53 +475,246 @@ class VexMySQLS3HTTPRequestHandler(BaseHTTPRequestHandler):
         if self.command != "HEAD":
             self.wfile.write(body)
 
-    def _read_chunked_body(self) -> bytes | None:
-        chunks: list[bytes] = []
-        length = 0
-        while True:
-            line = self.rfile.readline(8192)
-            if not line:
-                self.send_error(400, "truncated chunked request")
-                return None
-            try:
-                chunk_length = int(line.split(b";", 1)[0].strip(), 16)
-            except ValueError:
-                self.send_error(400, "invalid chunked request")
-                return None
-            if chunk_length == 0:
-                while True:
-                    trailer = self.rfile.readline(8192)
-                    if trailer in {b"\r\n", b"\n", b""}:
-                        return b"".join(chunks)
-            length += chunk_length
-            if length > MAX_REQUEST_BYTES:
-                self.send_error(413, "request exceeds Vex HTTP limit")
-                return None
-            chunk = self.rfile.read(chunk_length)
-            ending = self.rfile.read(2)
-            if len(chunk) != chunk_length or ending != b"\r\n":
-                self.send_error(400, "truncated chunked request")
-                return None
-            chunks.append(chunk)
+    def _request_error(self, status: int, message: str) -> None:
+        """Return a framing error and make unread client bytes harmless."""
+        self.close_connection = True
+        self.send_error(status, message)
 
-    def _read_body(self) -> bytes | None:
-        if self.command != "POST":
-            return b""
-        if "chunked" in self.headers.get("Transfer-Encoding", "").lower():
-            return self._read_chunked_body()
-        raw_length = self.headers.get("Content-Length")
-        if raw_length is None:
-            self.send_error(411, "Content-Length is required")
-            return None
+    def _read_chunk_line(self) -> bytes:
+        line = self.rfile.readline(MAX_CHUNK_LINE_BYTES + 1)
+        if not line or len(line) > MAX_CHUNK_LINE_BYTES or not line.endswith(b"\r\n"):
+            raise RequestBodyError("invalid chunked request")
+        return line[:-2]
+
+    def _read_chunked_body(self) -> RequestBody | None:
+        """Decode a chunked request into a bounded disk-backed source.
+
+        CGI needs a concrete ``CONTENT_LENGTH``.  Spooling only this uncommon
+        framing keeps normal smart-HTTP Content-Length requests fully
+        streaming while preserving safe chunked support without assembling a
+        multi-gigabyte Python ``bytes`` object.
+        """
+        spool = tempfile.TemporaryFile(mode="w+b")
+        length = 0
         try:
-            length = int(raw_length)
-        except ValueError:
-            self.send_error(400, "invalid Content-Length")
+            while True:
+                raw_size = self._read_chunk_line().split(b";", 1)[0]
+                if not raw_size or not all(character in b"0123456789abcdefABCDEF" for character in raw_size):
+                    raise RequestBodyError("invalid chunked request")
+                chunk_length = int(raw_size, 16)
+                if chunk_length == 0:
+                    trailer_length = 0
+                    while True:
+                        trailer = self._read_chunk_line()
+                        if not trailer:
+                            spool.seek(0)
+                            return RequestBody(length, spool, close_source=True)
+                        trailer_length += len(trailer) + 2
+                        if trailer_length > MAX_CHUNK_TRAILER_BYTES:
+                            raise RequestBodyError("chunked request trailers exceed Vex HTTP limit")
+                if chunk_length > MAX_REQUEST_BYTES - length:
+                    self._request_error(413, "request exceeds Vex HTTP limit")
+                    spool.close()
+                    return None
+                remaining = chunk_length
+                while remaining:
+                    chunk = self.rfile.read(min(STREAM_CHUNK_BYTES, remaining))
+                    if not chunk:
+                        raise RequestBodyError("truncated chunked request")
+                    spool.write(chunk)
+                    length += len(chunk)
+                    remaining -= len(chunk)
+                if self.rfile.read(2) != b"\r\n":
+                    raise RequestBodyError("truncated chunked request")
+        except RequestBodyError as error:
+            spool.close()
+            self._request_error(400, str(error))
             return None
-        if length < 0 or length > MAX_REQUEST_BYTES:
-            self.send_error(413, "request exceeds Vex HTTP limit")
+
+    def _request_body(self) -> RequestBody | None:
+        """Return a validated source rather than reading a whole POST body."""
+        if self.command != "POST":
+            return RequestBody(0, self.rfile)
+
+        transfer_values = self.headers.get_all("Transfer-Encoding", [])
+        transfer_codings = [
+            coding.strip().lower()
+            for value in transfer_values
+            for coding in value.split(",")
+            if coding.strip()
+        ]
+        content_lengths = self.headers.get_all("Content-Length", [])
+        if transfer_codings:
+            if content_lengths:
+                self._request_error(400, "ambiguous request framing")
+                return None
+            if transfer_codings != ["chunked"]:
+                self._request_error(501, "unsupported Transfer-Encoding")
+                return None
+            return self._read_chunked_body()
+
+        if len(content_lengths) != 1:
+            self._request_error(411, "Content-Length is required")
             return None
-        return self.rfile.read(length)
+        raw_length = content_lengths[0].strip()
+        if not raw_length.isdecimal():
+            self._request_error(400, "invalid Content-Length")
+            return None
+        length = int(raw_length)
+        if length > MAX_REQUEST_BYTES:
+            self._request_error(413, "request exceeds Vex HTTP limit")
+            return None
+        return RequestBody(length, self.rfile)
+
+    def _send_backend_error(self, status: int, message: str) -> None:
+        body = (message + "\n").encode("utf-8")
+        self.close_connection = True
+        self.send_response(status)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Connection", "close")
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
+
+    @staticmethod
+    def _stop_backend(process: subprocess.Popen[bytes]) -> None:
+        try:
+            if process.stdin is not None:
+                process.stdin.close()
+        except OSError:
+            pass
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                process.kill()
+
+    def _relay_backend(self, environ: dict[str, str], body: RequestBody) -> None:
+        """Pump request, stderr, and response concurrently with bounded RAM."""
+        try:
+            process = subprocess.Popen(
+                [HTTP_BACKEND],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=environ,
+            )
+        except OSError as error:
+            body.close()
+            sys.stderr.write(f"vex mysql-s3-http: could not start git-http-backend: {error}\n")
+            self._send_backend_error(502, "could not start git-http-backend")
+            return
+
+        if process.stdin is None or process.stdout is None or process.stderr is None:
+            body.close()
+            self._stop_backend(process)
+            self._send_backend_error(502, "git-http-backend pipes are unavailable")
+            return
+
+        pump = StdinPumpResult()
+
+        def pump_stdin() -> None:
+            try:
+                pump.bytes_copied = copy_request_body(body.source, process.stdin, body.length)
+            except (BrokenPipeError, ConnectionResetError, OSError, ValueError, RequestBodyError) as error:
+                pump.error = error
+            finally:
+                try:
+                    process.stdin.close()
+                except (BrokenPipeError, OSError, ValueError):
+                    pass
+                body.close()
+                pump.done.set()
+
+        stderr_thread = threading.Thread(
+            target=drain_child_stderr,
+            args=(process.stderr,),
+            name="vex-git-http-stderr",
+            daemon=True,
+        )
+        stdin_thread = threading.Thread(
+            target=pump_stdin,
+            name="vex-git-http-stdin",
+            daemon=True,
+        )
+        timed_out = threading.Event()
+
+        def timeout_backend() -> None:
+            if process.poll() is None:
+                timed_out.set()
+                process.kill()
+
+        timeout = threading.Timer(CGI_TIMEOUT_SECONDS, timeout_backend)
+        timeout.daemon = True
+        stderr_thread.start()
+        stdin_thread.start()
+        timeout.start()
+
+        response_started = False
+        try:
+            try:
+                status, headers, body_prefix = read_cgi_response_headers(process.stdout)
+            except CGIResponseError:
+                self._stop_backend(process)
+                if isinstance(pump.error, RequestBodyError):
+                    self._send_backend_error(400, "truncated request body")
+                elif timed_out.is_set():
+                    self._send_backend_error(504, "git-http-backend timed out")
+                else:
+                    self._send_backend_error(502, "git-http-backend returned malformed CGI output")
+                return
+
+            # A short Content-Length body is detected by the concurrent pump.
+            # If it failed before CGI committed a response, reject it rather
+            # than forwarding a potentially misleading backend error.
+            if pump.done.is_set() and isinstance(pump.error, RequestBodyError):
+                self._stop_backend(process)
+                self._send_backend_error(400, "truncated request body")
+                return
+
+            self.send_response(status)
+            for name, value in headers:
+                self.send_header(name, value)
+            # Without a CGI Content-Length, EOF framing is correct because the
+            # listener closes this connection after the stream completes.
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.close_connection = True
+            response_started = True
+            self.wfile.flush()
+
+            if self.command != "HEAD" and body_prefix:
+                self.wfile.write(body_prefix)
+            while True:
+                chunk = process.stdout.read(STREAM_CHUNK_BYTES)
+                if not chunk:
+                    break
+                if self.command != "HEAD":
+                    self.wfile.write(chunk)
+            self.wfile.flush()
+            process.wait()
+            if process.returncode:
+                sys.stderr.write(
+                    "vex mysql-s3-http: git-http-backend exited with "
+                    f"status {process.returncode}\n"
+                )
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            # The client may disconnect while a pack is in flight.  Once the
+            # response has started there is no valid HTTP error to append.
+            if not response_started:
+                self._send_backend_error(502, "could not relay git-http-backend response")
+            self._stop_backend(process)
+        finally:
+            timeout.cancel()
+            if process.poll() is None:
+                self._stop_backend(process)
+            try:
+                process.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                process.kill()
+            stderr_thread.join(timeout=1)
 
     def _serve(self) -> None:
         split = urlsplit(self.path)
@@ -370,7 +732,7 @@ class VexMySQLS3HTTPRequestHandler(BaseHTTPRequestHandler):
         if self._needs_push_auth(split.path, split.query) and not self._authorized():
             self._auth_required()
             return
-        body = self._read_body()
+        body = self._request_body()
         if body is None:
             return
 
@@ -393,7 +755,7 @@ class VexMySQLS3HTTPRequestHandler(BaseHTTPRequestHandler):
                 "QUERY_STRING": split.query,
                 "REQUEST_METHOD": self.command,
                 "CONTENT_TYPE": self.headers.get("Content-Type", ""),
-                "CONTENT_LENGTH": str(len(body)),
+                "CONTENT_LENGTH": str(body.length),
                 "REMOTE_ADDR": self.client_address[0],
             }
         )
@@ -401,36 +763,7 @@ class VexMySQLS3HTTPRequestHandler(BaseHTTPRequestHandler):
         set_cgi_git_protocol(environ, self.headers)
         if self._authorized():
             environ["REMOTE_USER"] = BASIC_USER
-        try:
-            completed = subprocess.run(
-                [HTTP_BACKEND],
-                input=body,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                env=environ,
-                timeout=300,
-                check=False,
-            )
-        except subprocess.TimeoutExpired:
-            self.send_error(504, "git-http-backend timed out")
-            return
-        if completed.returncode:
-            sys.stderr.write(completed.stderr.decode("utf-8", "replace"))
-
-        status, headers, response_body = split_cgi_response(completed.stdout)
-        self.send_response(status)
-        saw_length = False
-        for name, value in headers:
-            if name.lower() == "content-length":
-                saw_length = True
-            self.send_header(name, value)
-        if not saw_length:
-            self.send_header("Content-Length", str(len(response_body)))
-        self.send_header("Connection", "close")
-        self.end_headers()
-        if self.command != "HEAD":
-            self.wfile.write(response_body)
-        self.close_connection = True
+        self._relay_backend(environ, body)
 
 
 def require_configuration() -> None:
@@ -459,8 +792,18 @@ def require_configuration() -> None:
             fail(f"{label} is not executable: {executable}")
     if not os.path.isdir(HELPER_PATH):
         fail(f"Git helper path does not exist: {HELPER_PATH}")
-    if MAX_REQUEST_BYTES <= 0:
-        fail("VEX_HTTP_MAX_REQUEST_BYTES must be positive")
+    configured_limits = {
+        "VEX_HTTP_MAX_REQUEST_BYTES": MAX_REQUEST_BYTES,
+        "VEX_HTTP_MAX_CGI_HEADER_BYTES": MAX_CGI_HEADER_BYTES,
+        "VEX_HTTP_MAX_CHUNK_LINE_BYTES": MAX_CHUNK_LINE_BYTES,
+        "VEX_HTTP_MAX_CHUNK_TRAILER_BYTES": MAX_CHUNK_TRAILER_BYTES,
+        "VEX_HTTP_STREAM_CHUNK_BYTES": STREAM_CHUNK_BYTES,
+        "VEX_HTTP_CGI_TIMEOUT_SECONDS": CGI_TIMEOUT_SECONDS,
+        "VEX_HTTP_IO_TIMEOUT_SECONDS": IO_TIMEOUT_SECONDS,
+    }
+    invalid = [name for name, value in configured_limits.items() if value <= 0]
+    if invalid:
+        fail("gateway limits must be positive: " + ", ".join(invalid))
 
 
 def initialize_ready_repository() -> None:

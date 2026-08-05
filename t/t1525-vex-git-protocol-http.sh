@@ -1,6 +1,6 @@
 #!/bin/sh
 
-test_description='Vex MySQL+S3 gateway Git-Protocol CGI forwarding'
+test_description='Vex MySQL+S3 gateway CGI forwarding and streaming relay'
 
 TEST_NO_CREATE_REPO=1
 
@@ -15,6 +15,11 @@ fi
 
 test_expect_success PYTHON3 'gateway forwards only one sanitized Git-Protocol value to CGI' '
 	"$PYTHON3_PATH" "$GIT_BUILD_DIR/t/vex/test-git-protocol-http.py" \
+		"$GIT_BUILD_DIR/vex/docker/git-http/vex_mysql_s3_http.py"
+'
+
+test_expect_success PYTHON3 'gateway streams Content-Length CGI requests and responses with bounded headers' '
+	"$PYTHON3_PATH" "$GIT_BUILD_DIR/t/vex/test-gateway-streaming.py" \
 		"$GIT_BUILD_DIR/vex/docker/git-http/vex_mysql_s3_http.py"
 '
 
