@@ -554,10 +554,11 @@ static int vex_be_transaction_abort(struct ref_store *ref_store UNUSED,
 	return 0;
 }
 
-static int vex_be_transaction_finish(struct ref_store *ref_store UNUSED,
+static int vex_be_transaction_finish(struct ref_store *ref_store,
 				     struct ref_transaction *transaction,
 				     struct strbuf *err)
 {
+	struct vex_ref_store *refs = vex_downcast(ref_store);
 	struct vex_transaction_data *data = transaction->backend_data;
 	int ret;
 
@@ -573,7 +574,8 @@ static int vex_be_transaction_finish(struct ref_store *ref_store UNUSED,
 	transaction->backend_data = NULL;
 	transaction->state = REF_TRANSACTION_CLOSED;
 	if (ret) {
-		strbuf_addstr(err, _("Vex ref transaction failed"));
+		strbuf_addf(err, _("Vex ref transaction failed (%s): %s"),
+			    vex_store_result_string(ret), vex_store_error(refs->store));
 		return -1;
 	}
 	return 0;

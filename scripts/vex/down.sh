@@ -45,6 +45,6 @@ compose=(docker compose -f "$docker_dir/compose.yaml" --env-file "$env_file" --p
 down_args=(down --remove-orphans)
 if [ "$volumes" -eq 1 ]; then
 	down_args+=(--volumes)
-	printf '%s\n' 'vex down: removing Vex Compose volumes (local metadata, blobs, and bootstrap repos).'
+	printf '%s\n' 'vex down: removing Vex Compose volumes (local metadata, blobs, and thin Vex repository directories).'
 fi
 "${compose[@]}" "${down_args[@]}"

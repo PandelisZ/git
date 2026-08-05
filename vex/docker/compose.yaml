@@ -76,13 +76,13 @@ services:
     restart: "no"
     networks: [vex_net]
 
-  # Until a custom Vex-aware server binary is supplied, this image runs the
-  # explicitly-labelled classic-bare bootstrap in git-http/.  It proves the
-  # stock-Git smart-HTTP path only; it does not make MySQL or MinIO Git SoT.
+  # The default command is the source-built Vex smart-HTTP gateway.  The image
+  # retains its explicitly-labelled classic-bare bootstrap only when invoked
+  # without a VEX_GIT_HTTP_COMMAND (for isolated protocol plumbing work).
   git-http:
     build:
-      context: ./git-http
-      dockerfile: Dockerfile
+      context: ../..
+      dockerfile: vex/docker/git-http/Dockerfile
     image: vex-git-http:dev
     depends_on:
       mysql:
@@ -92,16 +92,25 @@ services:
     environment:
       GIT_HTTP_ROOT: /srv/git
       GIT_VEX_BACKEND: ${GIT_VEX_BACKEND:-mysql+s3}
+      GIT_VEX_META_BACKEND: ${GIT_VEX_META_BACKEND:-mysql}
+      GIT_VEX_BLOB_BACKEND: ${GIT_VEX_BLOB_BACKEND:-s3}
       GIT_VEX_MYSQL_DSN: mysql://${MYSQL_USER}:${MYSQL_PASSWORD}@mysql:3306/${MYSQL_DATABASE}
+      GIT_VEX_MYSQL_HOST: mysql
+      GIT_VEX_MYSQL_PORT: "3306"
+      GIT_VEX_MYSQL_USER: ${MYSQL_USER}
+      GIT_VEX_MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+      GIT_VEX_MYSQL_DATABASE: ${MYSQL_DATABASE}
       GIT_VEX_S3_ENDPOINT: http://minio:9000
       GIT_VEX_S3_BUCKET: ${MINIO_BUCKET}
+      GIT_VEX_S3_REGION: ${MINIO_REGION}
       GIT_VEX_S3_PATH_STYLE: "1"
       GIT_VEX_S3_ACCESS_KEY: ${MINIO_ROOT_USER}
       GIT_VEX_S3_SECRET_KEY: ${MINIO_ROOT_PASSWORD}
       GIT_VEX_SCRATCH: /var/git-scratch
       GIT_VEX_REPO_GIT_GIT_UUID: ${GIT_VEX_REPO_GIT_GIT_UUID}
-      VEX_GIT_HTTP_COMMAND: ${VEX_GIT_HTTP_COMMAND:-}
-      VEX_REPO_INIT_COMMAND: ${VEX_REPO_INIT_COMMAND:-}
+      VEX_GIT_HTTP_COMMAND: ${VEX_GIT_HTTP_COMMAND:-/usr/local/lib/vex-git-http/vex_mysql_s3_http.py}
+      VEX_REPO_INIT_COMMAND: ${VEX_REPO_INIT_COMMAND:-/usr/local/bin/vex-init-mysql-s3-repo}
+      VEX_STORAGE_READY_REPO: ${VEX_STORAGE_READY_REPO:-vex-health.git}
       VEX_HTTP_BASIC_USER: ${VEX_HTTP_BASIC_USER}
       VEX_HTTP_BASIC_PASSWORD: ${VEX_HTTP_BASIC_PASSWORD}
       VEX_HTTP_REQUIRE_PUSH_AUTH: ${VEX_HTTP_REQUIRE_PUSH_AUTH:-1}
@@ -111,10 +120,10 @@ services:
       - "127.0.0.1:${GIT_HTTP_PORT:-8080}:8080"
       - "127.0.0.1:${GIT_HTTPS_PORT:-8443}:8443"
     volumes:
-      - vex_git_bootstrap_repos:/srv/git
+      - vex_git_repositories:/srv/git
       - vex_git_scratch:/var/git-scratch
-      # The bootstrap needs the leaf key and CA certificate, never the local
-      # CA private key used by certs/gen.sh.
+      # The gateway needs the leaf key and CA certificate, never the local CA
+      # private key used by certs/gen.sh.
       - ./certs/rootCA.pem:/certs/rootCA.pem:ro
       - ./certs/localhost.pem:/certs/localhost.pem:ro
       - ./certs/localhost.key:/certs/localhost.key:ro
@@ -152,8 +161,9 @@ services:
 volumes:
   vex_mysql_data:
   vex_minio_data:
-  # Used only by the explicitly non-Vex classic-bare bootstrap server.
-  vex_git_bootstrap_repos:
+  # Thin Git discovery/protocol directories only. Vex metadata lives in
+  # MySQL and canonical object bytes live in MinIO/S3.
+  vex_git_repositories:
   vex_git_scratch:
 
 networks:

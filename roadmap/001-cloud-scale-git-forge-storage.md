@@ -1,16 +1,17 @@
 # Vex Git Forge Storage (Cloud-Scale PoC) PRD
 
 **Status:** Active
-**Current Stage:** 2 - fs store + local ODB/ref foundation
+**Current Stage:** 4 - MySQL metadata + S3 object-byte Compose data plane
 **Owner:** Codex
 **Created:** 2026-08-05
 **Updated:** 2026-08-05
 **Posture:** Experiment / proof of concept — **no tenancy or auth product scope**
 **Related:** user request; [002](002-comparative-research-digest.md); [003](003-adversarial-review-log.md); [004](004-stage-playbooks.md); Mononoke; jj; git ODB/refs plugins
 
-Stage 0 design is frozen after 45 adversarial passes. Stages 1–2 have a
-targeted, local implementation foundation; the protocol and MySQL/S3 drivers
-remain unimplemented.
+Stage 0 design is frozen after 45 adversarial passes. Stages 1–4 now have a
+targeted implementation foundation: the active Compose path uses MySQL for
+metadata and MinIO/S3 for canonical Git object bytes. Push-stress, fault
+injection, sweeping, and the sealed-pack L4 path remain pending.
 
 **Implementation identity:** this experiment is the **Vex backend**.  “Cloud
 storage” describes its MySQL + blob-store architecture; code, extension URIs,
@@ -369,7 +370,7 @@ push-stress harness against this endpoint.
 
 ### Stage 4: MySQL + S3 via local Docker Compose (L2)
 
-**Status:** Active — Compose foundation plus FS-metadata/S3-byte vertical slice
+**Status:** Active — MySQL metadata + S3-byte Compose data plane
 **Owned Paths:** `meta-mysql.c`, `blob-s3.c`, `vex/docker/compose.yaml`, `scripts/vex/*`, `t/vex/integration-mysql-minio.sh`
 
 - [x] Compose: mysql + minio + git-http (ports on 127.0.0.1)
@@ -378,18 +379,24 @@ push-stress harness against this endpoint.
 - [x] Native MySQL metadata probe (metadata rows only; no raw Git bytes)
 - [x] Signed S3/MinIO blob probe (stage, promote, read, Git hash verification)
 - [x] Select signed S3 canonical bytes from `vex_store` with `GIT_VEX_BLOB_BACKEND=s3` while retaining FS metadata
-- [ ] Integrate the MySQL metadata driver into `vex_store`
-- [ ] Wire a Vex-aware Compose git-http command to the MySQL+S3 store
-- [ ] Protocol tests against a Vex `https://localhost…` endpoint
+- [x] Integrate the MySQL metadata driver into `vex_store` (normalized SQL rows; no Git payload bytes)
+- [x] Wire a Vex-aware Compose git-http command to the MySQL+S3 store
+- [x] Protocol tests against a Vex `https://localhost…` endpoint: stock push/clone/fetch, atomic tag+branch, branch delete, and depth-one clone
+- [x] Empty-repo 20× batch=1 stock-Git HTTPS push stress with fresh-fetch/`fsck` reconciliation
+- [x] Rejected receive compensates MySQL metadata, canonical/staging S3 keys, and leaves the accepted tip readable
+- [x] Concurrent first pushes to two repositories retain independent MySQL ref-audit sequences
 - [ ] CI: Compose → Vex seed → Vex smoke → down -v (no AWS)
 
-The current git-http image exposes an explicit classic-bare bootstrap and
-reports `vex_storage_active:false`. Its successful stock-Git smoke proves
-TLS/transport plumbing, not a Vex data-plane path or L2. The loopback Vex
-HTTP harness does exercise real MinIO bytes: `t1494` proves the exact final
-object key and fresh read, `t1495` proves stock clone/fetch/push, and `t1496`
-proves rejected-receive S3 staging compensation. Metadata is still FS-backed,
-not MySQL-backed.
+The Compose default is now a source-built Vex Git image and a long-lived
+smart-HTTP gateway. Its health check opens the same Vex store used to serve
+clients and reports `metadata_backend:mysql`, `blob_backend:s3`, and
+`vex_storage_active:true` only when both are usable. `t1497` uses an
+unmodified host Git over HTTPS to verify the basic P0/P1 surface and queries
+MySQL plus MinIO afterward to prove the durable split. The old classic-bare
+bootstrap remains only an explicitly labelled fallback, not the Compose
+default. The serial smoke and compensation gates are green, but this does not
+claim ramp/chaos or fault injection, sweeping, sealed-pack clone performance,
+or an L3/L4 readiness level.
 
 Acceptance remains pending: Stage 3 tests must pass on **local** MySQL+MinIO
 through a Vex-aware server; Valkey off; second machine can reproduce from
@@ -469,6 +476,29 @@ scripts/vex/bench-clone.sh
 - Commands: `rg odb_source_files_downcast`; header reads; web research (GitLab #479, Gitea, gitgres, JGit DFS, Mesh, GitHub packs, Piper, bundle-uri, Gitaly quarantine).
 - Gaps closed at Stage 0: reflog, tiering, grace, dogfood levels, bundle-uri priority, per-repo keys, txn API.
 - Gaps remaining for impl: MySQL/S3 client libs; fs meta sqlite-vs-files; daemon RPC shape.
+
+### 2026-08-05 - Stage 4 MySQL + S3 data plane
+
+- `make VEX_MYSQL=YesPlease git` builds the Vex store with its MySQL metadata adapter; the normal build retains an explicit unavailable-stub error when MySQL support is omitted.
+- `scripts/vex/up.sh` starts loopback-only Compose services `vex-mysql-1`, `vex-minio-1`, and `vex-git-http-1`. The server is source-built and the health endpoint reports active MySQL metadata plus S3 bytes.
+- `VEX_COMPOSE_NO_BUILD=1 VEX_TEST_COMPOSE_MYSQL_S3=1 make -C t T=t1497-vex-compose-mysql-s3.sh` passed stock Git HTTPS push, clone, fetch, atomic annotated tag plus branch, deletion, depth-one clone, and MySQL/MinIO postconditions.
+- No L4 claim: object reads are still the loose-object correctness path; sealed packs, clone SLO measurements, ramp/chaos/fault injection, and sweep/lease roots remain future gates.
+
+### 2026-08-05 - Stage 4 MySQL + S3 receive safety and smoke stress
+
+- `t1499-vex-compose-mysql-s3-receive-epoch.sh` passes the rejected receive
+  compensation gate: the rejected tip never appears, its MySQL/S3 state and
+  staging keys are absent, and the accepted tip remains readable.
+- `t1498-vex-push-stress-compose.sh` passes an empty-repository, stock-Git
+  20× batch=1 push run with fresh-fetch/`fsck` reconciliation. The most recent
+  smoke sample measured p50 `1622.890ms`, p90 `2332.091ms`, and p99
+  `2556.664ms`; these are loose-object write-path observations, not clone SLOs.
+- A cross-repository race exposed the old schema's global `ref_updates.id`
+  uniqueness under independent repo locks. Audit IDs are now repository-scoped;
+  `t1500-vex-compose-mysql-s3-cross-repo.sh` concurrently pushes two fresh
+  stock-Git HTTPS repositories and verifies both tips plus one audit row each.
+- Existing local volumes migrate `ref_updates_id` to a non-unique leading index
+  under a MySQL advisory schema lock. Raw Git bytes remain S3-only.
 
 ---
 

@@ -151,3 +151,69 @@ This is intentionally not L2 or L4: metadata remains FS-backed and the
 bundled Compose `git-http` service remains an explicit classic-bare bootstrap.
 The next required slice is MySQL metadata in the central store, followed by a
 Vex-aware Compose server and the staged push-stress/chaos gates.
+
+## 2026-08-05 — Active Vex MySQL + S3 Compose data plane
+
+Shipped the first active Vex Compose server whose durable metadata and object
+bytes follow the intended split:
+
+- `VEX_STORE_BACKEND_MYSQL_S3` maps the existing Vex state machine to the
+  normalized MySQL schema while canonical object bytes remain in MinIO/S3.
+  MySQL records IDs, metadata, generations, refs, and audit rows; it never
+  stores raw Git object payloads.
+- `GIT_VEX_META_BACKEND=mysql` and `GIT_VEX_BLOB_BACKEND=s3` select the active
+  data plane. `GIT_VEX_BACKEND=mysql+s3` remains a convenient topology alias.
+- Compose builds the Vex Git server with `VEX_MYSQL=YesPlease` and runs a
+  long-lived smart-HTTP gateway. Its health check opens the same Vex store
+  used by protocol requests, so `vex_storage_active:true` requires both
+  MySQL metadata and S3 object-byte access.
+- The regular build remains supported: switching between `make git` and
+  `make VEX_MYSQL=YesPlease git` now rebuilds only `vex/meta-mysql.o`, avoiding
+  stale native-client symbols in the normal no-MySQL binary.
+
+Verified locally:
+
+```sh
+make -j4 git
+make -j4 VEX_MYSQL=YesPlease git
+make -j4 git
+# PASS: all three links succeed; the MySQL mode switch rebuilds meta-mysql.o
+
+make -C t T=t1490-vex-storage.sh
+# PASS: 2/2 (Vex storage and maintenance safe-fail regression)
+
+VEX_COMPOSE_NO_BUILD=1 VEX_TEST_COMPOSE_MYSQL_S3=1 \
+  make -C t T=t1497-vex-compose-mysql-s3.sh
+# PASS: 1/1 stock /usr/bin/git HTTPS push, clone, fetch, atomic annotated
+# tag+branch, branch delete, depth-one clone; MySQL rows + MinIO keys checked
+```
+
+The Compose project remains loopback-only and is running as `vex` with
+`vex-git-http-1`, `vex-mysql-1`, and `vex-minio-1`. This is a functional L2
+vertical slice, not L4: the read path is still loose-object correctness work,
+and sealed packs, benchmark numbers, stress/chaos, fault injection, sweeping,
+and clone leases remain required before any performance or completion claim.
+
+## 2026-08-05 — MySQL+S3 receive safety and serial smoke
+
+The active Vex Compose path now has the first useful L2 write-boundary gates:
+
+- `t1499-vex-compose-mysql-s3-receive-epoch.sh` passes rejected receive
+  compensation. A rejected update leaves no rejected MySQL object/ref state,
+  no canonical or staging MinIO object, and no changed `main`; accepted data
+  remains readable.
+- `t1498-vex-push-stress-compose.sh` passes against a unique empty Vex repo
+  with only host `/usr/bin/git` on the wire. It completes 20/20 batch=1
+  pushes, reports `failures=0`, matches the planned final tip, and performs a
+  fresh fetch plus `git fsck` reconciliation. Latest measured smoke latency:
+  p50 `1622.890ms`, p90 `2332.091ms`, p99 `2556.664ms`.
+- Concurrent first pushes to different repositories revealed that the old
+  globally-unique `ref_updates.id` was incompatible with per-repository row
+  locks. The schema now uses a non-unique leading ID index and selects the
+  next audit ID per repository; an advisory-lock migration upgrades existing
+  local volumes. `t1500-vex-compose-mysql-s3-cross-repo.sh` passes two
+  simultaneous stock-Git HTTPS pushes and verifies both MySQL tips plus one
+  audit row per repository.
+
+These are correctness and write-path smoke results only. Ramp/chaos/fault
+injection, sweep/scrub, sealed packs, and the git/git clone SLO remain open.

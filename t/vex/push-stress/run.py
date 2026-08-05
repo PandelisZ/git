@@ -23,7 +23,15 @@ import threading
 import time
 from typing import Any
 
-from plan import PlanError, build_plan, default_source_ref, load_plan, sha256_file, write_plan
+from plan import (
+    PlanError,
+    build_plan,
+    default_source_ref,
+    git_binary,
+    load_plan,
+    sha256_file,
+    write_plan,
+)
 
 
 class HarnessError(RuntimeError):
@@ -94,11 +102,11 @@ def require_success(process: subprocess.CompletedProcess[str], what: str) -> str
 
 
 def git_at(path: Path, *args: str) -> subprocess.CompletedProcess[str]:
-    return run_command(["git", "-C", str(path), *args])
+    return run_command([git_binary(), "-C", str(path), *args])
 
 
 def git_global(*args: str) -> subprocess.CompletedProcess[str]:
-    return run_command(["git", *args])
+    return run_command([git_binary(), *args])
 
 
 def env_text(name: str, fallback: str | None = None) -> str | None:
@@ -187,7 +195,7 @@ def estimate_bytes(driver: Path, base_tip: str | None, want_tip: str) -> int | N
     if not oids:
         return 0
     process = subprocess.Popen(
-        ["git", "-C", str(driver), "cat-file", "--batch-check=%(objectsize)"],
+        [git_binary(), "-C", str(driver), "cat-file", "--batch-check=%(objectsize)"],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -678,7 +686,7 @@ def initial_checkpoint(
 
 def push_command(driver: Path, branch: str, base_tip: str | None, want_tip: str) -> tuple[list[str], bool]:
     command = [
-        "git",
+        git_binary(),
         "-C",
         str(driver),
         "push",
@@ -706,6 +714,7 @@ def execute(config: dict[str, Any], plan: list[dict[str, object]], plan_sha256: 
     run_record = {
         "bootstrap_source_fetch_ms": round(bootstrap_ms, 3),
         "branch": config["branch"],
+        "git_executable": git_binary(),
         "git_version": require_success(git_global("--version"), "git --version").strip(),
         "origin": config["origin"],
         "platform": platform.platform(),

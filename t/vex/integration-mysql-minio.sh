@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 
-# Compose-level dependency check. It verifies that the Vex metadata schema is
-# present in MySQL and that the MinIO bucket exists, without pretending that
-# the bootstrap Git endpoint stores Git data in either service.
+# Compose-level dependency check. It verifies the Vex metadata schema, MinIO
+# bucket, and that the source-built Vex smart-HTTP gateway can open the active
+# MySQL+S3 store before stock-client E2E runs.
 set -euo pipefail
 
 root=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
@@ -44,7 +44,9 @@ blob_key_type=$("${compose[@]}" exec -T mysql \
 health=$(curl --fail --silent --show-error --cacert "$docker_dir/certs/rootCA.pem" "https://localhost:${GIT_HTTPS_PORT}/healthz")
 printf 'vex integration: MySQL schema and MinIO bucket ready; git-http health: %s\n' "$health"
 case "$health" in
-*'"vex_storage_active": false'*)
-	printf '%s\n' 'vex integration: dependency readiness passed; no Vex Git object/ref data-plane claim in bootstrap mode.' >&2
+*'"blob_backend": "s3"'*'"metadata_backend": "mysql"'*'"vex_storage_active": true'*) ;;
+*)
+	printf '%s\n' 'vex integration: git-http did not report active MySQL metadata and S3 object bytes' >&2
+	exit 1
 	;;
 esac

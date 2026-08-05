@@ -16,6 +16,21 @@ The latter creates a temporary source and classic bare target, pushes the
 smoke profile's 20 one-commit batches, verifies every fifth tip, then does a
 fresh target fetch and full fsck. Its temporary directory is removed on exit.
 
+## Compose MySQL + S3 smoke
+
+With the Vex Compose stack already running, exercise the active receiver with
+the same fixed 20 x batch=1 profile:
+
+```sh
+scripts/vex/push-stress.sh --compose-smoke
+```
+
+This creates and seeds a unique empty Compose repository, then uses
+`/usr/bin/git` for every wire operation. It ends with a fresh clone/fetch plus
+`git fsck --full`, and an operator reconciliation that checks the canonical
+object row and its S3 blob. The JSON result is retained under the ignored path
+`t/vex/push-stress/work/compose-smoke-*/out/summary.json`.
+
 ## Run against a Vex endpoint
 
 Create an empty target repository first, then supply its normal Git URL:

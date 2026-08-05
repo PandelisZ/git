@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 
-# Bring up the local Vex MySQL + MinIO topology. A successful bootstrap
-# listener is intentionally reported as protocol-ready, not storage-ready.
+# Bring up the local Vex MySQL + MinIO topology and the source-built Vex
+# smart-HTTP gateway. A direct image invocation with no command can still use
+# its labelled classic-bare fallback, but normal Compose startup is active.
 set -euo pipefail
 
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
@@ -14,9 +15,10 @@ usage() {
 	cat <<'EOF'
 usage: scripts/vex/up.sh [--profile NAME] [--no-build]
 
-Starts local-only MySQL, MinIO, minio-init, and git-http. The default
-git-http image is an explicitly classic-bare bootstrap until a Vex-aware
-server command is configured in vex/docker/.env.
+Starts local-only MySQL, MinIO, minio-init, and a source-built Vex Git
+smart-HTTP gateway. The normal health result confirms MySQL metadata and S3
+object-byte configuration through the same custom Git binary that serves
+clients.
 EOF
 }
 
@@ -107,7 +109,15 @@ case "$health" in
 	printf '%s\n' 'vex up: Bootstrap successes must not be interpreted as MySQL-ref or MinIO-object verification.' >&2
 	;;
 *'"vex_storage_active":true'*|*'"vex_storage_active": true'*)
-	printf '%s\n' 'vex up: Vex-aware git-http endpoint reports storage active.'
+	case "$health" in
+	*'"blob_backend": "s3"'*'"metadata_backend": "mysql"'*)
+		printf '%s\n' 'vex up: Vex-aware git-http endpoint reports active MySQL metadata and S3 object bytes.'
+		;;
+	*)
+		printf '%s\n' 'vex up: endpoint claimed active storage without the required MySQL+S3 health fields.' >&2
+		exit 1
+		;;
+	esac
 	;;
 *)
 	printf '%s\n' 'vex up: git-http health did not declare backend readiness; inspect its health payload before treating storage as active.' >&2

@@ -20,12 +20,15 @@ struct vex_store;
 struct vex_epoch;
 struct vex_ref_transaction;
 struct vex_blob_s3_options;
+struct vex_meta_mysql_options;
 struct strbuf;
 
 enum vex_store_backend {
 	VEX_STORE_BACKEND_FS = 1,
 	/* Filesystem metadata with canonical object bytes in S3-compatible storage. */
 	VEX_STORE_BACKEND_FS_S3,
+	/* MySQL metadata with canonical object bytes in S3-compatible storage. */
+	VEX_STORE_BACKEND_MYSQL_S3,
 };
 
 enum vex_store_result {
@@ -58,8 +61,10 @@ struct vex_store_options {
 	/* A canonical, lower-case 32-digit hexadecimal repository UUID. */
 	const char *repo_id;
 	const struct git_hash_algo *hash_algo;
-	/* Required only for VEX_STORE_BACKEND_FS_S3. Repo/hash are derived here. */
+	/* Required for either S3-byte backend. Repo/hash are derived here. */
 	const struct vex_blob_s3_options *blob_s3;
+	/* Required only for VEX_STORE_BACKEND_MYSQL_S3. */
+	const struct vex_meta_mysql_options *meta_mysql;
 };
 
 struct vex_object_info {
@@ -121,6 +126,9 @@ void vex_store_close(struct vex_store *store);
 int vex_repo_ensure(struct vex_store *store);
 const char *vex_store_repo_id(const struct vex_store *store);
 const struct git_hash_algo *vex_store_hash_algo(const struct vex_store *store);
+const char *vex_store_result_string(int result);
+/* A backend diagnostic for an open store; it never exposes credentials. */
+const char *vex_store_error(const struct vex_store *store);
 
 /* Build git/v1/<repo_uuid>/objects/<oid_hex> into key. */
 int vex_blob_key(const struct vex_store *store, const struct object_id *oid,

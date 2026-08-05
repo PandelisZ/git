@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 
-# Ensure an empty repository exists for stock-Git push tests. In the supplied
-# bootstrap this is a classic bare repo; a configured Vex server must provide
-# VEX_REPO_INIT_COMMAND rather than silently using this fallback.
+# Ensure an empty thin Vex repository exists for stock-Git push tests. The
+# normal Compose command creates MySQL+S3-backed Vex storage; direct fallback
+# images remain explicitly labelled as classic-bare in their health payload.
 set -euo pipefail
 
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)

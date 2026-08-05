@@ -1,7 +1,7 @@
 # Vex Local Docker Compose Test Environment PRD
 
 **Status:** Active
-**Current Stage:** FS metadata + live S3 byte-store slice; MySQL data plane pending
+**Current Stage:** Active MySQL metadata + S3 object-byte smart-HTTP data plane
 **Owner:** Codex
 **Created:** 2026-08-05
 **Updated:** 2026-08-05
@@ -17,21 +17,25 @@ Vex backends are only believable if every developer and CI runner can stand up *
 
 ### Implemented boundary (2026-08-05)
 
-`vex/docker/compose.yaml`, `scripts/vex/`, and the local checks are now
-present. MySQL schema initialization, MinIO bucket initialization, TLS, and a
-stock-Git clone/fetch/push bootstrap were run successfully on loopback.
+`vex/docker/compose.yaml`, `scripts/vex/`, and the local checks are present.
+The normal Compose image builds Vex Git with `VEX_MYSQL=YesPlease` and starts a
+long-lived smart-HTTP gateway. It uses MySQL for Vex metadata and MinIO for
+canonical object bytes; its health check opens that exact store before
+returning `vex_storage_active:true`.
 
-The bundled `git-http` process deliberately reports
-`mode:"bootstrap-classic-bare"` and `vex_storage_active:false`. It is a
-transport/dependency proof only: MySQL and MinIO are not yet Vex Git storage
-in that process, so no Stage 3/L1 or Stage 4/L2 claim follows from it.
+The native `meta-mysql` probe and signed `blob-s3` probe run against these
+same services. `t1497` uses only an unmodified host Git client over loopback
+HTTPS, then confirms ref/object metadata in MySQL and the pushed Git bytes in
+MinIO. Raw Git object payloads do not enter MySQL. The intentionally labelled
+classic-bare bootstrap is retained only for isolated protocol plumbing, never
+the normal Compose data-plane route.
 
-The native `meta-mysql` probe and signed `blob-s3` probe also run
-against these Compose services and are green. They use real MySQL and MinIO
-protocols and keep raw Git payloads out of MySQL. The central `vex_store` can
-now select MinIO canonical bytes with `GIT_VEX_BLOB_BACKEND=s3`, while FS
-remains the metadata store for that vertical slice. The bundled `git-http`
-process is still not MySQL/S3-backed.
+The active Compose gates also cover the write boundary: `t1498` runs twenty
+stock-Git batch=1 pushes from an empty repository and reconciles with a fresh
+fetch plus `fsck`; `t1499` proves a rejected receive leaves no rejected
+MySQL/S3 state; and `t1500` pushes two fresh repositories concurrently. The
+last gate caught and fixed a per-repository audit-sequence race, including an
+idempotent migration of the old globally-unique index.
 
 ### Goals
 
@@ -187,7 +191,8 @@ GIT_VEX_ORIGIN=https://localhost:8443/git/git.git
 
 ```env
 GIT_VEX_BACKEND=mysql+s3
-GIT_VEX_BLOB_BACKEND=s3       # implemented: FS metadata + S3 canonical bytes
+GIT_VEX_META_BACKEND=mysql
+GIT_VEX_BLOB_BACKEND=s3
 GIT_VEX_MYSQL_DSN=mysql://vex:vex-local-mysql@mysql:3306/vex
 GIT_VEX_S3_ENDPOINT=http://minio:9000
 GIT_VEX_S3_BUCKET=git-objects
@@ -198,11 +203,11 @@ GIT_VEX_VALKEY_URL=redis://valkey:6379/0   # optional
 GIT_VEX_SCRATCH=/var/git-scratch
 ```
 
-`GIT_VEX_BACKEND=mysql+s3` names the intended full topology; it does not
-activate it yet. The current activation switch is
-`GIT_VEX_BLOB_BACKEND=s3`, which preserves FS metadata and directs canonical
-object bytes to MinIO. Host-run binary (optional): use the same S3 vars with
-`127.0.0.1` ports from published mappings.
+`GIT_VEX_BACKEND=mysql+s3` is a convenient topology alias. The explicit
+`GIT_VEX_META_BACKEND=mysql` and `GIT_VEX_BLOB_BACKEND=s3` selectors activate
+the data plane. Compose uses its service names; a host-built binary can use
+the published `127.0.0.1` ports after a fresh `scripts/vex/reset.sh` if local
+MySQL credentials were changed underneath an existing volume.
 
 ### TLS
 
@@ -252,9 +257,14 @@ object bytes to MinIO. Host-run binary (optional): use the same S3 vars with
 scripts/vex/up.sh
 scripts/vex/seed-small.sh
 t/vex/integration-mysql-minio.sh
+t/vex/mysql-s3-stock-http.sh
+VEX_TEST_COMPOSE_MYSQL_S3=1 make -C t T=t1497-vex-compose-mysql-s3.sh
 t/vex/compat-stock-client.sh   # F1–F8 against small or git/git
 scripts/vex/seed-empty-repo.sh stress/git-replay
-scripts/vex/push-stress.sh --profile t/vex/push-stress/profiles/smoke.env
+scripts/vex/push-stress.sh --compose-smoke
+VEX_TEST_COMPOSE_MYSQL_S3=1 make -C t T=t1498-vex-push-stress-compose.sh
+VEX_TEST_COMPOSE_MYSQL_S3=1 make -C t T=t1499-vex-compose-mysql-s3-receive-epoch.sh
+VEX_TEST_COMPOSE_MYSQL_S3=1 make -C t T=t1500-vex-compose-mysql-s3-cross-repo.sh
 scripts/vex/down.sh            # CI always cleanup
 ```
 
@@ -425,6 +435,8 @@ Healthchecks + `restart: on-failure`. Exact YAML at implement time.
 - User requirement: tests/verification local; local S3 + MySQL via Docker Compose; controllable, testable, shareable, benchmarkable.
 - Aligns with Stage 4+ backends and 005 stock-client gates.
 - MinIO as S3 stand-in; MySQL 8; optional Valkey; smart HTTP on localhost.
+- Active Stage 4 evidence: `vex-git-http-1`, `vex-mysql-1`, and `vex-minio-1` run under the `vex` Compose project; `t1497` passes stock Git HTTPS P0/P1 basics and verifies MySQL plus MinIO after the wire operation.
+- Active write-boundary evidence: `t1498` passes 20× batch=1 against the active MySQL+S3 server with fresh reconciliation (latest p50 `1622.890ms`, p90 `2332.091ms`, p99 `2556.664ms`); `t1499` passes rejected-receive compensation; and `t1500` passes simultaneous first pushes to two distinct repositories after converting `ref_updates.id` to a repository-scoped audit sequence. These are functional/write-path measurements, not L4 clone results.
 
 ## Open Questions
 

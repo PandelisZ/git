@@ -86,6 +86,9 @@ CREATE TABLE IF NOT EXISTS refs (
 
 CREATE TABLE IF NOT EXISTS ref_updates (
 	repo_id BINARY(16) NOT NULL,
+	-- IDs are ordered within a repository.  Keep a non-unique leading index so
+	-- direct SQL callers may still use AUTO_INCREMENT without serializing all
+	-- repositories behind one global audit-id sequence.
 	id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
 	refname VARBINARY(1024) NOT NULL,
 	old_oid BINARY(32) NULL,
@@ -99,7 +102,7 @@ CREATE TABLE IF NOT EXISTS ref_updates (
 	message VARBINARY(1024) NULL,
 	ts DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
 	PRIMARY KEY (repo_id, id),
-	UNIQUE KEY ref_updates_id (id),
+	KEY ref_updates_id (id),
 	KEY ref_updates_ref (repo_id, refname, id),
 	CONSTRAINT ref_updates_repo_fk FOREIGN KEY (repo_id)
 		REFERENCES repositories (repo_id)

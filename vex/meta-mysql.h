@@ -21,6 +21,8 @@
 #define VEX_META_MYSQL_VERSION_ABSENT UINT64_MAX
 
 struct vex_meta_mysql;
+struct vex_meta_state;
+struct git_hash_algo;
 
 enum vex_meta_mysql_result {
 	VEX_META_MYSQL_OK = 0,
@@ -32,6 +34,32 @@ enum vex_meta_mysql_result {
 	VEX_META_MYSQL_ERR_NOT_FOUND = -6,
 	VEX_META_MYSQL_ERR_CONFLICT = -7,
 	VEX_META_MYSQL_ERR_STATE = -8,
+};
+
+enum vex_meta_mysql_epoch_state {
+	VEX_META_MYSQL_EPOCH_OPEN = 1,
+	VEX_META_MYSQL_EPOCH_SEALED,
+	VEX_META_MYSQL_EPOCH_SWEEPABLE,
+	VEX_META_MYSQL_EPOCH_SWEPT,
+	VEX_META_MYSQL_EPOCH_ABORTED,
+};
+
+enum vex_meta_mysql_object_state {
+	VEX_META_MYSQL_OBJECT_QUARANTINE = 1,
+	VEX_META_MYSQL_OBJECT_PUBLISHED,
+};
+
+/*
+ * Returned metadata is sufficient to locate and validate a blob-store read.
+ * blob_key is allocated by the driver and must be released with
+ * vex_meta_mysql_object_release().  It is never a Git object payload.
+ */
+struct vex_meta_mysql_object {
+	unsigned int object_type;
+	uint64_t size;
+	uint64_t generation;
+	enum vex_meta_mysql_object_state state;
+	char *blob_key;
 };
 
 struct vex_meta_mysql_options {
@@ -75,6 +103,20 @@ int vex_meta_mysql_epoch_begin(struct vex_meta_mysql *db,
 			       const char *repo_id, const char *push_id,
 			       uint64_t *generation);
 
+/* Read an epoch state, or return VEX_META_MYSQL_ERR_NOT_FOUND. */
+int vex_meta_mysql_epoch_get_state(struct vex_meta_mysql *db,
+				   const char *repo_id, uint64_t generation,
+				   enum vex_meta_mysql_epoch_state *state);
+
+/*
+ * Abort one open epoch atomically.  Its generation claims are removed and
+ * only now-unclaimed quarantine objects (plus their commit-parent rows) are
+ * deleted; shared claims and already-published objects survive.  Blob-store
+ * staging cleanup remains the caller's responsibility.
+ */
+int vex_meta_mysql_epoch_abort(struct vex_meta_mysql *db,
+			       const char *repo_id, uint64_t generation);
+
 /*
  * Stage an object metadata row and its generation claim.  oid may be a
  * 20-byte SHA-1 or 32-byte SHA-256 ID; SHA-1 values are zero-padded to the
@@ -85,6 +127,19 @@ int vex_meta_mysql_stage_object(struct vex_meta_mysql *db,
 			 const unsigned char *oid, size_t oid_len,
 			 unsigned int object_type, uint64_t size,
 			 const char *blob_key);
+
+/*
+ * Fetch metadata only if it is public, or if visible_generation is the same
+ * still-open epoch that claimed it.  Pass zero for normal public reads.  The
+ * ownership check prevents another receive-pack from observing quarantine
+ * objects by guessing a generation number.
+ */
+int vex_meta_mysql_object_get_visible(struct vex_meta_mysql *db,
+				      const char *repo_id,
+				      const unsigned char *oid, size_t oid_len,
+				      uint64_t visible_generation,
+				      struct vex_meta_mysql_object *object);
+void vex_meta_mysql_object_release(struct vex_meta_mysql_object *object);
 
 /* Store only commit-graph edge metadata; neither object contains Git bytes. */
 int vex_meta_mysql_add_commit_parent(struct vex_meta_mysql *db,
@@ -100,6 +155,8 @@ int vex_meta_mysql_epoch_seal(struct vex_meta_mysql *db,
 /*
  * Atomically create/update one direct ref and append its immutable audit row.
  * expected_version is VEX_META_MYSQL_VERSION_ABSENT for a create-only CAS.
+ * new_oid must already be a published object in this repository; blob
+ * durability is checked by the caller before this metadata operation.
  * Symbolic refs, deletions, and a multi-ref transaction belong in the future
  * common metadata-backend interface rather than this standalone probe API.
  */
@@ -109,5 +166,23 @@ int vex_meta_mysql_ref_cas_direct(struct vex_meta_mysql *db,
 				  const unsigned char *new_oid, size_t new_oid_len,
 				  const char *reason, const char *message,
 				  uint64_t *new_version);
+
+/*
+ * Store adapter boundary.  These methods project the existing Vex metadata
+ * state machine onto the normalized MySQL schema while a repository-row lock
+ * and SQL transaction are held.  They never accept or return Git bytes.
+ *
+ * A regular Git build still exports unavailable stubs, so selecting the
+ * MySQL backend fails clearly unless Git was built with VEX_MYSQL=YesPlease.
+ */
+int vex_meta_mysql_state_lock(struct vex_meta_mysql *db, const char *repo_id);
+void vex_meta_mysql_state_unlock(struct vex_meta_mysql *db);
+int vex_meta_mysql_state_load(struct vex_meta_mysql *db, const char *repo_id,
+			       const struct git_hash_algo *hash_algo,
+			       struct vex_meta_state *state);
+int vex_meta_mysql_state_save_locked(struct vex_meta_mysql *db,
+				      const char *repo_id,
+				      const struct git_hash_algo *hash_algo,
+				      const struct vex_meta_state *state);
 
 #endif /* VEX_META_MYSQL_H */

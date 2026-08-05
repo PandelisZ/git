@@ -16,10 +16,26 @@ if ! command -v python3 >/dev/null 2>&1; then
 	exit 127
 fi
 
+usage() {
+	cat <<'EOF'
+usage: scripts/vex/push-stress.sh [--profile FILE] [runner options...]
+       scripts/vex/push-stress.sh --compose-smoke
+
+--compose-smoke uses stock /usr/bin/git to run the 20 x batch=1 smoke profile
+against a unique empty Vex MySQL+S3 Compose repository. It retains JSON output
+under t/vex/push-stress/work/, which is ignored by Git.
+EOF
+}
+
 profile=''
+compose_smoke=0
 arguments=()
 while [ "$#" -gt 0 ]; do
 	case "$1" in
+	--compose-smoke)
+		compose_smoke=1
+		shift
+		;;
 	--profile)
 		if [ "$#" -lt 2 ]; then
 			printf '%s\n' 'push-stress: --profile requires a path' >&2
@@ -32,12 +48,24 @@ while [ "$#" -gt 0 ]; do
 		profile=${1#--profile=}
 		shift
 		;;
+	-h|--help)
+		usage
+		exit 0
+		;;
 	*)
 		arguments+=("$1")
 		shift
 		;;
 	esac
 done
+
+if [ "$compose_smoke" -eq 1 ]; then
+	if [ -n "$profile" ] || [ "${#arguments[@]}" -ne 0 ]; then
+		printf '%s\n' 'push-stress: --compose-smoke does not accept a profile or runner options' >&2
+		exit 2
+	fi
+	exec "$harness_dir/compose-smoke.sh"
+fi
 
 if [ -n "$profile" ]; then
 	case "$profile" in

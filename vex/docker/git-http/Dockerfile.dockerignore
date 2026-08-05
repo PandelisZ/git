@@ -1,0 +1,16 @@
+# Keep local credentials, certificates, source-tree build products, and Git
+# history out of the root-context image build.  This Dockerfile-specific file
+# applies only to vex/docker/git-http/Dockerfile.
+.git
+**/.git
+vex/docker/.env
+vex/docker/certs/*.key
+vex/docker/certs/*.pem
+vex/docker/certs/*.csr
+config.mak
+config.mak.autogen
+GIT-BUILD-OPTIONS
+*.o
+*.a
+git
+git-http-backend

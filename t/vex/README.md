@@ -2,8 +2,7 @@
 
 `push-stress/` exercises an empty target repository through unmodified Git
 transport commands. It is usable against a classic bare repository today and
-becomes the write-path gate for the Vex backend once its smart-HTTP endpoint is
-available.
+can now target the Compose Vex smart-HTTP endpoint as the write-path gate.
 
 Run the self-contained local proof:
 
@@ -14,6 +13,20 @@ t/vex/push-stress/test-classic-bare.sh
 
 See [push-stress/README.md](push-stress/README.md) for profiles, artifacts, and
 the server-owned canonical-byte reconciliation hook.
+
+## MySQL + S3 Compose smart-HTTP gate
+
+`mysql-s3-stock-http.sh` brings up the source-built Compose server, requires
+an active MySQL+S3 health payload, then uses only an unmodified host Git client
+to push, clone, fetch, atomically publish an annotated tag plus branch, delete
+the transient branch, run a depth-one clone, and fsck a fresh thin Vex
+repository over HTTPS. It is the data-plane E2E gate; it does not claim the
+sealed-pack clone SLO.
+
+```sh
+t/vex/mysql-s3-stock-http.sh
+VEX_TEST_COMPOSE_MYSQL_S3=1 make -C t T=t1497-vex-compose-mysql-s3.sh
+```
 
 ## FS smart-HTTP integration gate
 

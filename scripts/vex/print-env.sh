@@ -24,11 +24,16 @@ emit() {
 	printf 'export %s=%q\n' "$1" "$2"
 }
 
-printf '%s\n' '# Host-side Vex configuration. GIT_VEX_BACKEND is the planned full topology label.'
-printf '%s\n' '# GIT_VEX_BLOB_BACKEND=s3 selects the implemented S3-byte/FS-metadata slice.'
+printf '%s\n' '# Host-side Vex configuration for the active MySQL-metadata + S3-byte topology.'
 emit GIT_VEX_BACKEND "${GIT_VEX_BACKEND:-mysql+s3}"
+emit GIT_VEX_META_BACKEND "${GIT_VEX_META_BACKEND:-mysql}"
 emit GIT_VEX_BLOB_BACKEND "${GIT_VEX_BLOB_BACKEND:-s3}"
 emit GIT_VEX_MYSQL_DSN "mysql://${MYSQL_USER}:${MYSQL_PASSWORD}@127.0.0.1:${MYSQL_PORT}/${MYSQL_DATABASE}"
+emit GIT_VEX_MYSQL_HOST 127.0.0.1
+emit GIT_VEX_MYSQL_PORT "$MYSQL_PORT"
+emit GIT_VEX_MYSQL_USER "$MYSQL_USER"
+emit GIT_VEX_MYSQL_PASSWORD "$MYSQL_PASSWORD"
+emit GIT_VEX_MYSQL_DATABASE "$MYSQL_DATABASE"
 emit GIT_VEX_S3_ENDPOINT "http://127.0.0.1:${MINIO_API_PORT}"
 emit GIT_VEX_S3_BUCKET "$MINIO_BUCKET"
 emit GIT_VEX_S3_REGION "$MINIO_REGION"

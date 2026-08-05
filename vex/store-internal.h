@@ -5,6 +5,7 @@
 #include "vex/blob-fs.h"
 #include "vex/blob-s3.h"
 #include "vex/meta-fs.h"
+#include "vex/meta-mysql.h"
 #include "lockfile.h"
 
 struct vex_meta_fs;
@@ -82,12 +83,24 @@ struct vex_meta_fs_lock {
 	int held;
 };
 
+/*
+ * A store write holds one metadata serialization boundary.  Filesystem
+ * stores use a lockfile; MySQL stores use a transaction scoped repository
+ * row lock.  Keeping this shape here lets the transactional store code stay
+ * backend-neutral without making raw blob bytes part of the SQL driver.
+ */
+struct vex_meta_lock {
+	struct vex_meta_fs_lock fs;
+	int held;
+};
+
 struct vex_store {
 	enum vex_store_backend backend;
 	char *root;
 	char *repo_id;
 	const struct git_hash_algo *hash_algo;
 	struct vex_meta_fs *meta;
+	struct vex_meta_mysql *meta_mysql;
 	struct vex_blob_fs *blob_fs;
 	struct vex_blob_s3 *blob_s3;
 	unsigned int blob_s3_checked:1;

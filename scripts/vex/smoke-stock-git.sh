@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 
-# Exercise clone, fetch, and push only through an unmodified host git. In
-# bootstrap mode this proves smart-HTTP/TLS wiring only, never Vex storage.
+# Exercise clone, fetch, and push only through an unmodified host git. Normal
+# Compose mode is the custom Vex MySQL+S3 server; bootstrap mode remains
+# labelled so its protocol-only evidence cannot be confused with that path.
 set -euo pipefail
 
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)

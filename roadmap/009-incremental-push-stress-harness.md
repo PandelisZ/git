@@ -1,7 +1,7 @@
 # Incremental Push Stress Harness PRD
 
 **Status:** Active
-**Current Stage:** Harness foundation — Vex-FS target not yet wired
+**Current Stage:** L2 Compose smoke verified — ramp/chaos/fault injection pending
 **Owner:** Codex
 **Created:** 2026-08-05
 **Updated:** 2026-08-05
@@ -55,8 +55,18 @@ smoke remains a required gate against the Vex receiver, and this baseline does
 not claim epoch compensation, blob durability, or a Vex performance number.
 
 A separate Vex-FS smart-HTTP smoke now proves stock-Git clone/fetch/push and
-accepted/rejected receive epochs. The stress harness has not yet targeted that
-endpoint, so its classic-bare result remains only a baseline.
+accepted/rejected receive epochs. The harness is now also wired to the active
+MySQL+S3 Compose receiver through `scripts/vex/push-stress.sh --compose-smoke`:
+it seeds a unique empty Vex repository, uses host `/usr/bin/git` for all wire
+operations, executes twenty batch=1 pushes, and verifies the final tip with a
+fresh fetch and `git fsck`. The latest passing run reported p50 `1622.890ms`,
+p90 `2332.091ms`, and p99 `2556.664ms`; these are write-path smoke numbers,
+not a calibrated SLO or a clone result.
+
+The Compose run also exposed a real cross-repository audit-ID race. The MySQL
+schema now scopes `ref_updates.id` to its repository and `t1500` proves two
+simultaneous stock-Git first pushes publish independently. Ramp, chaos,
+fault-injection, and concurrent-reader profiles remain unverified.
 
 ---
 
@@ -520,13 +530,13 @@ Document hardware. Soft only until calibrated (Wave 5 perf agent):
 
 ## Acceptance (design → impl)
 
-- [ ] Plan from git/git first-parent produces deterministic `plan.jsonl`
-- [ ] Empty ORIGIN + batch=1 pushes 20 commits; tip matches
+- [x] Deterministic smoke `plan.jsonl` is produced and recorded in `run.json`
+- [x] Empty Compose Vex ORIGIN + batch=1 pushes 20 commits; tip matches
 - [ ] batch=50 jumps tip by 50; one receive-pack per step
 - [ ] resume works after Ctrl-C
 - [ ] chaos kill does not publish tip without objects
-- [ ] metrics.jsonl + summary.json emitted
-- [ ] Documented in `t/vex/push-stress/README.md`
+- [x] metrics.jsonl + summary.json emitted and checked by the Compose smoke
+- [x] Documented in `t/vex/push-stress/README.md`
 - [ ] Wired in 005 as write-path stress alongside clone SLO
 
 ---
@@ -537,6 +547,13 @@ Document hardware. Soft only until calibrated (Wave 5 perf agent):
 
 - User request: harness from empty repo; push 1-by-1 or tunable batches from git/git; stress commit/push flow not only clone/big push.
 - Complements 005 clone SLO and mirror import path.
+- `t1498-vex-push-stress-compose.sh` passed against active Vex MySQL+S3 with
+  host `/usr/bin/git`: 20/20 batch=1 pushes, `failures=0`, matching final tip,
+  and fresh reconciliation. Latest smoke: p50 `1622.890ms`, p90 `2332.091ms`,
+  p99 `2556.664ms`.
+- `t1500-vex-compose-mysql-s3-cross-repo.sh` concurrently pushed two unique
+  empty repositories and verified one MySQL audit row per repository. This
+  regression protects the repository-scoped `ref_updates.id` migration.
 
 ## Open Questions
 

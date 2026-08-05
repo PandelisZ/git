@@ -3,6 +3,7 @@
 #include "hex.h"
 #include "object-file.h"
 #include "strbuf.h"
+#include "trace.h"
 #include "wrapper.h"
 
 static int normalize_repo_id(const char *repo_id, struct strbuf *normalized)
@@ -255,15 +256,108 @@ static int verify_object(struct vex_store *store, const struct object_id *oid,
 	return VEX_STORE_OK;
 }
 
-static int load_locked(struct vex_store *store, struct vex_meta_fs_lock *lock,
+static int meta_mysql_result(int ret)
+{
+	switch (ret) {
+	case VEX_META_MYSQL_OK:
+		return VEX_STORE_OK;
+	case VEX_META_MYSQL_ERR_NOT_FOUND:
+		return VEX_STORE_ERR_NOT_FOUND;
+	case VEX_META_MYSQL_ERR_CONFLICT:
+		return VEX_STORE_ERR_CONFLICT;
+	case VEX_META_MYSQL_ERR_INVALID:
+		return VEX_STORE_ERR_INVALID;
+	case VEX_META_MYSQL_ERR_STATE:
+		return VEX_STORE_ERR_STATE;
+	default:
+		return VEX_STORE_ERR;
+	}
+}
+
+static int meta_lock(struct vex_store *store, struct vex_meta_lock *lock)
+{
+	int ret;
+
+	memset(lock, 0, sizeof(*lock));
+	if (store->backend != VEX_STORE_BACKEND_MYSQL_S3) {
+		ret = vex_meta_fs_lock(store->meta, &lock->fs);
+		lock->held = lock->fs.held;
+		return ret;
+	}
+	ret = meta_mysql_result(vex_meta_mysql_state_lock(store->meta_mysql,
+							     store->repo_id));
+	if (!ret)
+		lock->held = 1;
+	return ret;
+}
+
+static void meta_unlock(struct vex_store *store, struct vex_meta_lock *lock)
+{
+	if (!lock->held)
+		return;
+	if (store->backend == VEX_STORE_BACKEND_MYSQL_S3)
+		vex_meta_mysql_state_unlock(store->meta_mysql);
+	else
+		vex_meta_fs_unlock(&lock->fs);
+	lock->held = 0;
+}
+
+static int meta_load(struct vex_store *store, struct vex_meta_state *state)
+{
+	if (store->backend == VEX_STORE_BACKEND_MYSQL_S3)
+		return meta_mysql_result(vex_meta_mysql_state_load(store->meta_mysql,
+								     store->repo_id,
+								     store->hash_algo, state));
+	return vex_meta_fs_load(store->meta, state);
+}
+
+static int meta_save_locked(struct vex_store *store,
+				    struct vex_meta_lock *lock,
+				    const struct vex_meta_state *state)
+{
+	int ret;
+
+	if (!lock->held)
+		return VEX_STORE_ERR_STATE;
+	if (store->backend == VEX_STORE_BACKEND_MYSQL_S3) {
+		ret = meta_mysql_result(vex_meta_mysql_state_save_locked(
+				store->meta_mysql, store->repo_id, store->hash_algo, state));
+		if (!ret)
+			lock->held = 0;
+		else
+			meta_unlock(store, lock);
+		return ret;
+	}
+	ret = vex_meta_fs_save_locked(store->meta, &lock->fs, state);
+	lock->held = lock->fs.held;
+	if (ret)
+		meta_unlock(store, lock);
+	return ret;
+}
+
+static int meta_ensure(struct vex_store *store)
+{
+	int ret;
+
+	if (store->backend != VEX_STORE_BACKEND_MYSQL_S3)
+		return vex_meta_fs_ensure(store->meta);
+	ret = meta_mysql_result(vex_meta_mysql_schema_check(store->meta_mysql,
+								     NULL));
+	if (ret)
+		return ret;
+	return meta_mysql_result(vex_meta_mysql_ensure_repository(
+		store->meta_mysql, store->repo_id, store->hash_algo->name, NULL));
+}
+
+static int load_locked(struct vex_store *store, struct vex_meta_lock *lock,
 		       struct vex_meta_state *state)
 {
 	int ret;
 
-	if ((ret = vex_meta_fs_lock(store->meta, lock)))
+	if ((ret = meta_lock(store, lock)))
 		return ret;
-	if ((ret = vex_meta_fs_load(store->meta, state)))
-		vex_meta_fs_unlock(lock);
+	if ((ret = meta_load(store, state)))
+		meta_unlock(store, lock);
 	return ret;
 }
 
@@ -319,6 +413,7 @@ static int blob_backend_put_staging(struct vex_store *store, uint64_t epoch,
 		return vex_blob_fs_put_staging(store->blob_fs, epoch, oid, data,
 					       size);
 	case VEX_STORE_BACKEND_FS_S3:
+	case VEX_STORE_BACKEND_MYSQL_S3:
 		return blob_s3_result(vex_blob_s3_put_staging(store->blob_s3, epoch,
 							 oid, data, size));
 	default:
@@ -335,6 +430,7 @@ static int blob_backend_has_final(struct vex_store *store,
 	case VEX_STORE_BACKEND_FS:
 		return vex_blob_fs_has_final(store->blob_fs, oid);
 	case VEX_STORE_BACKEND_FS_S3:
+	case VEX_STORE_BACKEND_MYSQL_S3:
 		ret = vex_blob_s3_has_final(store->blob_s3, oid);
 		return ret < 0 ? blob_s3_result(ret) : ret;
 	default:
@@ -350,6 +446,7 @@ static int blob_backend_read_final(struct vex_store *store,
 	case VEX_STORE_BACKEND_FS:
 		return vex_blob_fs_read_final(store->blob_fs, oid, data, size);
 	case VEX_STORE_BACKEND_FS_S3:
+	case VEX_STORE_BACKEND_MYSQL_S3:
 		return blob_s3_result(vex_blob_s3_read_final(store->blob_s3, oid,
 							      data, size));
 	default:
@@ -366,6 +463,7 @@ static int blob_backend_read_staging(struct vex_store *store, uint64_t epoch,
 		return vex_blob_fs_read_staging(store->blob_fs, epoch, oid, data,
 						size);
 	case VEX_STORE_BACKEND_FS_S3:
+	case VEX_STORE_BACKEND_MYSQL_S3:
 		return blob_s3_result(vex_blob_s3_read_staging(store->blob_s3, epoch,
 							       oid, data, size));
 	default:
@@ -381,7 +479,8 @@ static int blob_backend_promote_epoch(struct vex_store *store,
 
 	if (store->backend == VEX_STORE_BACKEND_FS)
 		return vex_blob_fs_promote_epoch(store->blob_fs, state, epoch);
-	if (store->backend != VEX_STORE_BACKEND_FS_S3)
+	if (store->backend != VEX_STORE_BACKEND_FS_S3 &&
+	    store->backend != VEX_STORE_BACKEND_MYSQL_S3)
 		return VEX_STORE_ERR_INVALID;
 	for (i = 0; i < state->epoch_objects_nr; i++) {
 		const struct vex_meta_epoch_object *entry = &state->epoch_objects[i];
@@ -433,7 +532,8 @@ static int blob_backend_compensate_epoch(
 
 	if (store->backend == VEX_STORE_BACKEND_FS)
 		return vex_blob_fs_compensate_epoch(store->blob_fs, epoch);
-	if (store->backend != VEX_STORE_BACKEND_FS_S3)
+	if (store->backend != VEX_STORE_BACKEND_FS_S3 &&
+	    store->backend != VEX_STORE_BACKEND_MYSQL_S3)
 		return VEX_STORE_ERR_INVALID;
 	for (i = 0; i < objects->nr; i++) {
 		int cleanup = blob_s3_result(vex_blob_s3_delete_staging(
@@ -643,7 +743,7 @@ static int index_commit_parents(struct vex_store *store, struct vex_epoch *epoch
 				const struct object_id *commit_oid,
 				const void *data, unsigned long size)
 {
-	struct vex_meta_fs_lock lock;
+	struct vex_meta_lock lock;
 	struct vex_meta_state state;
 	struct object_id *parents;
 	size_t parents_nr;
@@ -666,10 +766,10 @@ static int index_commit_parents(struct vex_store *store, struct vex_epoch *epoch
 	remove_commit_parents_for(&state, commit_oid);
 	for (i = 0; i < parents_nr; i++)
 		add_commit_parent(&state, commit_oid, i, &parents[i]);
-	ret = vex_meta_fs_save_locked(store->meta, &lock, &state);
+	ret = meta_save_locked(store, &lock, &state);
 out:
 	if (lock.held)
-		vex_meta_fs_unlock(&lock);
+		meta_unlock(store, &lock);
 	vex_meta_state_release(&state);
 	free(parents);
 	return ret;
@@ -684,8 +784,10 @@ int vex_store_open(struct vex_store **store_out,
 
 	if (!store_out || !opts ||
 	    (opts->backend != VEX_STORE_BACKEND_FS &&
-	     opts->backend != VEX_STORE_BACKEND_FS_S3) ||
-	    !opts->root || !*opts->root || !opts->hash_algo ||
+	     opts->backend != VEX_STORE_BACKEND_FS_S3 &&
+	     opts->backend != VEX_STORE_BACKEND_MYSQL_S3) ||
+	    (opts->backend != VEX_STORE_BACKEND_MYSQL_S3 &&
+	     (!opts->root || !*opts->root)) || !opts->hash_algo ||
 	    !opts->hash_algo->rawsz || !opts->hash_algo->hexsz) {
 		ret = VEX_STORE_ERR_INVALID;
 		goto done;
@@ -694,11 +796,26 @@ int vex_store_open(struct vex_store **store_out,
 		goto done;
 	CALLOC_ARRAY(store, 1);
 	store->backend = opts->backend;
-	store->root = xstrdup(opts->root);
+	store->root = xstrdup(opts->root ? opts->root : "");
 	store->repo_id = strbuf_detach(&repo_id, NULL);
 	store->hash_algo = opts->hash_algo;
-	if ((ret = vex_meta_fs_open(&store->meta, store->root, store->repo_id,
-				    store->hash_algo))) {
+	if (store->backend == VEX_STORE_BACKEND_MYSQL_S3) {
+		if (!opts->meta_mysql) {
+			ret = VEX_STORE_ERR_INVALID;
+			vex_store_close(store);
+			goto done;
+		}
+		ret = meta_mysql_result(vex_meta_mysql_open(&store->meta_mysql,
+								    opts->meta_mysql));
+	} else {
+		ret = vex_meta_fs_open(&store->meta, store->root, store->repo_id,
+					       store->hash_algo);
+	}
+	if (ret) {
+		trace_printf("vex: store open backend=%d repo=%s failed (%d)%s%s",
+			     store->backend, store->repo_id, ret,
+			     store->meta_mysql ? ": " : "",
+			     store->meta_mysql ? vex_meta_mysql_error(store->meta_mysql) : "");
 		vex_store_close(store);
 		goto done;
 	}
@@ -719,6 +836,8 @@ int vex_store_open(struct vex_store **store_out,
 		}
 	}
 	if (ret) {
+		trace_printf("vex: blob backend open backend=%d repo=%s failed (%d)",
+			     store->backend, store->repo_id, ret);
 		vex_store_close(store);
 		goto done;
 	}
@@ -734,6 +853,7 @@ void vex_store_close(struct vex_store *store)
 	if (!store)
 		return;
 	vex_meta_fs_close(store->meta);
+	vex_meta_mysql_close(store->meta_mysql);
 	vex_blob_fs_close(store->blob_fs);
 	vex_blob_s3_close(store->blob_s3);
 	free(store->root);
@@ -747,11 +867,12 @@ int vex_repo_ensure(struct vex_store *store)
 
 	if (!store)
 		return VEX_STORE_ERR_INVALID;
-	if ((ret = vex_meta_fs_ensure(store->meta)))
+	if ((ret = meta_ensure(store)))
 		return ret;
 	if (store->backend == VEX_STORE_BACKEND_FS)
 		return vex_blob_fs_ensure(store->blob_fs);
-	if (store->backend != VEX_STORE_BACKEND_FS_S3)
+	if (store->backend != VEX_STORE_BACKEND_FS_S3 &&
+	    store->backend != VEX_STORE_BACKEND_MYSQL_S3)
 		return VEX_STORE_ERR_INVALID;
 	if (!store->blob_s3_checked) {
 		ret = blob_s3_result(vex_blob_s3_check_bucket(store->blob_s3));
@@ -772,6 +893,37 @@ const struct git_hash_algo *vex_store_hash_algo(const struct vex_store *store)
 	return store ? store->hash_algo : NULL;
 }
 
+const char *vex_store_result_string(int result)
+{
+	switch (result) {
+	case VEX_STORE_OK:
+		return "success";
+	case VEX_STORE_ERR:
+		return "backend error";
+	case VEX_STORE_ERR_NOT_FOUND:
+		return "not found";
+	case VEX_STORE_ERR_CONFLICT:
+		return "compare-and-swap conflict";
+	case VEX_STORE_ERR_INVALID:
+		return "invalid request";
+	case VEX_STORE_ERR_CORRUPT:
+		return "corrupt object or metadata";
+	case VEX_STORE_ERR_STATE:
+		return "invalid epoch state";
+	default:
+		return "unknown Vex store error";
+	}
+}
+
+const char *vex_store_error(const struct vex_store *store)
+{
+	if (!store)
+		return "Vex store is not open";
+	if (store->backend == VEX_STORE_BACKEND_MYSQL_S3)
+		return vex_meta_mysql_error(store->meta_mysql);
+	return "filesystem Vex store operation failed";
+}
+
 int vex_blob_key(const struct vex_store *store, const struct object_id *oid,
 		   struct strbuf *key)
 {
@@ -787,7 +939,7 @@ int vex_blob_key(const struct vex_store *store, const struct object_id *oid,
 int vex_epoch_allocate(struct vex_store *store, const char *push_id,
 		       struct vex_epoch **epoch_out)
 {
-	struct vex_meta_fs_lock lock;
+	struct vex_meta_lock lock;
 	struct vex_meta_state state;
 	struct vex_meta_epoch *meta_epoch;
 	struct vex_epoch *epoch;
@@ -802,7 +954,7 @@ int vex_epoch_allocate(struct vex_store *store, const char *push_id,
 	meta_epoch->id = state.next_epoch++;
 	meta_epoch->state = VEX_EPOCH_OPEN;
 	meta_epoch->push_id = push_id ? xstrdup(push_id) : NULL;
-	ret = vex_meta_fs_save_locked(store->meta, &lock, &state);
+	ret = meta_save_locked(store, &lock, &state);
 	if (ret) {
 		vex_meta_state_release(&state);
 		return ret;
@@ -833,7 +985,7 @@ int vex_epoch_attach(struct vex_store *store, uint64_t epoch_id,
 	if (!store || !epoch_out || !epoch_id)
 		return VEX_STORE_ERR_INVALID;
 	*epoch_out = NULL;
-	if ((ret = vex_meta_fs_load(store->meta, &state)))
+	if ((ret = meta_load(store, &state)))
 		return ret;
 	meta_epoch = find_epoch(&state, epoch_id);
 	if (!meta_epoch || meta_epoch->state != VEX_EPOCH_OPEN) {
@@ -863,7 +1015,7 @@ void vex_epoch_detach(struct vex_epoch *epoch)
 int vex_epoch_seal(struct vex_epoch *epoch)
 {
 	struct vex_store *store;
-	struct vex_meta_fs_lock lock;
+	struct vex_meta_lock lock;
 	struct vex_meta_state state;
 	struct vex_meta_epoch *meta_epoch;
 	size_t i;
@@ -892,12 +1044,12 @@ int vex_epoch_seal(struct vex_epoch *epoch)
 		}
 	}
 	meta_epoch->state = VEX_EPOCH_SEALED;
-	ret = vex_meta_fs_save_locked(store->meta, &lock, &state);
+	ret = meta_save_locked(store, &lock, &state);
 	if (!ret)
 		epoch->active = 0;
 out:
 	if (lock.held)
-		vex_meta_fs_unlock(&lock);
+		meta_unlock(store, &lock);
 	vex_meta_state_release(&state);
 	return ret;
 }
@@ -905,7 +1057,7 @@ out:
 int vex_epoch_compensate(struct vex_epoch *epoch)
 {
 	struct vex_store *store;
-	struct vex_meta_fs_lock lock;
+	struct vex_meta_lock lock;
 	struct vex_meta_state state;
 	struct vex_meta_epoch *meta_epoch;
 	struct vex_epoch_blob_list blobs = { 0 };
@@ -924,12 +1076,12 @@ int vex_epoch_compensate(struct vex_epoch *epoch)
 	}
 	snapshot_epoch_objects(&state, epoch->id, &blobs);
 	abort_epoch_state(&state, epoch->id);
-	ret = vex_meta_fs_save_locked(store->meta, &lock, &state);
+	ret = meta_save_locked(store, &lock, &state);
 	if (!ret)
 		epoch->active = 0;
 out:
 	if (lock.held)
-		vex_meta_fs_unlock(&lock);
+		meta_unlock(store, &lock);
 	vex_meta_state_release(&state);
 	if (ret) {
 		release_epoch_objects(&blobs);
@@ -953,7 +1105,7 @@ int vex_blob_put_staging(struct vex_store *store, struct vex_epoch *epoch,
 			 const struct object_id *oid, enum object_type type,
 			 const void *data, unsigned long size)
 {
-	struct vex_meta_fs_lock lock;
+	struct vex_meta_lock lock;
 	struct vex_meta_state state;
 	int ret;
 
@@ -967,19 +1119,19 @@ int vex_blob_put_staging(struct vex_store *store, struct vex_epoch *epoch,
 		ret = VEX_STORE_ERR_STATE;
 		goto out;
 	}
-	vex_meta_fs_unlock(&lock);
+	meta_unlock(store, &lock);
 	ret = blob_backend_put_staging(store, epoch->id, oid, data, size);
 	vex_meta_state_release(&state);
 	return ret;
 out:
-	vex_meta_fs_unlock(&lock);
+	meta_unlock(store, &lock);
 	vex_meta_state_release(&state);
 	return ret;
 }
 
 int vex_blob_promote(struct vex_store *store, struct vex_epoch *epoch)
 {
-	struct vex_meta_fs_lock lock;
+	struct vex_meta_lock lock;
 	struct vex_meta_state state;
 	int ret;
 
@@ -991,7 +1143,7 @@ int vex_blob_promote(struct vex_store *store, struct vex_epoch *epoch)
 		ret = VEX_STORE_ERR_STATE;
 	else
 		ret = blob_backend_promote_epoch(store, &state, epoch->id);
-	vex_meta_fs_unlock(&lock);
+	meta_unlock(store, &lock);
 	vex_meta_state_release(&state);
 	return ret;
 }
@@ -1004,7 +1156,7 @@ int vex_blob_compensate(struct vex_store *store, struct vex_epoch *epoch)
 
 	if (ret)
 		return ret;
-	if ((ret = vex_meta_fs_load(store->meta, &state)))
+	if ((ret = meta_load(store, &state)))
 		return ret;
 	snapshot_epoch_objects(&state, epoch->id, &blobs);
 	vex_meta_state_release(&state);
@@ -1018,7 +1170,7 @@ int vex_object_index_put_quarantine(struct vex_store *store,
 			      const struct object_id *oid,
 			      enum object_type type, unsigned long size)
 {
-	struct vex_meta_fs_lock lock;
+	struct vex_meta_lock lock;
 	struct vex_meta_state state;
 	struct vex_meta_epoch *meta_epoch;
 	struct vex_meta_object *object;
@@ -1045,17 +1197,17 @@ int vex_object_index_put_quarantine(struct vex_store *store,
 	ret = add_epoch_object(&state, epoch->id, oid);
 	if (ret)
 		goto out;
-	ret = vex_meta_fs_save_locked(store->meta, &lock, &state);
+	ret = meta_save_locked(store, &lock, &state);
 out:
 	if (lock.held)
-		vex_meta_fs_unlock(&lock);
+		meta_unlock(store, &lock);
 	vex_meta_state_release(&state);
 	return ret;
 }
 
 int vex_object_index_publish(struct vex_store *store, struct vex_epoch *epoch)
 {
-	struct vex_meta_fs_lock lock;
+	struct vex_meta_lock lock;
 	struct vex_meta_state state;
 	int ret;
 
@@ -1070,10 +1222,10 @@ int vex_object_index_publish(struct vex_store *store, struct vex_epoch *epoch)
 	ret = publish_epoch(store, &state, epoch->id);
 	if (ret)
 		goto out;
-	ret = vex_meta_fs_save_locked(store->meta, &lock, &state);
+	ret = meta_save_locked(store, &lock, &state);
 out:
 	if (lock.held)
-		vex_meta_fs_unlock(&lock);
+		meta_unlock(store, &lock);
 	vex_meta_state_release(&state);
 	return ret;
 }
@@ -1087,7 +1239,7 @@ int vex_object_index_get(struct vex_store *store, const struct object_id *oid,
 
 	if (!store || !oid || !info)
 		return VEX_STORE_ERR_INVALID;
-	if ((ret = vex_meta_fs_load(store->meta, &state)))
+	if ((ret = meta_load(store, &state)))
 		return ret;
 	object = find_object(&state, oid);
 	if (!object)
@@ -1126,7 +1278,7 @@ int vex_store_has_object(struct vex_store *store, const struct object_id *oid)
 
 	if (!store || !oid)
 		return VEX_STORE_ERR_INVALID;
-	if ((ret = vex_meta_fs_load(store->meta, &state)))
+	if ((ret = meta_load(store, &state)))
 		return ret;
 	object = find_object(&state, oid);
 	if (!object || object->state != VEX_OBJECT_PUBLISHED) {
@@ -1153,7 +1305,7 @@ static int read_object(struct vex_store *store, const struct vex_epoch *epoch,
 	if (!store || !oid || !type || !size || !data)
 		return VEX_STORE_ERR_INVALID;
 	*data = NULL;
-	if ((ret = vex_meta_fs_load(store->meta, &state)))
+	if ((ret = meta_load(store, &state)))
 		return ret;
 	object = find_object(&state, oid);
 	if (!object || (object->state != VEX_OBJECT_PUBLISHED &&
@@ -1225,7 +1377,7 @@ int vex_store_for_each_object(struct vex_store *store,
 		return VEX_STORE_ERR_INVALID;
 	if ((ret = check_optional_epoch(store, epoch)))
 		return ret;
-	if ((ret = vex_meta_fs_load(store->meta, &state)))
+	if ((ret = meta_load(store, &state)))
 		return ret;
 	if (state.objects_nr)
 		ALLOC_ARRAY(objects, state.objects_nr);
@@ -1269,7 +1421,7 @@ int vex_store_count_objects(struct vex_store *store,
 	*out = 0;
 	if ((ret = check_optional_epoch(store, epoch)))
 		return ret;
-	if ((ret = vex_meta_fs_load(store->meta, &state)))
+	if ((ret = meta_load(store, &state)))
 		return ret;
 	for (i = 0; i < state.objects_nr; i++) {
 		if (!object_is_visible(&state, &state.objects[i], epoch))
@@ -1306,7 +1458,7 @@ int vex_store_find_abbrev_len(struct vex_store *store,
 		return VEX_STORE_OK;
 	}
 	*out = min_length;
-	if ((ret = vex_meta_fs_load(store->meta, &state)))
+	if ((ret = meta_load(store, &state)))
 		return ret;
 	for (i = 0; i < state.objects_nr; i++) {
 		unsigned common;
@@ -1335,7 +1487,7 @@ int vex_ref_read(struct vex_store *store, const char *refname, struct vex_ref *r
 	if (!store || !refname || !ref)
 		return VEX_STORE_ERR_INVALID;
 	memset(ref, 0, sizeof(*ref));
-	if ((ret = vex_meta_fs_load(store->meta, &state)))
+	if ((ret = meta_load(store, &state)))
 		return ret;
 	found = find_ref(&state, refname);
 	if (!found) {
@@ -1384,7 +1536,7 @@ int vex_ref_iterate(struct vex_store *store, const char *prefix,
 		return VEX_STORE_ERR_INVALID;
 	if (!prefix)
 		prefix = "";
-	if ((ret = vex_meta_fs_load(store->meta, &state)))
+	if ((ret = meta_load(store, &state)))
 		return ret;
 	ALLOC_ARRAY(refs, state.refs_nr);
 	for (i = 0; i < state.refs_nr; i++)
@@ -1450,7 +1602,7 @@ int vex_ref_transaction_commit(struct vex_ref_transaction *transaction)
 {
 	struct vex_store *store;
 	struct vex_epoch *epoch;
-	struct vex_meta_fs_lock lock;
+	struct vex_meta_lock lock;
 	struct vex_meta_state state;
 	struct vex_meta_epoch *meta_epoch;
 	struct vex_epoch_blob_list blobs = { 0 };
@@ -1487,11 +1639,11 @@ int vex_ref_transaction_commit(struct vex_ref_transaction *transaction)
 
 		snapshot_epoch_objects(&state, epoch->id, &blobs);
 		abort_epoch_state(&state, epoch->id);
-		save_ret = vex_meta_fs_save_locked(store->meta, &lock, &state);
+		save_ret = meta_save_locked(store, &lock, &state);
 		if (!save_ret)
 			epoch->active = 0;
 		if (lock.held)
-			vex_meta_fs_unlock(&lock);
+			meta_unlock(store, &lock);
 		vex_meta_state_release(&state);
 		if (!save_ret)
 			blob_backend_compensate_epoch(store, epoch->id, &blobs);
@@ -1507,14 +1659,14 @@ int vex_ref_transaction_commit(struct vex_ref_transaction *transaction)
 			goto out;
 	}
 	meta_epoch->state = VEX_EPOCH_SEALED;
-	ret = vex_meta_fs_save_locked(store->meta, &lock, &state);
+	ret = meta_save_locked(store, &lock, &state);
 	if (!ret) {
 		epoch->active = 0;
 		transaction->committed = 1;
 	}
-out:
+	out:
 	if (lock.held)
-		vex_meta_fs_unlock(&lock);
+		meta_unlock(store, &lock);
 	vex_meta_state_release(&state);
 	return ret;
 }
@@ -1536,7 +1688,7 @@ void vex_ref_transaction_abort(struct vex_ref_transaction *transaction)
 int vex_ref_updates_append(struct vex_store *store,
 			   const struct vex_ref_update *update, uint64_t *id)
 {
-	struct vex_meta_fs_lock lock;
+	struct vex_meta_lock lock;
 	struct vex_meta_state state;
 	int ret;
 
@@ -1548,9 +1700,9 @@ int vex_ref_updates_append(struct vex_store *store,
 		return ret;
 	ret = append_ref_update(&state, update, NULL, id);
 	if (!ret)
-		ret = vex_meta_fs_save_locked(store->meta, &lock, &state);
+		ret = meta_save_locked(store, &lock, &state);
 	if (lock.held)
-		vex_meta_fs_unlock(&lock);
+		meta_unlock(store, &lock);
 	vex_meta_state_release(&state);
 	return ret;
 }
@@ -1564,7 +1716,7 @@ int vex_ref_updates_iterate(struct vex_store *store,
 
 	if (!store || !fn)
 		return VEX_STORE_ERR_INVALID;
-	if ((ret = vex_meta_fs_load(store->meta, &state)))
+	if ((ret = meta_load(store, &state)))
 		return ret;
 	for (i = 0; i < state.ref_updates_nr; i++) {
 		ret = fn(&state.ref_updates[i].update, state.ref_updates[i].id,

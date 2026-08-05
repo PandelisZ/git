@@ -1,7 +1,7 @@
 # Vex Stage Playbooks PRD
 
 **Status:** Active
-**Current Stage:** 3 - Vex-FS smart-HTTP and atomic receive epochs
+**Current Stage:** 4 - MySQL metadata + S3 object-byte Compose data plane
 **Owner:** Codex
 **Created:** 2026-08-05
 **Updated:** 2026-08-05
@@ -34,7 +34,7 @@ PRD 001 stages need agent-executable playbooks: schemas, file lists, tests, and 
 | L0 | Design | Roadmap freeze |
 | L1 | Dev fs correctness | Stage 3 fs push/fetch |
 | L2 | Vex functional | Stage 4 mysql+s3 |
-| L3 | Multi-tenant beta | Stage 6 + scrub |
+| L3 | PoC safety / dogfood | Stage 6 + scrub |
 | L4 | **User acceptance** | Stage 7: stock client F1–F8 on mirrored **git/git** + clone \(T_{us}\le 1.5 T_{gh}\) and \(T_{us}\le 1.5 T_{disk}\) — see [005](005-stock-client-verification-and-benchmark.md) |
 | L5 | HA hardened | multiplex + long-lived daemon; p95 holds under drill |
 
@@ -238,14 +238,16 @@ Acceptance:
 
 **Local-only dependencies:** Docker Compose stack in [006](006-local-docker-compose-test-environment.md).
 
-**Implementation snapshot (2026-08-05):** the local MySQL/MinIO/TLS topology,
-schema/bucket initialization, stock-Git bootstrap smoke, native MySQL metadata
-probe, and signed MinIO blob probe are green. `GIT_VEX_BLOB_BACKEND=s3` now
-selects MinIO canonical bytes in the central store while metadata remains FS;
-the direct-store, stock-HTTP, and receive-compensation proofs are `t1494`,
-`t1495`, and `t1496`. The bundled bootstrap health response still explicitly
-says `vex_storage_active:false` and MySQL is not yet active metadata, so this
-is not a Vex MySQL/S3 data plane or an L2 result.
+**Implementation snapshot (2026-08-05):** the source-built Compose Git image
+now selects `GIT_VEX_META_BACKEND=mysql` and `GIT_VEX_BLOB_BACKEND=s3`.
+Its long-lived gateway verifies the active store before reporting healthy.
+`t1497` proves a stock host Git can push, clone, fetch, atomically publish a
+tag plus branch, delete a branch, and shallow-clone through that gateway; it
+then checks MySQL metadata and MinIO keys. This is an L2 vertical data-plane
+milestone, not an L4 pack/benchmark result. `t1498` adds 20 stock-Git
+batch=1 pushes from an empty repo with fresh reconciliation; `t1499` proves
+rejected-receive compensation; and `t1500` covers simultaneous first pushes
+to separate repositories after the MySQL audit-sequence migration.
 
 Tasks:
 
@@ -253,14 +255,15 @@ Tasks:
 2. Land `scripts/vex/{up,down,reset,seed-small,print-env}.sh`.
 3. meta-mysql migrations applied by mysql init or migrate job.
 4. [x] blob-s3 against MinIO (`path-style`, custom endpoint) for canonical bytes; FS metadata remains for this slice.
-5. Wire git-http container to the active MySQL+S3 store. `GIT_VEX_BACKEND=mysql+s3` remains a planned topology label, not an activation switch.
-6. pooling notes for short-lived git processes.
-7. `t/vex/integration-mysql-minio.sh` + stock clone smoke.
-8. Finalize push-stress on Compose ([009](009-incremental-push-stress-harness.md)): smoke + **ramp** + **chaos** + **fault_inject**.
-9. Post-batch recon asserts (W5-3); anti-cheat checkpoint (W5-5).
-10. Compose resource limits for stress profile (W5-10).
-11. CI: up → seed-small → clone smoke → **push-stress smoke** → down -v.
-12. **Sealed packs still optional** at L2 (W5-4).
+5. [x] Wire git-http container to the active MySQL+S3 store. `GIT_VEX_BACKEND=mysql+s3` is a topology alias; the explicit MySQL and S3 selectors activate it.
+6. [x] Use a long-lived gateway process; Git protocol children remain bounded request work, so this does not yet satisfy the no-CGI-stampede L4 load gate.
+7. [x] `t/vex/integration-mysql-minio.sh` + `t1497` stock-client smoke.
+8. [x] Compose smoke push-stress ([009](009-incremental-push-stress-harness.md)): empty repo, 20× batch=1 with stock Git.
+9. [x] Post-batch fresh-fetch/`fsck` recon asserts and checkpoint/metrics anti-cheat fields.
+10. [ ] Compose ramp + **chaos** + **fault_inject** profiles.
+11. Compose resource limits for stress profile (W5-10).
+12. CI: up → seed-small → clone smoke → **push-stress smoke** → down -v.
+13. **Sealed packs still optional** at L2 (W5-4).
 
 Acceptance:
 
@@ -389,6 +392,7 @@ Tasks:
 
 - Playbooks derived from 001 stages + 003 passes 02,05,13,14,16,21,25,26,28,35.
 - receive-pack quarantine/`odb_transaction` integration requirement confirmed in-tree.
+- Compose Stage 4 data plane: source-built Vex Git, MySQL metadata, and MinIO canonical bytes verified by `t1497`; `t1498` is green for the serial 20× smoke plus reconciliation, `t1499` is green for receive compensation, and `t1500` is green for two concurrent repositories. Ramp, chaos, fault injection, and sweeper/scrub remain the next gates.
 
 ## Open Questions
 

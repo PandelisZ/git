@@ -1232,6 +1232,7 @@ LIB_OBJS += odb/source.o
 LIB_OBJS += odb/source-vex.o
 LIB_OBJS += vex/store.o
 LIB_OBJS += vex/meta-fs.o
+LIB_OBJS += vex/meta-mysql.o
 LIB_OBJS += vex/blob-fs.o
 LIB_OBJS += vex/blob-s3.o
 LIB_OBJS += odb/source-files.o
@@ -2538,6 +2539,37 @@ VEX_MYSQL_CFLAGS = $(shell if $(VEX_MYSQL_PKG_CONFIG) --exists mysqlclient >/dev
 VEX_MYSQL_LIBS = $(shell if $(VEX_MYSQL_PKG_CONFIG) --exists mysqlclient >/dev/null 2>&1; then $(VEX_MYSQL_PKG_CONFIG) --libs mysqlclient; elif command -v $(VEX_MYSQL_CONFIG) >/dev/null 2>&1; then $(VEX_MYSQL_CONFIG) --libs; fi)
 VEX_MYSQL_PROBE_BIN = t/vex/bin/vex-mysql-metadata-probe
 VEX_MYSQL_PROBE_OBJS = vex/meta-mysql-probe.o t/vex/mysql-metadata-probe.o
+
+# `vex/meta-mysql.o` changes ABI when VEX_MYSQL is toggled. Track that
+# selection separately so alternating normal and MySQL-enabled builds cannot
+# reuse an object with unresolved mysql_* symbols (or silently lose the native
+# driver). This deliberately rebuilds only the one Vex object.
+VEX_MYSQL_BUILD_FLAGS = $(VEX_MYSQL) $(VEX_MYSQL_CFLAGS) $(VEX_MYSQL_LIBS)
+VEX-MYSQL-BUILD: FORCE
+	@FLAGS='$(VEX_MYSQL_BUILD_FLAGS)'; \
+	    if test x"$$FLAGS" != x"`cat $@ 2>/dev/null`" ; then \
+		echo >&2 "    * new Vex MySQL build flags"; \
+		echo "$$FLAGS" >$@; \
+	    fi
+
+vex/meta-mysql.o: VEX-MYSQL-BUILD
+
+# A normal Git build keeps the Vex MySQL driver as a safe, unavailable stub.
+# Opting in makes the production Vex store link the native client; this is the
+# mode used by the Vex Compose image and MySQL+S3 integration tests.
+ifeq ($(VEX_MYSQL),YesPlease)
+ifeq ($(strip $(VEX_MYSQL_CFLAGS)$(VEX_MYSQL_LIBS)),)
+$(error VEX_MYSQL=YesPlease requires pkg-config mysqlclient or mysql_config)
+endif
+vex/meta-mysql.o: EXTRA_CPPFLAGS += $(VEX_MYSQL_CFLAGS) -DVEX_HAVE_MYSQL_CLIENT
+EXTLIBS += $(VEX_MYSQL_LIBS)
+endif
+
+# This object is linked into libgit regardless of whether the native client
+# is selected.  The define gives its unavailable stubs the central-store
+# adapter ABI, while the standalone probe intentionally stays independent of
+# Git's in-process metadata state types.
+vex/meta-mysql.o: EXTRA_CPPFLAGS += -DVEX_META_MYSQL_STORE
 
 BASIC_CFLAGS += $(COMPAT_CFLAGS)
 LIB_OBJS += $(COMPAT_OBJS)
@@ -3945,7 +3977,7 @@ clean: profile-clean coverage-clean cocciclean
 	$(RM) po/git.pot po/git-core.pot
 	$(RM) git.rc git.res
 	$(RM) $(OBJECTS)
-	$(RM) $(VEX_MYSQL_PROBE_OBJS) $(VEX_MYSQL_PROBE_BIN)
+	$(RM) $(VEX_MYSQL_PROBE_OBJS) $(VEX_MYSQL_PROBE_BIN) VEX-MYSQL-BUILD
 	$(RM) headless-git.o
 	$(RM) $(LIB_FILE)
 	$(RM) $(ALL_PROGRAMS) $(SCRIPT_LIB) $(BUILT_INS) $(OTHER_PROGRAMS)

@@ -1,5 +1,11 @@
 #include "vex/meta-mysql.h"
 
+#ifdef VEX_META_MYSQL_STORE
+#include "git-compat-util.h"
+#include "trace.h"
+#include "vex/store-internal.h"
+#endif
+
 #include <ctype.h>
 #include <errno.h>
 #include <inttypes.h>
@@ -123,6 +129,27 @@ int vex_meta_mysql_epoch_begin(struct vex_meta_mysql *db,
 	return mysql_unavailable();
 }
 
+int vex_meta_mysql_epoch_get_state(struct vex_meta_mysql *db,
+				   const char *repo_id, uint64_t generation,
+				   enum vex_meta_mysql_epoch_state *state)
+{
+	(void)db;
+	(void)repo_id;
+	(void)generation;
+	if (state)
+		*state = 0;
+	return mysql_unavailable();
+}
+
+int vex_meta_mysql_epoch_abort(struct vex_meta_mysql *db,
+			       const char *repo_id, uint64_t generation)
+{
+	(void)db;
+	(void)repo_id;
+	(void)generation;
+	return mysql_unavailable();
+}
+
 int vex_meta_mysql_stage_object(struct vex_meta_mysql *db,
 			 const char *repo_id, uint64_t generation,
 			 const unsigned char *oid, size_t oid_len,
@@ -138,6 +165,30 @@ int vex_meta_mysql_stage_object(struct vex_meta_mysql *db,
 	(void)size;
 	(void)blob_key;
 	return mysql_unavailable();
+}
+
+int vex_meta_mysql_object_get_visible(struct vex_meta_mysql *db,
+				      const char *repo_id,
+				      const unsigned char *oid, size_t oid_len,
+				      uint64_t visible_generation,
+				      struct vex_meta_mysql_object *object)
+{
+	(void)db;
+	(void)repo_id;
+	(void)oid;
+	(void)oid_len;
+	(void)visible_generation;
+	if (object)
+		memset(object, 0, sizeof(*object));
+	return mysql_unavailable();
+}
+
+void vex_meta_mysql_object_release(struct vex_meta_mysql_object *object)
+{
+	if (!object)
+		return;
+	free(object->blob_key);
+	memset(object, 0, sizeof(*object));
 }
 
 int vex_meta_mysql_add_commit_parent(struct vex_meta_mysql *db,
@@ -185,15 +236,55 @@ int vex_meta_mysql_ref_cas_direct(struct vex_meta_mysql *db,
 	return mysql_unavailable();
 }
 
+int vex_meta_mysql_state_lock(struct vex_meta_mysql *db, const char *repo_id)
+{
+	(void)db;
+	(void)repo_id;
+	return mysql_unavailable();
+}
+
+void vex_meta_mysql_state_unlock(struct vex_meta_mysql *db)
+{
+	(void)db;
+}
+
+int vex_meta_mysql_state_load(struct vex_meta_mysql *db, const char *repo_id,
+			       const struct git_hash_algo *hash_algo,
+			       struct vex_meta_state *state)
+{
+	(void)db;
+	(void)repo_id;
+	(void)hash_algo;
+	(void)state;
+	return mysql_unavailable();
+}
+
+int vex_meta_mysql_state_save_locked(struct vex_meta_mysql *db,
+				      const char *repo_id,
+				      const struct git_hash_algo *hash_algo,
+				      const struct vex_meta_state *state)
+{
+	(void)db;
+	(void)repo_id;
+	(void)hash_algo;
+	(void)state;
+	return mysql_unavailable();
+}
+
 #else /* VEX_HAVE_MYSQL_CLIENT */
 
+/* mysql.h exports an unrelated list_add symbol; Git already owns that name. */
+#define list_add vex_mysql_client_list_add
 #include <mysql.h>
+#undef list_add
 
 #define VEX_META_MYSQL_ERROR_SIZE 512
 
 struct vex_meta_mysql {
 	MYSQL *mysql;
 	char error[VEX_META_MYSQL_ERROR_SIZE];
+	/* A central-store write owns this transaction until save or unlock. */
+	int state_transaction;
 };
 
 static const char hex[] = "0123456789abcdef";
@@ -434,6 +525,63 @@ static int query_one_text(struct vex_meta_mysql *db, const char *sql,
 	return VEX_META_MYSQL_OK;
 }
 
+static int parse_epoch_state(const char *value,
+			     enum vex_meta_mysql_epoch_state *state)
+{
+	if (!strcmp(value, "open"))
+		*state = VEX_META_MYSQL_EPOCH_OPEN;
+	else if (!strcmp(value, "sealed"))
+		*state = VEX_META_MYSQL_EPOCH_SEALED;
+	else if (!strcmp(value, "sweepable"))
+		*state = VEX_META_MYSQL_EPOCH_SWEEPABLE;
+	else if (!strcmp(value, "swept"))
+		*state = VEX_META_MYSQL_EPOCH_SWEPT;
+	else if (!strcmp(value, "aborted"))
+		*state = VEX_META_MYSQL_EPOCH_ABORTED;
+	else
+		return -1;
+	return 0;
+}
+
+static int parse_object_state(const char *value,
+			      enum vex_meta_mysql_object_state *state)
+{
+	if (!strcmp(value, "quarantine"))
+		*state = VEX_META_MYSQL_OBJECT_QUARANTINE;
+	else if (!strcmp(value, "published"))
+		*state = VEX_META_MYSQL_OBJECT_PUBLISHED;
+	else
+		return -1;
+	return 0;
+}
+
+static int require_published_object_locked(struct vex_meta_mysql *db,
+					   const char *repo,
+					   const char *object)
+{
+	char *sql;
+	char state[16];
+	int found;
+	int ret;
+
+	sql = vex_format("SELECT state FROM objects WHERE repo_id = %s "
+			 "AND oid = %s FOR UPDATE", repo, object);
+	if (!sql)
+		return set_error(db, VEX_META_MYSQL_ERR_NOMEM,
+				 "could not allocate object publication query");
+	ret = query_one_text(db, sql, state, sizeof(state), &found);
+	free(sql);
+	if (ret)
+		return ret;
+	if (!found)
+		return set_error(db, VEX_META_MYSQL_ERR_NOT_FOUND,
+				 "Vex ref target object does not exist");
+	if (strcmp(state, "published"))
+		return set_error(db, VEX_META_MYSQL_ERR_STATE,
+				 "Vex ref target object is not published");
+	return VEX_META_MYSQL_OK;
+}
+
 static int mysql_begin(struct vex_meta_mysql *db)
 {
 	return mysql_exec(db, "START TRANSACTION");
@@ -532,12 +680,24 @@ int vex_meta_mysql_open(struct vex_meta_mysql **out,
 				opts->port ? opts->port : 3306, opts->unix_socket, 0)) {
 		set_error(db, VEX_META_MYSQL_ERR_CONNECT, "MySQL connect failed: %s",
 			  mysql_error(db->mysql));
+#ifdef VEX_META_MYSQL_STORE
+		trace_printf("vex: MySQL connection to %s:%u/%s failed: %s",
+			     opts->host ? opts->host : "127.0.0.1",
+			     opts->port ? opts->port : 3306, opts->database,
+			     mysql_error(db->mysql));
+#endif
 		mysql_close(db->mysql);
 		free(db);
 		return VEX_META_MYSQL_ERR_CONNECT;
 	}
 	if (mysql_set_character_set(db->mysql, "utf8mb4")) {
 		set_mysql_error(db, "MySQL character set setup failed");
+#ifdef VEX_META_MYSQL_STORE
+		trace_printf("vex: MySQL character-set setup for %s:%u/%s failed: %s",
+			     opts->host ? opts->host : "127.0.0.1",
+			     opts->port ? opts->port : 3306, opts->database,
+			     mysql_error(db->mysql));
+#endif
 		mysql_close(db->mysql);
 		free(db);
 		return VEX_META_MYSQL_ERR_CONNECT;
@@ -569,6 +729,60 @@ int vex_meta_mysql_ping(struct vex_meta_mysql *db)
 	if (mysql_ping(db->mysql))
 		return set_mysql_error(db, "MySQL ping failed");
 	return VEX_META_MYSQL_OK;
+}
+
+/*
+ * ref_updates.id was originally made globally unique even though every Vex
+ * state transaction locks only its repository row.  That made simultaneous
+ * first pushes to two repositories race for the same manually assigned audit
+ * id.  IDs are an audit sequence within a repository, so retain a leading
+ * non-unique index for AUTO_INCREMENT callers instead.  The advisory lock
+ * makes this upgrade safe when several smart-HTTP children open at once.
+ */
+static int ensure_ref_updates_id_index(struct vex_meta_mysql *db)
+{
+	static const char lock_sql[] =
+		"SELECT GET_LOCK('vex-schema-ref-updates-id-v2', 5)";
+	static const char unlock_sql[] =
+		"SELECT RELEASE_LOCK('vex-schema-ref-updates-id-v2')";
+	static const char index_sql[] =
+		"SELECT non_unique FROM information_schema.statistics "
+		"WHERE table_schema = DATABASE() AND table_name = 'ref_updates' "
+		"AND index_name = 'ref_updates_id' LIMIT 1";
+	uint64_t locked;
+	uint64_t non_unique;
+	uint64_t released;
+	int found;
+	int lock_found;
+	int release_found;
+	int ret;
+	int release_ret;
+
+	ret = query_one_u64(db, lock_sql, &locked, &lock_found);
+	if (ret)
+		return ret;
+	if (!lock_found || locked != 1)
+		return set_error(db, VEX_META_MYSQL_ERR_CONFLICT,
+				 "timed out acquiring Vex schema migration lock");
+
+	ret = query_one_u64(db, index_sql, &non_unique, &found);
+	if (!ret && found && non_unique != 0 && non_unique != 1)
+		ret = set_error(db, VEX_META_MYSQL_ERR_SCHEMA,
+				"ref_updates.id index has invalid uniqueness metadata");
+	if (!ret && !found)
+		ret = mysql_exec(db, "ALTER TABLE ref_updates ADD KEY ref_updates_id (id)");
+	else if (!ret && found && !non_unique)
+		ret = mysql_exec(db, "ALTER TABLE ref_updates DROP INDEX ref_updates_id, "
+				 "ADD KEY ref_updates_id (id)");
+	release_ret = query_one_u64(db, unlock_sql, &released, &release_found);
+	if (!ret && (release_ret || !release_found || released != 1)) {
+		if (release_ret)
+			ret = release_ret;
+		else
+			ret = set_error(db, VEX_META_MYSQL_ERR_STATE,
+					"lost Vex schema migration lock");
+	}
+	return ret;
 }
 
 int vex_meta_mysql_schema_check(struct vex_meta_mysql *db,
@@ -607,6 +821,9 @@ int vex_meta_mysql_schema_check(struct vex_meta_mysql *db,
 	if (!found || blob_key != 1)
 		return set_error(db, VEX_META_MYSQL_ERR_SCHEMA,
 				 "objects.blob_key is not VARBINARY metadata");
+	ret = ensure_ref_updates_id_index(db);
+	if (ret)
+		return ret;
 	if (table_count)
 		*table_count = (unsigned int)tables;
 	return VEX_META_MYSQL_OK;
@@ -685,7 +902,6 @@ out:
 	free(repo);
 	return ret;
 }
-
 int vex_meta_mysql_epoch_begin(struct vex_meta_mysql *db,
 			       const char *repo_id, const char *push_id,
 			       uint64_t *generation)
@@ -767,6 +983,202 @@ out:
 			ret = unlock_ret;
 	}
 	free(push);
+	free(repo);
+	return ret;
+}
+
+int vex_meta_mysql_epoch_get_state(struct vex_meta_mysql *db,
+				   const char *repo_id, uint64_t generation,
+				   enum vex_meta_mysql_epoch_state *state)
+{
+	char *repo = NULL;
+	char *sql = NULL;
+	char value[16];
+	int found;
+	int ret;
+
+	if (!db || !db->mysql || !generation || !state)
+		return VEX_META_MYSQL_ERR_INVALID;
+	*state = 0;
+	repo = sql_repo_literal(repo_id, NULL);
+	if (!repo)
+		return set_error(db, VEX_META_MYSQL_ERR_INVALID,
+				 "invalid Vex repository UUID");
+	sql = vex_format("SELECT state FROM generations WHERE repo_id = %s "
+			 "AND generation = %" PRIu64, repo, generation);
+	if (!sql) {
+		ret = set_error(db, VEX_META_MYSQL_ERR_NOMEM,
+				"could not allocate epoch state query");
+		goto out;
+	}
+	ret = query_one_text(db, sql, value, sizeof(value), &found);
+	if (ret)
+		goto out;
+	if (!found) {
+		ret = VEX_META_MYSQL_ERR_NOT_FOUND;
+		goto out;
+	}
+	if (parse_epoch_state(value, state)) {
+		ret = set_error(db, VEX_META_MYSQL_ERR,
+				"MySQL returned an invalid Vex epoch state");
+		goto out;
+	}
+	ret = VEX_META_MYSQL_OK;
+
+out:
+	free(sql);
+	free(repo);
+	return ret;
+}
+
+int vex_meta_mysql_epoch_abort(struct vex_meta_mysql *db,
+			       const char *repo_id, uint64_t generation)
+{
+	char *repo = NULL;
+	char *sql = NULL;
+	char value[16];
+	int found;
+	int in_transaction = 0;
+	int ret;
+
+	if (!db || !db->mysql || !generation)
+		return VEX_META_MYSQL_ERR_INVALID;
+	repo = sql_repo_literal(repo_id, NULL);
+	if (!repo)
+		return set_error(db, VEX_META_MYSQL_ERR_INVALID,
+				 "invalid Vex repository UUID");
+	ret = mysql_begin(db);
+	if (ret)
+		goto out;
+	in_transaction = 1;
+	sql = vex_format("SELECT state FROM generations WHERE repo_id = %s "
+			 "AND generation = %" PRIu64 " FOR UPDATE", repo, generation);
+	if (!sql) {
+		ret = set_error(db, VEX_META_MYSQL_ERR_NOMEM,
+				"could not allocate epoch abort state query");
+		goto out;
+	}
+	ret = query_one_text(db, sql, value, sizeof(value), &found);
+	free(sql);
+	sql = NULL;
+	if (ret)
+		goto out;
+	if (!found) {
+		ret = set_error(db, VEX_META_MYSQL_ERR_NOT_FOUND,
+				"cannot abort a missing Vex generation");
+		goto out;
+	}
+	if (strcmp(value, "open")) {
+		ret = set_error(db, VEX_META_MYSQL_ERR_STATE,
+				"cannot abort a non-open Vex generation");
+		goto out;
+	}
+
+	/*
+	 * First remove graph rows for objects which are solely claimed by this
+	 * generation.  The matching object/claim deletes below preserve an object
+	 * shared with another open epoch, or a pre-existing published object.
+	 */
+	sql = vex_format("DELETE cp FROM commit_parents AS cp "
+			 "INNER JOIN objects AS o ON o.repo_id = cp.repo_id "
+			 "AND o.oid = cp.commit_oid "
+			 "INNER JOIN generation_objects AS own ON own.repo_id = o.repo_id "
+			 "AND own.oid = o.oid "
+			 "LEFT JOIN generation_objects AS other ON other.repo_id = o.repo_id "
+			 "AND other.oid = o.oid AND other.generation <> %" PRIu64 " "
+			 "WHERE own.repo_id = %s AND own.generation = %" PRIu64 " "
+			 "AND o.state = 'quarantine' AND other.oid IS NULL",
+			 generation, repo, generation);
+	if (!sql) {
+		ret = set_error(db, VEX_META_MYSQL_ERR_NOMEM,
+				"could not allocate commit-parent compensation query");
+		goto out;
+	}
+	ret = mysql_exec(db, sql);
+	free(sql);
+	sql = NULL;
+	if (ret)
+		goto out;
+
+	/* Drop this epoch's unique quarantine claims before deleting their rows. */
+	sql = vex_format("DELETE own FROM generation_objects AS own "
+			 "INNER JOIN objects AS o ON o.repo_id = own.repo_id "
+			 "AND o.oid = own.oid "
+			 "LEFT JOIN generation_objects AS other ON other.repo_id = own.repo_id "
+			 "AND other.oid = own.oid AND other.generation <> %" PRIu64 " "
+			 "WHERE own.repo_id = %s AND own.generation = %" PRIu64 " "
+			 "AND o.state = 'quarantine' AND other.oid IS NULL",
+			 generation, repo, generation);
+	if (!sql) {
+		ret = set_error(db, VEX_META_MYSQL_ERR_NOMEM,
+				"could not allocate generation-claim compensation query");
+		goto out;
+	}
+	ret = mysql_exec(db, sql);
+	free(sql);
+	sql = NULL;
+	if (ret)
+		goto out;
+
+	/* A normally staged object is owned by the generation that introduced it. */
+	sql = vex_format("DELETE o FROM objects AS o "
+			 "LEFT JOIN generation_objects AS remaining "
+			 "ON remaining.repo_id = o.repo_id AND remaining.oid = o.oid "
+			 "WHERE o.repo_id = %s AND o.generation = %" PRIu64 " "
+			 "AND o.state = 'quarantine' AND remaining.oid IS NULL",
+			 repo, generation);
+	if (!sql) {
+		ret = set_error(db, VEX_META_MYSQL_ERR_NOMEM,
+				"could not allocate object compensation query");
+		goto out;
+	}
+	ret = mysql_exec(db, sql);
+	free(sql);
+	sql = NULL;
+	if (ret)
+		goto out;
+
+	/* Remaining claims are shared quarantine or published-object claims. */
+	sql = vex_format("DELETE FROM generation_objects WHERE repo_id = %s "
+			 "AND generation = %" PRIu64, repo, generation);
+	if (!sql) {
+		ret = set_error(db, VEX_META_MYSQL_ERR_NOMEM,
+				"could not allocate final generation-claim cleanup query");
+		goto out;
+	}
+	ret = mysql_exec(db, sql);
+	free(sql);
+	sql = NULL;
+	if (ret)
+		goto out;
+
+	sql = vex_format("UPDATE generations SET state = 'aborted' "
+			 "WHERE repo_id = %s AND generation = %" PRIu64 " "
+			 "AND state = 'open'", repo, generation);
+	if (!sql) {
+		ret = set_error(db, VEX_META_MYSQL_ERR_NOMEM,
+				"could not allocate epoch abort update query");
+		goto out;
+	}
+	ret = mysql_exec(db, sql);
+	free(sql);
+	sql = NULL;
+	if (ret)
+		goto out;
+	if (mysql_affected_rows(db->mysql) != 1) {
+		ret = set_error(db, VEX_META_MYSQL_ERR_STATE,
+				"Vex generation changed while being aborted");
+		goto out;
+	}
+	ret = vex_mysql_commit(db);
+	if (ret)
+		goto out;
+	in_transaction = 0;
+
+out:
+	free(sql);
+	if (in_transaction)
+		vex_mysql_rollback(db);
 	free(repo);
 	return ret;
 }
@@ -860,6 +1272,131 @@ out:
 	free(object);
 	free(repo);
 	return ret;
+}
+
+int vex_meta_mysql_object_get_visible(struct vex_meta_mysql *db,
+				      const char *repo_id,
+				      const unsigned char *oid, size_t oid_len,
+				      uint64_t visible_generation,
+				      struct vex_meta_mysql_object *object)
+{
+	char *repo = NULL;
+	char *object_id = NULL;
+	char *sql = NULL;
+	char *blob_key = NULL;
+	MYSQL_RES *res = NULL;
+	MYSQL_ROW row;
+	unsigned long *lengths;
+	char state_value[16];
+	uint64_t object_type;
+	uint64_t size;
+	uint64_t generation;
+	enum vex_meta_mysql_object_state state;
+	int ret = VEX_META_MYSQL_ERR;
+
+	if (!db || !db->mysql || !object)
+		return VEX_META_MYSQL_ERR_INVALID;
+	memset(object, 0, sizeof(*object));
+	repo = sql_repo_literal(repo_id, NULL);
+	object_id = sql_oid_literal(oid, oid_len);
+	if (!repo || !object_id) {
+		ret = set_error(db, VEX_META_MYSQL_ERR_INVALID,
+				"invalid Vex object visibility lookup");
+		goto out;
+	}
+	if (visible_generation) {
+		sql = vex_format("SELECT o.obj_type, o.size, o.blob_key, o.generation, "
+				 "o.state FROM objects AS o WHERE o.repo_id = %s "
+				 "AND o.oid = %s AND (o.state = 'published' OR "
+				 "(o.state = 'quarantine' AND EXISTS (SELECT 1 "
+				 "FROM generation_objects AS go INNER JOIN generations AS g "
+				 "ON g.repo_id = go.repo_id AND g.generation = go.generation "
+				 "WHERE go.repo_id = o.repo_id AND go.oid = o.oid "
+				 "AND go.generation = %" PRIu64 " AND g.state = 'open')))",
+				 repo, object_id, visible_generation);
+	} else {
+		sql = vex_format("SELECT o.obj_type, o.size, o.blob_key, o.generation, "
+				 "o.state FROM objects AS o WHERE o.repo_id = %s "
+				 "AND o.oid = %s AND o.state = 'published'", repo,
+				 object_id);
+	}
+	if (!sql) {
+		ret = set_error(db, VEX_META_MYSQL_ERR_NOMEM,
+				"could not allocate object visibility query");
+		goto out;
+	}
+	if (mysql_query(db->mysql, sql)) {
+		ret = set_mysql_error(db, "MySQL object visibility read failed");
+		goto out;
+	}
+	res = mysql_store_result(db->mysql);
+	if (!res) {
+		ret = set_mysql_error(db, "MySQL object visibility result retrieval failed");
+		goto out;
+	}
+	if (mysql_num_fields(res) != 5) {
+		ret = set_error(db, VEX_META_MYSQL_ERR,
+				"MySQL returned an invalid Vex object visibility result");
+		goto out;
+	}
+	row = mysql_fetch_row(res);
+	if (!row) {
+		ret = VEX_META_MYSQL_ERR_NOT_FOUND;
+		goto out;
+	}
+	lengths = mysql_fetch_lengths(res);
+	if (!row[0] || !row[1] || !row[2] || !row[3] || !row[4] || !lengths ||
+	    parse_u64(row[0], &object_type) || object_type < 1 || object_type > 4 ||
+	    parse_u64(row[1], &size) || parse_u64(row[3], &generation) ||
+	    !lengths[2] || lengths[2] > 512 || memchr(row[2], '\0', lengths[2])) {
+		ret = set_error(db, VEX_META_MYSQL_ERR,
+				"MySQL returned invalid Vex object metadata");
+		goto out;
+	}
+	if (lengths[4] >= sizeof(state_value)) {
+		ret = set_error(db, VEX_META_MYSQL_ERR,
+				"MySQL returned an invalid Vex object state");
+		goto out;
+	}
+	memcpy(state_value, row[4], lengths[4]);
+	state_value[lengths[4]] = '\0';
+	if (parse_object_state(state_value, &state)) {
+		ret = set_error(db, VEX_META_MYSQL_ERR,
+				"MySQL returned an invalid Vex object state");
+		goto out;
+	}
+	blob_key = malloc(lengths[2] + 1);
+	if (!blob_key) {
+		ret = set_error(db, VEX_META_MYSQL_ERR_NOMEM,
+				"could not allocate Vex blob key metadata");
+		goto out;
+	}
+	memcpy(blob_key, row[2], lengths[2]);
+	blob_key[lengths[2]] = '\0';
+	object->object_type = (unsigned int)object_type;
+	object->size = size;
+	object->generation = generation;
+	object->state = state;
+	object->blob_key = blob_key;
+	blob_key = NULL;
+	ret = VEX_META_MYSQL_OK;
+
+out:
+	free(blob_key);
+	if (res)
+		mysql_free_result(res);
+	free(sql);
+	free(object_id);
+	free(repo);
+	return ret;
+}
+
+void vex_meta_mysql_object_release(struct vex_meta_mysql_object *object)
+{
+	if (!object)
+		return;
+	free(object->blob_key);
+	memset(object, 0, sizeof(*object));
 }
 
 int vex_meta_mysql_add_commit_parent(struct vex_meta_mysql *db,
@@ -1052,6 +1589,9 @@ int vex_meta_mysql_ref_cas_direct(struct vex_meta_mysql *db,
 	if (ret)
 		goto out;
 	in_transaction = 1;
+	ret = require_published_object_locked(db, repo, new_object);
+	if (ret)
+		goto out;
 	ret = query_locked_ref(db, repo, quoted_refname, &current_version,
 			       old_oid_hex, &found);
 	if (ret)
@@ -1137,5 +1677,1036 @@ out:
 	free(repo);
 	return ret;
 }
+#ifdef VEX_META_MYSQL_STORE
 
+static int state_oid_from_binary(const char *value, unsigned long length,
+				 const struct git_hash_algo *hash_algo,
+				 struct object_id *oid)
+{
+	unsigned int i;
+
+	if (!value || length != VEX_META_MYSQL_OID_BYTES ||
+	    !hash_algo || (hash_algo->rawsz != 20 && hash_algo->rawsz != 32))
+		return -1;
+	for (i = hash_algo->rawsz; i < VEX_META_MYSQL_OID_BYTES; i++)
+		if ((unsigned char)value[i])
+			return -1;
+	memset(oid, 0, sizeof(*oid));
+	memcpy(oid->hash, value, hash_algo->rawsz);
+	return 0;
+}
+
+static char *state_oid_literal(const struct object_id *oid,
+				       const struct git_hash_algo *hash_algo)
+{
+	if (!oid || !hash_algo)
+		return NULL;
+	return sql_oid_literal(oid->hash, hash_algo->rawsz);
+}
+
+static char *state_row_text(const char *value, unsigned long length)
+{
+	char *result;
+
+	if (!value || memchr(value, '\0', length))
+		return NULL;
+	result = xmallocz(length);
+	memcpy(result, value, length);
+	return result;
+}
+
+static char *state_row_uuid(const char *value, unsigned long length)
+{
+	char *result;
+
+	if (!value)
+		return NULL;
+	if (length != 16)
+		return NULL;
+	result = xmallocz(VEX_META_MYSQL_REPO_ID_HEXSZ);
+	bytes_to_hex((const unsigned char *)value, length, result);
+	return result;
+}
+
+static char *state_uuid_literal_or_null(const char *value)
+{
+	char *literal;
+
+	if (!value)
+		return vex_strdup("NULL");
+	literal = sql_uuid_literal(value);
+	/* Internal one-off object publication uses a descriptive non-UUID id. */
+	return literal ? literal : vex_strdup("NULL");
+}
+
+static int state_query_result(struct vex_meta_mysql *db, const char *sql,
+			      MYSQL_RES **result)
+{
+	if (mysql_query(db->mysql, sql))
+		return set_mysql_error(db, "MySQL Vex state query failed");
+	*result = mysql_store_result(db->mysql);
+	if (!*result)
+		return set_mysql_error(db, "MySQL Vex state result retrieval failed");
+	return VEX_META_MYSQL_OK;
+}
+
+static int state_verify_repository(struct vex_meta_mysql *db, const char *repo,
+				   const struct git_hash_algo *hash_algo)
+{
+	char *sql = NULL;
+	char value[32];
+	int found;
+	int ret;
+
+	sql = vex_format("SELECT hash_algo FROM repositories WHERE repo_id = %s", repo);
+	if (!sql)
+		return set_error(db, VEX_META_MYSQL_ERR_NOMEM,
+				 "could not allocate repository state query");
+	ret = query_one_text(db, sql, value, sizeof(value), &found);
+	free(sql);
+	if (ret)
+		return ret;
+	if (!found)
+		return VEX_META_MYSQL_ERR_NOT_FOUND;
+	if (strcmp(value, hash_algo->name))
+		return set_error(db, VEX_META_MYSQL_ERR_CONFLICT,
+				 "Vex repository hash algorithm does not match store");
+	return VEX_META_MYSQL_OK;
+}
+
+int vex_meta_mysql_state_lock(struct vex_meta_mysql *db, const char *repo_id)
+{
+	char *repo = NULL;
+	char *sql = NULL;
+	char value[32];
+	int found;
+	int in_transaction = 0;
+	int ret;
+
+	if (!db || !db->mysql || db->state_transaction)
+		return VEX_META_MYSQL_ERR_STATE;
+	repo = sql_repo_literal(repo_id, NULL);
+	if (!repo)
+		return set_error(db, VEX_META_MYSQL_ERR_INVALID,
+				 "invalid Vex repository UUID");
+	ret = mysql_begin(db);
+	if (ret)
+		goto out;
+	in_transaction = 1;
+	sql = vex_format("SELECT hash_algo FROM repositories WHERE repo_id = %s "
+			 "FOR UPDATE", repo);
+	if (!sql) {
+		ret = set_error(db, VEX_META_MYSQL_ERR_NOMEM,
+				"could not allocate Vex state lock query");
+		goto out;
+	}
+	ret = query_one_text(db, sql, value, sizeof(value), &found);
+	if (ret)
+		goto out;
+	if (!found) {
+		ret = VEX_META_MYSQL_ERR_NOT_FOUND;
+		goto out;
+	}
+	db->state_transaction = 1;
+	in_transaction = 0;
+	ret = VEX_META_MYSQL_OK;
+
+out:
+	free(sql);
+	if (in_transaction)
+		vex_mysql_rollback(db);
+	free(repo);
+	return ret;
+}
+
+void vex_meta_mysql_state_unlock(struct vex_meta_mysql *db)
+{
+	if (!db || !db->mysql || !db->state_transaction)
+		return;
+	vex_mysql_rollback(db);
+	db->state_transaction = 0;
+}
+
+static int state_load_epochs(struct vex_meta_mysql *db, const char *repo,
+			     struct vex_meta_state *state)
+{
+	char *sql = NULL;
+	MYSQL_RES *res = NULL;
+	MYSQL_ROW row;
+	unsigned long *lengths;
+	int ret;
+
+	sql = vex_format("SELECT generation, state, push_id FROM generations "
+			 "WHERE repo_id = %s ORDER BY generation", repo);
+	if (!sql)
+		return set_error(db, VEX_META_MYSQL_ERR_NOMEM,
+				 "could not allocate generation state query");
+	ret = state_query_result(db, sql, &res);
+	free(sql);
+	if (ret)
+		return ret;
+	while ((row = mysql_fetch_row(res))) {
+		struct vex_meta_epoch *epoch;
+		uint64_t id;
+		enum vex_meta_mysql_epoch_state epoch_state;
+
+		lengths = mysql_fetch_lengths(res);
+		if (!row[0] || !row[1] || !lengths ||
+		    parse_u64(row[0], &id) || !id ||
+		    parse_epoch_state(row[1], &epoch_state) ||
+		    (row[2] && lengths[2] != 16) || id == UINT64_MAX) {
+			ret = set_error(db, VEX_META_MYSQL_ERR,
+					"MySQL returned invalid Vex generation metadata");
+			goto out;
+		}
+		ALLOC_GROW(state->epochs, state->epochs_nr + 1, state->epochs_alloc);
+		epoch = &state->epochs[state->epochs_nr++];
+		epoch->id = id;
+		epoch->state = (enum vex_epoch_state)epoch_state;
+		epoch->push_id = state_row_uuid(row[2], row[2] ? lengths[2] : 0);
+		if (row[2] && !epoch->push_id) {
+			ret = set_error(db, VEX_META_MYSQL_ERR_NOMEM,
+					"could not allocate Vex generation push id");
+			goto out;
+		}
+		if (id >= state->next_epoch)
+			state->next_epoch = id + 1;
+	}
+	ret = VEX_META_MYSQL_OK;
+out:
+	mysql_free_result(res);
+	return ret;
+}
+
+static int state_load_objects(struct vex_meta_mysql *db, const char *repo,
+			      const struct git_hash_algo *hash_algo,
+			      struct vex_meta_state *state)
+{
+	char *sql = NULL;
+	MYSQL_RES *res = NULL;
+	MYSQL_ROW row;
+	unsigned long *lengths;
+	int ret;
+
+	sql = vex_format("SELECT oid, obj_type, size, generation, state FROM objects "
+			 "WHERE repo_id = %s ORDER BY oid", repo);
+	if (!sql)
+		return set_error(db, VEX_META_MYSQL_ERR_NOMEM,
+				 "could not allocate object state query");
+	ret = state_query_result(db, sql, &res);
+	free(sql);
+	if (ret)
+		return ret;
+	while ((row = mysql_fetch_row(res))) {
+		struct vex_meta_object *object;
+		struct object_id parsed_oid;
+		uint64_t object_type;
+		uint64_t size;
+		uint64_t generation;
+		enum vex_meta_mysql_object_state object_state;
+
+		lengths = mysql_fetch_lengths(res);
+		if (!row[0] || !row[1] || !row[2] || !row[3] || !row[4] || !lengths ||
+		    state_oid_from_binary(row[0], lengths[0], hash_algo,
+					  &parsed_oid) ||
+		    parse_u64(row[1], &object_type) || object_type < OBJ_COMMIT ||
+		    object_type > OBJ_TAG || parse_u64(row[2], &size) ||
+		    size > ULONG_MAX || parse_u64(row[3], &generation) || !generation ||
+		    parse_object_state(row[4], &object_state)) {
+			ret = set_error(db, VEX_META_MYSQL_ERR,
+					"MySQL returned invalid Vex object metadata");
+			goto out;
+		}
+		ALLOC_GROW(state->objects, state->objects_nr + 1, state->objects_alloc);
+		object = &state->objects[state->objects_nr++];
+		oidcpy(&object->oid, &parsed_oid);
+		object->type = (enum object_type)object_type;
+		object->size = (unsigned long)size;
+		object->epoch = generation;
+		object->state = (enum vex_object_state)object_state;
+	}
+	ret = VEX_META_MYSQL_OK;
+out:
+	mysql_free_result(res);
+	return ret;
+}
+
+static int state_load_generation_objects(struct vex_meta_mysql *db,
+					 const char *repo,
+					 const struct git_hash_algo *hash_algo,
+					 struct vex_meta_state *state)
+{
+	char *sql = NULL;
+	MYSQL_RES *res = NULL;
+	MYSQL_ROW row;
+	unsigned long *lengths;
+	int ret;
+
+	sql = vex_format("SELECT generation, oid FROM generation_objects "
+			 "WHERE repo_id = %s ORDER BY generation, oid", repo);
+	if (!sql)
+		return set_error(db, VEX_META_MYSQL_ERR_NOMEM,
+				 "could not allocate generation-object state query");
+	ret = state_query_result(db, sql, &res);
+	free(sql);
+	if (ret)
+		return ret;
+	while ((row = mysql_fetch_row(res))) {
+		struct vex_meta_epoch_object *entry;
+		uint64_t generation;
+
+		lengths = mysql_fetch_lengths(res);
+		if (!row[0] || !row[1] || !lengths ||
+		    parse_u64(row[0], &generation) || !generation) {
+			ret = set_error(db, VEX_META_MYSQL_ERR,
+					"MySQL returned invalid Vex generation-object metadata");
+			goto out;
+		}
+		ALLOC_GROW(state->epoch_objects, state->epoch_objects_nr + 1,
+			   state->epoch_objects_alloc);
+		entry = &state->epoch_objects[state->epoch_objects_nr++];
+		entry->epoch = generation;
+		if (state_oid_from_binary(row[1], lengths[1], hash_algo, &entry->oid)) {
+			ret = set_error(db, VEX_META_MYSQL_ERR,
+					"MySQL returned an invalid Vex generation object id");
+			goto out;
+		}
+	}
+	ret = VEX_META_MYSQL_OK;
+out:
+	mysql_free_result(res);
+	return ret;
+}
+
+static int state_target_from_row(const char *oid, unsigned long oid_length,
+				 const char *symref, unsigned long symref_length,
+				 int symbolic, const struct git_hash_algo *hash_algo,
+				 int allow_none, struct vex_ref_target *target)
+{
+	memset(target, 0, sizeof(*target));
+	if (oid && symref)
+		return -1;
+	if (symbolic) {
+		if (oid || !symref || !symref_length)
+			return -1;
+		target->type = VEX_REF_TARGET_SYMREF;
+		target->symref = state_row_text(symref, symref_length);
+		return target->symref ? 0 : -1;
+	}
+	if (symref)
+		return -1;
+	if (!oid) {
+		if (!allow_none)
+			return -1;
+		target->type = VEX_REF_TARGET_NONE;
+		return 0;
+	}
+	target->type = VEX_REF_TARGET_OID;
+	return state_oid_from_binary(oid, oid_length, hash_algo, &target->oid);
+}
+
+static int state_load_refs(struct vex_meta_mysql *db, const char *repo,
+			   const struct git_hash_algo *hash_algo,
+			   struct vex_meta_state *state)
+{
+	char *sql = NULL;
+	MYSQL_RES *res = NULL;
+	MYSQL_ROW row;
+	unsigned long *lengths;
+	int ret;
+
+	sql = vex_format("SELECT refname, is_symbolic, target_oid, symref_target, "
+			 "version FROM refs WHERE repo_id = %s ORDER BY refname", repo);
+	if (!sql)
+		return set_error(db, VEX_META_MYSQL_ERR_NOMEM,
+				 "could not allocate ref state query");
+	ret = state_query_result(db, sql, &res);
+	free(sql);
+	if (ret)
+		return ret;
+	while ((row = mysql_fetch_row(res))) {
+		struct vex_meta_ref *ref;
+		uint64_t symbolic;
+		uint64_t version;
+
+		lengths = mysql_fetch_lengths(res);
+		if (!row[0] || !row[1] || !row[4] || !lengths || !lengths[0] ||
+		    parse_u64(row[1], &symbolic) || symbolic > 1 ||
+		    parse_u64(row[4], &version) || !version) {
+			ret = set_error(db, VEX_META_MYSQL_ERR,
+					"MySQL returned invalid Vex ref metadata");
+			goto out;
+		}
+		ALLOC_GROW(state->refs, state->refs_nr + 1, state->refs_alloc);
+		ref = &state->refs[state->refs_nr++];
+		memset(ref, 0, sizeof(*ref));
+		ref->name = state_row_text(row[0], lengths[0]);
+		if (!ref->name || state_target_from_row(row[2], row[2] ? lengths[2] : 0,
+							 row[3], row[3] ? lengths[3] : 0,
+							 (int)symbolic, hash_algo, 0,
+							 &ref->target)) {
+			ret = set_error(db, VEX_META_MYSQL_ERR,
+					"MySQL returned an invalid Vex ref target");
+			goto out;
+		}
+		ref->version = version;
+	}
+	ret = VEX_META_MYSQL_OK;
+out:
+	mysql_free_result(res);
+	return ret;
+}
+
+static int state_update_target_from_row(const char *oid,
+					unsigned long oid_length,
+					const char *symref,
+					unsigned long symref_length,
+					const struct git_hash_algo *hash_algo,
+					struct vex_ref_target *target)
+{
+	return state_target_from_row(oid, oid_length, symref, symref_length,
+				     symref != NULL, hash_algo, 1, target);
+}
+
+static int state_load_ref_updates(struct vex_meta_mysql *db, const char *repo,
+				  const struct git_hash_algo *hash_algo,
+				  struct vex_meta_state *state)
+{
+	char *sql = NULL;
+	MYSQL_RES *res = NULL;
+	MYSQL_ROW row;
+	unsigned long *lengths;
+	int ret;
+
+	sql = vex_format("SELECT id, refname, old_oid, new_oid, old_target, "
+			 "new_target, is_ff, actor, push_id, reason, message FROM ref_updates "
+			 "WHERE repo_id = %s ORDER BY id", repo);
+	if (!sql)
+		return set_error(db, VEX_META_MYSQL_ERR_NOMEM,
+				 "could not allocate ref audit state query");
+	ret = state_query_result(db, sql, &res);
+	free(sql);
+	if (ret)
+		return ret;
+	while ((row = mysql_fetch_row(res))) {
+		struct vex_meta_ref_update *entry;
+		struct vex_ref_update *update;
+		uint64_t id;
+		uint64_t is_ff;
+
+		lengths = mysql_fetch_lengths(res);
+		if (!row[0] || !row[1] || !row[9] || !lengths || !lengths[1] ||
+		    parse_u64(row[0], &id) || !id ||
+		    (row[6] && (parse_u64(row[6], &is_ff) || is_ff > 1)) ||
+		    (row[8] && lengths[8] != 16)) {
+			ret = set_error(db, VEX_META_MYSQL_ERR,
+					"MySQL returned invalid Vex ref audit metadata");
+			goto out;
+		}
+		ALLOC_GROW(state->ref_updates, state->ref_updates_nr + 1,
+			   state->ref_updates_alloc);
+		entry = &state->ref_updates[state->ref_updates_nr++];
+		memset(entry, 0, sizeof(*entry));
+		entry->id = id;
+		update = &entry->update;
+		update->is_fast_forward = row[6] ? (int)is_ff : -1;
+		update->refname = state_row_text(row[1], lengths[1]);
+		update->actor = row[7] ? state_row_text(row[7], lengths[7]) : NULL;
+		update->push_id = row[8] ? state_row_uuid(row[8], lengths[8]) : NULL;
+		update->reason = state_row_text(row[9], lengths[9]);
+		update->message = row[10] ? state_row_text(row[10], lengths[10]) : NULL;
+		if (!update->refname || !update->reason ||
+		    (row[7] && !update->actor) || (row[8] && !update->push_id) ||
+		    (row[10] && !update->message) ||
+		    state_update_target_from_row(row[2], row[2] ? lengths[2] : 0,
+						 row[4], row[4] ? lengths[4] : 0,
+						 hash_algo, &update->old_target) ||
+		    state_update_target_from_row(row[3], row[3] ? lengths[3] : 0,
+						 row[5], row[5] ? lengths[5] : 0,
+						 hash_algo, &update->new_target)) {
+			ret = set_error(db, VEX_META_MYSQL_ERR,
+					"MySQL returned an invalid Vex ref audit target");
+			goto out;
+		}
+	}
+	ret = VEX_META_MYSQL_OK;
+out:
+	mysql_free_result(res);
+	return ret;
+}
+
+static int state_load_commit_parents(struct vex_meta_mysql *db, const char *repo,
+				     const struct git_hash_algo *hash_algo,
+				     struct vex_meta_state *state)
+{
+	char *sql = NULL;
+	MYSQL_RES *res = NULL;
+	MYSQL_ROW row;
+	unsigned long *lengths;
+	int ret;
+
+	sql = vex_format("SELECT commit_oid, parent_pos, parent_oid FROM commit_parents "
+			 "WHERE repo_id = %s ORDER BY commit_oid, parent_pos", repo);
+	if (!sql)
+		return set_error(db, VEX_META_MYSQL_ERR_NOMEM,
+				 "could not allocate commit-parent state query");
+	ret = state_query_result(db, sql, &res);
+	free(sql);
+	if (ret)
+		return ret;
+	while ((row = mysql_fetch_row(res))) {
+		struct vex_meta_commit_parent *entry;
+		uint64_t position;
+
+		lengths = mysql_fetch_lengths(res);
+		if (!row[0] || !row[1] || !row[2] || !lengths ||
+		    parse_u64(row[1], &position) || position > UINT_MAX) {
+			ret = set_error(db, VEX_META_MYSQL_ERR,
+					"MySQL returned invalid Vex commit-parent metadata");
+			goto out;
+		}
+		ALLOC_GROW(state->commit_parents, state->commit_parents_nr + 1,
+			   state->commit_parents_alloc);
+		entry = &state->commit_parents[state->commit_parents_nr++];
+		if (state_oid_from_binary(row[0], lengths[0], hash_algo,
+					  &entry->commit_oid) ||
+		    state_oid_from_binary(row[2], lengths[2], hash_algo,
+					  &entry->parent_oid)) {
+			ret = set_error(db, VEX_META_MYSQL_ERR,
+					"MySQL returned invalid Vex commit-parent object ids");
+			goto out;
+		}
+		entry->position = (unsigned int)position;
+	}
+	ret = VEX_META_MYSQL_OK;
+out:
+	mysql_free_result(res);
+	return ret;
+}
+
+static int state_load_next_update(struct vex_meta_mysql *db, const char *repo,
+				  struct vex_meta_state *state)
+{
+	char *sql;
+	uint64_t max_id;
+	int found;
+	int ret;
+
+	sql = vex_format("SELECT COALESCE(MAX(id), 0) FROM ref_updates "
+			 "WHERE repo_id = %s", repo);
+	if (!sql)
+		return set_error(db, VEX_META_MYSQL_ERR_NOMEM,
+				 "could not allocate Vex ref audit sequence query");
+	ret = query_one_u64(db, sql, &max_id, &found);
+	free(sql);
+	if (ret)
+		return ret;
+	if (!found || max_id == UINT64_MAX)
+		return set_error(db, VEX_META_MYSQL_ERR_STATE,
+				 "Vex ref audit identifier counter exhausted");
+	state->next_update = max_id + 1;
+	return VEX_META_MYSQL_OK;
+}
+
+int vex_meta_mysql_state_load(struct vex_meta_mysql *db, const char *repo_id,
+			       const struct git_hash_algo *hash_algo,
+			       struct vex_meta_state *state)
+{
+	char *repo = NULL;
+	int own_transaction = 0;
+	int ret;
+
+	if (!db || !db->mysql || !repo_id || !hash_algo || !state)
+		return VEX_META_MYSQL_ERR_INVALID;
+	repo = sql_repo_literal(repo_id, NULL);
+	if (!repo)
+		return set_error(db, VEX_META_MYSQL_ERR_INVALID,
+				 "invalid Vex repository UUID");
+	vex_meta_state_init(state);
+	if (!db->state_transaction) {
+		ret = mysql_begin(db);
+		if (ret)
+			goto out;
+		own_transaction = 1;
+	}
+	if ((ret = state_verify_repository(db, repo, hash_algo)) ||
+	    (ret = state_load_epochs(db, repo, state)) ||
+	    (ret = state_load_objects(db, repo, hash_algo, state)) ||
+	    (ret = state_load_generation_objects(db, repo, hash_algo, state)) ||
+	    (ret = state_load_refs(db, repo, hash_algo, state)) ||
+	    (ret = state_load_ref_updates(db, repo, hash_algo, state)) ||
+	    (ret = state_load_commit_parents(db, repo, hash_algo, state)) ||
+	    (ret = state_load_next_update(db, repo, state)))
+		goto out;
+	if (own_transaction) {
+		ret = vex_mysql_commit(db);
+		if (ret)
+			goto out;
+		own_transaction = 0;
+	}
+	ret = VEX_META_MYSQL_OK;
+out:
+	if (own_transaction)
+		vex_mysql_rollback(db);
+	if (ret)
+		vex_meta_state_release(state);
+	free(repo);
+	return ret;
+}
+static int state_require_no_derived_rows(struct vex_meta_mysql *db,
+					 const char *repo)
+{
+	char *sql;
+	uint64_t rows;
+	int found;
+	int ret;
+
+	sql = vex_format("SELECT (SELECT COUNT(*) FROM object_pins WHERE repo_id = %s) "
+			 "+ (SELECT COUNT(*) FROM pack_envelopes WHERE repo_id = %s)",
+			 repo, repo);
+	if (!sql)
+		return set_error(db, VEX_META_MYSQL_ERR_NOMEM,
+				 "could not allocate Vex derived metadata check");
+	ret = query_one_u64(db, sql, &rows, &found);
+	free(sql);
+	if (ret)
+		return ret;
+	if (!found || rows)
+		return set_error(db, VEX_META_MYSQL_ERR_STATE,
+				 "Vex state replacement requires a repository without pins or packs");
+	return VEX_META_MYSQL_OK;
+}
+
+static int state_delete_rows(struct vex_meta_mysql *db, const char *repo)
+{
+	static const char *const tables[] = {
+		"commit_parents", "generation_objects", "objects", "generations",
+		"refs", "ref_updates",
+	};
+	size_t i;
+
+	for (i = 0; i < ARRAY_SIZE(tables); i++) {
+		char *sql = vex_format("DELETE FROM %s WHERE repo_id = %s", tables[i],
+					       repo);
+		int ret;
+
+		if (!sql)
+			return set_error(db, VEX_META_MYSQL_ERR_NOMEM,
+					 "could not allocate Vex metadata delete query");
+		ret = mysql_exec(db, sql);
+		free(sql);
+		if (ret)
+			return ret;
+	}
+	return VEX_META_MYSQL_OK;
+}
+
+static const char *state_epoch_name(enum vex_epoch_state state)
+{
+	switch (state) {
+	case VEX_EPOCH_OPEN: return "open";
+	case VEX_EPOCH_SEALED: return "sealed";
+	case VEX_EPOCH_SWEEPABLE: return "sweepable";
+	case VEX_EPOCH_SWEPT: return "swept";
+	case VEX_EPOCH_ABORTED: return "aborted";
+	}
+	return NULL;
+}
+
+static const char *state_object_name(enum vex_object_state state)
+{
+	switch (state) {
+	case VEX_OBJECT_QUARANTINE: return "quarantine";
+	case VEX_OBJECT_PUBLISHED: return "published";
+	}
+	return NULL;
+}
+
+static char *state_blob_key(const char *repo_id, const struct object_id *oid,
+			    const struct git_hash_algo *hash_algo)
+{
+	char hex[GIT_MAX_HEXSZ + 1];
+
+	bytes_to_hex(oid->hash, hash_algo->rawsz, hex);
+	return vex_format("git/v1/%s/objects/%s", repo_id, hex);
+}
+
+static int state_insert_epochs(struct vex_meta_mysql *db, const char *repo,
+			       const struct vex_meta_state *state)
+{
+	size_t i;
+
+	for (i = 0; i < state->epochs_nr; i++) {
+		const struct vex_meta_epoch *epoch = &state->epochs[i];
+		const char *name = state_epoch_name(epoch->state);
+		char *push = state_uuid_literal_or_null(epoch->push_id);
+		char *sql;
+		int ret;
+
+		if (!epoch->id || !name || !push) {
+			free(push);
+			return set_error(db, VEX_META_MYSQL_ERR_INVALID,
+					 "invalid Vex epoch state");
+		}
+		sql = vex_format("INSERT INTO generations "
+				 "(repo_id, generation, state, push_id, sealed_at) VALUES "
+				 "(%s, %" PRIu64 ", '%s', %s, %s)",
+				 repo, epoch->id, name, push,
+				 epoch->state == VEX_EPOCH_OPEN ? "NULL" : "CURRENT_TIMESTAMP(6)");
+		free(push);
+		if (!sql)
+			return set_error(db, VEX_META_MYSQL_ERR_NOMEM,
+					 "could not allocate Vex epoch insert query");
+		ret = mysql_exec(db, sql);
+		free(sql);
+		if (ret)
+			return ret;
+	}
+	return VEX_META_MYSQL_OK;
+}
+
+static int state_insert_objects(struct vex_meta_mysql *db, const char *repo,
+				const char *repo_id,
+				const struct git_hash_algo *hash_algo,
+				const struct vex_meta_state *state)
+{
+	size_t i;
+
+	for (i = 0; i < state->objects_nr; i++) {
+		const struct vex_meta_object *object = &state->objects[i];
+		const char *name = state_object_name(object->state);
+		char *oid = state_oid_literal(&object->oid, hash_algo);
+		char *key = state_blob_key(repo_id, &object->oid, hash_algo);
+		char *quoted_key = key ? sql_quote(db, key) : NULL;
+		char *sql;
+		int ret;
+
+		free(key);
+		if (!object->epoch || !name || !oid || !quoted_key ||
+		    object->type < OBJ_COMMIT || object->type > OBJ_TAG) {
+			free(quoted_key);
+			free(oid);
+			return set_error(db, VEX_META_MYSQL_ERR_INVALID,
+					 "invalid Vex object state");
+		}
+		sql = vex_format("INSERT INTO objects "
+				 "(repo_id, oid, obj_type, size, blob_key, generation, state, published_at) "
+				 "VALUES (%s, %s, %u, %lu, %s, %" PRIu64 ", '%s', %s)",
+				 repo, oid, object->type, object->size, quoted_key,
+				 object->epoch, name,
+				 object->state == VEX_OBJECT_PUBLISHED ? "CURRENT_TIMESTAMP(6)" : "NULL");
+		free(quoted_key);
+		free(oid);
+		if (!sql)
+			return set_error(db, VEX_META_MYSQL_ERR_NOMEM,
+					 "could not allocate Vex object insert query");
+		ret = mysql_exec(db, sql);
+		free(sql);
+		if (ret)
+			return ret;
+	}
+	return VEX_META_MYSQL_OK;
+}
+
+static int state_insert_generation_objects(struct vex_meta_mysql *db,
+					  const char *repo,
+					  const struct git_hash_algo *hash_algo,
+					  const struct vex_meta_state *state)
+{
+	size_t i;
+
+	for (i = 0; i < state->epoch_objects_nr; i++) {
+		const struct vex_meta_epoch_object *entry = &state->epoch_objects[i];
+		char *oid = state_oid_literal(&entry->oid, hash_algo);
+		char *sql;
+		int ret;
+
+		if (!entry->epoch || !oid) {
+			free(oid);
+			return set_error(db, VEX_META_MYSQL_ERR_INVALID,
+					 "invalid Vex generation object state");
+		}
+		sql = vex_format("INSERT INTO generation_objects (repo_id, generation, oid) "
+				 "VALUES (%s, %" PRIu64 ", %s)", repo, entry->epoch, oid);
+		free(oid);
+		if (!sql)
+			return set_error(db, VEX_META_MYSQL_ERR_NOMEM,
+					 "could not allocate Vex generation object insert query");
+		ret = mysql_exec(db, sql);
+		free(sql);
+		if (ret)
+			return ret;
+	}
+	return VEX_META_MYSQL_OK;
+}
+
+static int state_insert_commit_parents(struct vex_meta_mysql *db,
+					const char *repo,
+					const struct git_hash_algo *hash_algo,
+					const struct vex_meta_state *state)
+{
+	size_t i;
+
+	for (i = 0; i < state->commit_parents_nr; i++) {
+		const struct vex_meta_commit_parent *entry = &state->commit_parents[i];
+		char *commit = state_oid_literal(&entry->commit_oid, hash_algo);
+		char *parent = state_oid_literal(&entry->parent_oid, hash_algo);
+		char *sql;
+		int ret;
+
+		if (!commit || !parent) {
+			free(parent);
+			free(commit);
+			return set_error(db, VEX_META_MYSQL_ERR_INVALID,
+					 "invalid Vex commit-parent state");
+		}
+		sql = vex_format("INSERT INTO commit_parents "
+				 "(repo_id, commit_oid, parent_pos, parent_oid) VALUES "
+				 "(%s, %s, %u, %s)", repo, commit, entry->position, parent);
+		free(parent);
+		free(commit);
+		if (!sql)
+			return set_error(db, VEX_META_MYSQL_ERR_NOMEM,
+					 "could not allocate Vex commit-parent insert query");
+		ret = mysql_exec(db, sql);
+		free(sql);
+		if (ret)
+			return ret;
+	}
+	return VEX_META_MYSQL_OK;
+}
+
+static int state_target_literals(struct vex_meta_mysql *db,
+				 const struct vex_ref_target *target,
+				 const struct git_hash_algo *hash_algo,
+				 char **oid_out, char **symref_out)
+{
+	char *oid = NULL;
+	char *symref = NULL;
+
+	if (!target || !oid_out || !symref_out)
+		return VEX_META_MYSQL_ERR_INVALID;
+	switch (target->type) {
+	case VEX_REF_TARGET_ANY:
+	case VEX_REF_TARGET_NONE:
+		oid = vex_strdup("NULL");
+		symref = vex_strdup("NULL");
+		break;
+	case VEX_REF_TARGET_OID:
+		oid = state_oid_literal(&target->oid, hash_algo);
+		symref = vex_strdup("NULL");
+		break;
+	case VEX_REF_TARGET_SYMREF:
+		if (!target->symref || !*target->symref || strlen(target->symref) > 1024)
+			return VEX_META_MYSQL_ERR_INVALID;
+		oid = vex_strdup("NULL");
+		symref = sql_quote(db, target->symref);
+		break;
+	default:
+		return VEX_META_MYSQL_ERR_INVALID;
+	}
+	if (!oid || !symref) {
+		free(symref);
+		free(oid);
+		return VEX_META_MYSQL_ERR_NOMEM;
+	}
+	*oid_out = oid;
+	*symref_out = symref;
+	return VEX_META_MYSQL_OK;
+}
+
+static int state_insert_refs(struct vex_meta_mysql *db, const char *repo,
+			     const struct git_hash_algo *hash_algo,
+			     const struct vex_meta_state *state)
+{
+	size_t i;
+
+	for (i = 0; i < state->refs_nr; i++) {
+		const struct vex_meta_ref *ref = &state->refs[i];
+		char *refname;
+		char *oid = NULL;
+		char *symref = NULL;
+		char *sql;
+		int ret;
+
+		if (!ref->name || !*ref->name || strlen(ref->name) > 1024 ||
+		    !ref->version || (ref->target.type != VEX_REF_TARGET_OID &&
+				      ref->target.type != VEX_REF_TARGET_SYMREF))
+			return set_error(db, VEX_META_MYSQL_ERR_INVALID,
+					 "invalid Vex ref state");
+		refname = sql_quote(db, ref->name);
+		ret = state_target_literals(db, &ref->target, hash_algo, &oid, &symref);
+		if (!refname || ret) {
+			free(symref);
+			free(oid);
+			free(refname);
+			return set_error(db, ret ? ret : VEX_META_MYSQL_ERR_NOMEM,
+					 "could not encode Vex ref state");
+		}
+		sql = vex_format("INSERT INTO refs "
+				 "(repo_id, refname, is_symbolic, target_oid, symref_target, "
+				 "peeled_oid, version) VALUES (%s, %s, %s, %s, %s, NULL, %" PRIu64 ")",
+				 repo, refname,
+				 ref->target.type == VEX_REF_TARGET_SYMREF ? "TRUE" : "FALSE",
+				 oid, symref, ref->version);
+		free(symref);
+		free(oid);
+		free(refname);
+		if (!sql)
+			return set_error(db, VEX_META_MYSQL_ERR_NOMEM,
+					 "could not allocate Vex ref insert query");
+		ret = mysql_exec(db, sql);
+		free(sql);
+		if (ret)
+			return ret;
+	}
+	return VEX_META_MYSQL_OK;
+}
+
+static int state_insert_ref_updates(struct vex_meta_mysql *db, const char *repo,
+				    const struct git_hash_algo *hash_algo,
+				    const struct vex_meta_state *state)
+{
+	size_t i;
+
+	for (i = 0; i < state->ref_updates_nr; i++) {
+		const struct vex_meta_ref_update *entry = &state->ref_updates[i];
+		const struct vex_ref_update *update = &entry->update;
+		char *refname = NULL;
+		char *old_oid = NULL;
+		char *old_target = NULL;
+		char *new_oid = NULL;
+		char *new_target = NULL;
+		char *actor = NULL;
+		char *push_id = NULL;
+		char *reason = NULL;
+		char *message = NULL;
+		char *sql = NULL;
+		const char *is_ff;
+		int ret = VEX_META_MYSQL_OK;
+
+		if (!entry->id || !update->refname || !*update->refname ||
+		    strlen(update->refname) > 1024 || !update->reason ||
+		    !*update->reason || strlen(update->reason) > 32 ||
+		    (update->actor && strlen(update->actor) > 255) ||
+		    (update->message && strlen(update->message) > 1024) ||
+		    (update->is_fast_forward != -1 && update->is_fast_forward != 0 &&
+		     update->is_fast_forward != 1))
+			return set_error(db, VEX_META_MYSQL_ERR_INVALID,
+					 "invalid Vex ref audit state");
+		refname = sql_quote(db, update->refname);
+		actor = sql_quote(db, update->actor);
+		push_id = state_uuid_literal_or_null(update->push_id);
+		reason = sql_quote(db, update->reason);
+		message = sql_quote(db, update->message);
+		if (!refname || !actor || !push_id || !reason || !message ||
+		    (ret = state_target_literals(db, &update->old_target, hash_algo,
+						 &old_oid, &old_target)) ||
+		    (ret = state_target_literals(db, &update->new_target, hash_algo,
+						 &new_oid, &new_target))) {
+			if (!ret)
+				ret = VEX_META_MYSQL_ERR_NOMEM;
+			ret = set_error(db, ret, "could not encode Vex ref audit state");
+			goto out;
+		}
+		is_ff = update->is_fast_forward < 0 ? "NULL" :
+			(update->is_fast_forward ? "TRUE" : "FALSE");
+		sql = vex_format("INSERT INTO ref_updates "
+				 "(repo_id, id, refname, old_oid, new_oid, old_target, new_target, "
+				 "is_ff, actor, push_id, reason, message) VALUES "
+				 "(%s, %" PRIu64 ", %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+				 repo, entry->id, refname, old_oid, new_oid, old_target,
+				 new_target, is_ff, actor, push_id, reason, message);
+		if (!sql) {
+			ret = set_error(db, VEX_META_MYSQL_ERR_NOMEM,
+					"could not allocate Vex ref audit insert query");
+			goto out;
+		}
+		ret = mysql_exec(db, sql);
+out:
+		free(sql);
+		free(message);
+		free(reason);
+		free(push_id);
+		free(actor);
+		free(new_target);
+		free(new_oid);
+		free(old_target);
+		free(old_oid);
+		free(refname);
+		if (ret)
+			return ret;
+	}
+	return VEX_META_MYSQL_OK;
+}
+
+int vex_meta_mysql_state_save_locked(struct vex_meta_mysql *db,
+				      const char *repo_id,
+				      const struct git_hash_algo *hash_algo,
+				      const struct vex_meta_state *state)
+{
+	char *repo;
+	int ret;
+
+	if (!db || !db->mysql || !db->state_transaction || !repo_id || !hash_algo ||
+	    !state)
+		return VEX_META_MYSQL_ERR_STATE;
+	repo = sql_repo_literal(repo_id, NULL);
+	if (!repo)
+		return set_error(db, VEX_META_MYSQL_ERR_INVALID,
+				 "invalid Vex repository UUID");
+	if ((ret = state_require_no_derived_rows(db, repo)) ||
+	    (ret = state_delete_rows(db, repo)) ||
+	    (ret = state_insert_epochs(db, repo, state)) ||
+	    (ret = state_insert_objects(db, repo, repo_id, hash_algo, state)) ||
+	    (ret = state_insert_generation_objects(db, repo, hash_algo, state)) ||
+	    (ret = state_insert_commit_parents(db, repo, hash_algo, state)) ||
+	    (ret = state_insert_refs(db, repo, hash_algo, state)) ||
+	    (ret = state_insert_ref_updates(db, repo, hash_algo, state)))
+		goto out;
+	ret = vex_mysql_commit(db);
+	if (!ret)
+		db->state_transaction = 0;
+out:
+	free(repo);
+	return ret;
+}
+#else /* VEX_META_MYSQL_STORE */
+
+int vex_meta_mysql_state_lock(struct vex_meta_mysql *db, const char *repo_id)
+{
+	(void)repo_id;
+	return set_error(db, VEX_META_MYSQL_ERR_STATE,
+			 "Vex MySQL store adapter was not compiled into this binary");
+}
+
+void vex_meta_mysql_state_unlock(struct vex_meta_mysql *db)
+{
+	(void)db;
+}
+
+int vex_meta_mysql_state_load(struct vex_meta_mysql *db, const char *repo_id,
+			       const struct git_hash_algo *hash_algo,
+			       struct vex_meta_state *state)
+{
+	(void)repo_id;
+	(void)hash_algo;
+	(void)state;
+	return set_error(db, VEX_META_MYSQL_ERR_STATE,
+			 "Vex MySQL store adapter was not compiled into this binary");
+}
+
+int vex_meta_mysql_state_save_locked(struct vex_meta_mysql *db,
+				      const char *repo_id,
+				      const struct git_hash_algo *hash_algo,
+				      const struct vex_meta_state *state)
+{
+	(void)repo_id;
+	(void)hash_algo;
+	(void)state;
+	return set_error(db, VEX_META_MYSQL_ERR_STATE,
+			 "Vex MySQL store adapter was not compiled into this binary");
+}
+
+#endif /* VEX_META_MYSQL_STORE */
 #endif /* VEX_HAVE_MYSQL_CLIENT */

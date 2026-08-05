@@ -24,9 +24,20 @@ class PlanError(RuntimeError):
     """A malformed plan request or source repository."""
 
 
+def git_binary() -> str:
+    """Return the one Git executable used by planning and replay.
+
+    Most users retain the regular PATH lookup. Compose smoke tests set this to
+    ``/usr/bin/git`` so the client side cannot accidentally use the Vex build
+    that is serving the endpoint.
+    """
+
+    return os.environ.get("GIT_VEX_PUSH_STRESS_GIT") or "git"
+
+
 def git(source: str, *args: str) -> str:
     process = subprocess.run(
-        ["git", "-C", source, *args],
+        [git_binary(), "-C", source, *args],
         check=False,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -46,7 +57,7 @@ def git(source: str, *args: str) -> str:
 
 def default_source_ref(source: str) -> str:
     process = subprocess.run(
-        ["git", "-C", source, "symbolic-ref", "-q", "HEAD"],
+        [git_binary(), "-C", source, "symbolic-ref", "-q", "HEAD"],
         check=False,
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,

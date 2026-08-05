@@ -2,6 +2,7 @@
 #include "config.h"
 #include "hex.h"
 #include "vex/blob-s3.h"
+#include "vex/meta-mysql.h"
 #include "vex/store.h"
 #include "gettext.h"
 #include "object-file.h"
@@ -77,6 +78,23 @@ static int vex_env_true(const char *name)
 			 !strcmp(value, "yes"));
 }
 
+static int vex_env_port(const char *name, unsigned int *port)
+{
+	const char *value = getenv(name);
+	char *end;
+	unsigned long parsed;
+
+	*port = 0;
+	if (!value || !*value)
+		return 0;
+	errno = 0;
+	parsed = strtoul(value, &end, 10);
+	if (errno || !*value || *end || !parsed || parsed > UINT_MAX)
+		return -1;
+	*port = (unsigned int)parsed;
+	return 0;
+}
+
 int vex_store_open_for_repository(struct repository *repo, const char *gitdir,
 					    struct vex_store **out)
 {
@@ -88,6 +106,8 @@ int vex_store_open_for_repository(struct repository *repo, const char *gitdir,
 	};
 	const char *configured_root = NULL;
 	const char *blob_backend = getenv("GIT_VEX_BLOB_BACKEND");
+	const char *meta_backend = getenv("GIT_VEX_META_BACKEND");
+	const char *backend = getenv("GIT_VEX_BACKEND");
 	const char *s3_region = getenv("GIT_VEX_S3_REGION");
 	struct vex_blob_s3_options blob_s3 = {
 		.endpoint = getenv("GIT_VEX_S3_ENDPOINT"),
@@ -98,6 +118,14 @@ int vex_store_open_for_repository(struct repository *repo, const char *gitdir,
 		.ca_file = getenv("GIT_VEX_S3_CA_FILE"),
 		.insecure_tls = vex_env_true("GIT_VEX_S3_INSECURE_TLS"),
 	};
+	struct vex_meta_mysql_options meta_mysql = {
+		.host = getenv("GIT_VEX_MYSQL_HOST"),
+		.port = 0,
+		.user = getenv("GIT_VEX_MYSQL_USER"),
+		.password = getenv("GIT_VEX_MYSQL_PASSWORD"),
+		.database = getenv("GIT_VEX_MYSQL_DATABASE"),
+		.unix_socket = getenv("GIT_VEX_MYSQL_SOCKET"),
+	};
 	char *root = NULL;
 	char *repo_id = vex_canonical_repo_id(repo->ref_storage_payload);
 	int ret;
@@ -105,11 +133,40 @@ int vex_store_open_for_repository(struct repository *repo, const char *gitdir,
 	*out = NULL;
 	if (!repo_id)
 		return VEX_STORE_ERR_INVALID;
+	if (!meta_backend || !*meta_backend) {
+		/* Keep the topology alias usable in process environments. */
+		if (backend && !strcmp(backend, "mysql+s3"))
+			meta_backend = "mysql";
+		else
+			meta_backend = "fs";
+	}
+	if (!strcmp(meta_backend, "mysql")) {
+		if (vex_env_port("GIT_VEX_MYSQL_PORT", &meta_mysql.port)) {
+			free(repo_id);
+			return VEX_STORE_ERR_INVALID;
+		}
+		/* MySQL stores metadata only; a Vex MySQL store always has S3 bytes. */
+		if (blob_backend && *blob_backend && strcmp(blob_backend, "s3")) {
+			free(repo_id);
+			return VEX_STORE_ERR_INVALID;
+		}
+		opts.backend = VEX_STORE_BACKEND_MYSQL_S3;
+		opts.blob_s3 = &blob_s3;
+		opts.meta_mysql = &meta_mysql;
+	} else if (strcmp(meta_backend, "fs")) {
+		free(repo_id);
+		return VEX_STORE_ERR_INVALID;
+	}
 	if (blob_backend && *blob_backend) {
 		if (!strcmp(blob_backend, "fs")) {
+			if (opts.backend != VEX_STORE_BACKEND_FS) {
+				free(repo_id);
+				return VEX_STORE_ERR_INVALID;
+			}
 			/* The default, retained for explicitly-configured test fixtures. */
 		} else if (!strcmp(blob_backend, "s3")) {
-			opts.backend = VEX_STORE_BACKEND_FS_S3;
+			if (opts.backend == VEX_STORE_BACKEND_FS)
+				opts.backend = VEX_STORE_BACKEND_FS_S3;
 			opts.blob_s3 = &blob_s3;
 		} else {
 			free(repo_id);
@@ -131,6 +188,9 @@ int vex_store_open_for_repository(struct repository *repo, const char *gitdir,
 	if (!ret)
 		ret = vex_repo_ensure(*out);
 	if (ret && *out) {
+		if (opts.backend == VEX_STORE_BACKEND_MYSQL_S3)
+			error(_("unable to initialize Vex MySQL metadata: %s"),
+			      vex_store_error(*out));
 		vex_store_close(*out);
 		*out = NULL;
 	}

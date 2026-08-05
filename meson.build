@@ -435,6 +435,7 @@ libgit_sources = [
   'odb/source-vex.c',
   'vex/store.c',
   'vex/meta-fs.c',
+  'vex/meta-mysql.c',
   'vex/blob-fs.c',
   'vex/blob-s3.c',
   'odb/source-files.c',

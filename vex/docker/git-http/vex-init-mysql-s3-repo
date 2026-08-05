@@ -1,0 +1,104 @@
+#!/bin/sh
+
+# Initialize a thin Vex repository whose refs/object metadata are in MySQL
+# and whose canonical object bytes are in the configured S3-compatible
+# bucket.  The Git directory is only protocol/discovery scaffolding; it is
+# never a classic-bare object/ref source of truth.
+set -eu
+
+repo_name=${1:-${VEX_REPO_NAME:-}}
+if [ -z "$repo_name" ]; then
+	printf '%s\n' 'vex-init-mysql-s3-repo: repository name is required' >&2
+	exit 64
+fi
+
+case "$repo_name" in
+'' | /* | *'..'* | *'//'*)
+	printf 'vex-init-mysql-s3-repo: unsafe repository name: %s\n' "$repo_name" >&2
+	exit 64
+	;;
+esac
+case "$repo_name" in
+*.git) ;;
+*)
+	printf 'vex-init-mysql-s3-repo: repository must end in .git: %s\n' "$repo_name" >&2
+	exit 64
+	;;
+esac
+
+old_ifs=$IFS
+IFS=/
+set -f
+set -- $repo_name
+set +f
+IFS=$old_ifs
+for component in "$@"; do
+	case "$component" in
+'' | .*)
+		printf 'vex-init-mysql-s3-repo: unsafe repository component: %s\n' "$component" >&2
+		exit 64
+		;;
+	*[!A-Za-z0-9._-]*)
+		printf 'vex-init-mysql-s3-repo: unsafe repository component: %s\n' "$component" >&2
+		exit 64
+		;;
+	esac
+done
+
+root=${GIT_HTTP_ROOT:-/srv/git}
+git_binary=${VEX_GIT:-/opt/vex-git/git}
+repo_path="$root/$repo_name"
+
+[ -x "$git_binary" ] || {
+	printf 'vex-init-mysql-s3-repo: Vex Git executable not found: %s\n' "$git_binary" >&2
+	exit 69
+}
+[ "${GIT_VEX_META_BACKEND:-}" = mysql ] || {
+	printf '%s\n' 'vex-init-mysql-s3-repo: GIT_VEX_META_BACKEND=mysql is required' >&2
+	exit 69
+}
+[ "${GIT_VEX_BLOB_BACKEND:-}" = s3 ] || {
+	printf '%s\n' 'vex-init-mysql-s3-repo: GIT_VEX_BLOB_BACKEND=s3 is required' >&2
+	exit 69
+}
+
+repo_key=$(printf '%s' "$repo_name" | tr 'abcdefghijklmnopqrstuvwxyz/.-' 'ABCDEFGHIJKLMNOPQRSTUVWXYZ___')
+repo_uuid_var="GIT_VEX_REPO_${repo_key}_UUID"
+repo_id=$(printenv "$repo_uuid_var" 2>/dev/null || true)
+if [ -z "$repo_id" ]; then
+	repo_id=$(printf '%s' "$repo_name" | sha256sum | awk '{print substr($1, 1, 32)}')
+fi
+case "$repo_id" in
+*[!0123456789abcdefABCDEF]* | '')
+	printf 'vex-init-mysql-s3-repo: %s must contain 32 hexadecimal characters\n' "$repo_uuid_var" >&2
+	exit 64
+	;;
+esac
+[ "${#repo_id}" -eq 32 ] || {
+	printf 'vex-init-mysql-s3-repo: %s must contain 32 hexadecimal characters\n' "$repo_uuid_var" >&2
+	exit 64
+}
+repo_id=$(printf '%s' "$repo_id" | tr 'A-F' 'a-f')
+expected_uri="vex://$repo_id"
+
+if [ -e "$repo_path" ]; then
+	[ -f "$repo_path/HEAD" ] || {
+		printf 'vex-init-mysql-s3-repo: existing path is not a bare repository: %s\n' "$repo_name" >&2
+		exit 1
+	}
+	actual_uri=$("$git_binary" --git-dir="$repo_path" config --get extensions.refstorage || true)
+	[ "$actual_uri" = "$expected_uri" ] || {
+		printf 'vex-init-mysql-s3-repo: existing repository does not match requested Vex identity: %s\n' "$repo_name" >&2
+		exit 1
+	}
+	printf 'vex-init-mysql-s3-repo: Vex MySQL+S3 repository already exists: %s\n' "$repo_name"
+	exit 0
+fi
+
+mkdir -p "$(dirname "$repo_path")"
+GIT_REFERENCE_BACKEND="$expected_uri" \
+	"$git_binary" init --bare --initial-branch=main --ref-format=vex "$repo_path" >/dev/null
+"$git_binary" --git-dir="$repo_path" config http.receivepack true
+"$git_binary" --git-dir="$repo_path" config daemon.export ok
+printf 'vex-init-mysql-s3-repo: initialized Vex MySQL+S3 repository %s (%s)\n' \
+	"$repo_name" "$expected_uri"

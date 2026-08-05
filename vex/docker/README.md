@@ -9,22 +9,28 @@ Run:
 scripts/vex/up.sh
 scripts/vex/seed-small.sh
 t/vex/integration-mysql-minio.sh
+t/vex/mysql-s3-stock-http.sh
 t/vex/compat-stock-client.sh
 scripts/vex/down.sh
 ```
 
-The supplied `git-http` image is intentionally a **bootstrap**, not the Vex
-server: it serves classic bare repositories from `vex_git_bootstrap_repos` and
-reports `"vex_storage_active": false` from `/healthz`.  Its successful stock
-Git clone/fetch/push checks demonstrate only TLS/smart-HTTP plumbing.  They do
-not demonstrate that object bytes use MinIO or that refs use MySQL.
+`git-http` builds this checkout's Git source with `VEX_MYSQL=YesPlease`, then
+serves normal smart HTTP through that binary.  Its thin `*.git` directories
+carry `extensions.refStorage=vex://<uuid>` discovery configuration only:
+metadata and refs use MySQL, while canonical object bytes use the configured
+MinIO/S3 bucket.  The gateway initializes `vex-health.git` at startup and its
+`/healthz` probe opens that same Vex store before returning
+`"vex_storage_active": true`.
 
-The bootstrap listener itself stays up, but delegates each request to stock
-`git http-backend`; it is not the required Vex long-lived data-plane daemon and
-must never be used for throughput or clone-SLO claims.
+`t/vex/mysql-s3-stock-http.sh` creates an empty Vex repository and proves an
+unmodified host Git client can push, clone, fetch, and fsck over local HTTPS.
+It is the Compose data-plane E2E gate, not a clone-SLO benchmark: the server
+still invokes `git-http-backend` per request and has no sealed-pack/bitmap
+read path yet.
 
-To activate a built Vex-aware, long-lived server, publish it in a derived image
-and set `VEX_GIT_HTTP_COMMAND` in `vex/docker/.env`.  That server must consume
-the supplied `GIT_VEX_*` variables and expose an honest `/healthz` endpoint.
-If it needs a seed hook, also set `VEX_REPO_INIT_COMMAND`; no silent fallback
-to a classic bare repository is made once a custom command is configured.
+The image keeps the explicitly labelled classic-bare listener as a direct
+image fallback when `VEX_GIT_HTTP_COMMAND` is absent. Compose deliberately
+sets the bundled Vex command by default, so an empty/false health payload is a
+startup failure rather than a misleading protocol-only success. A derived
+image may override `VEX_GIT_HTTP_COMMAND` and `VEX_REPO_INIT_COMMAND`, provided
+it preserves the MySQL+S3 health contract.
