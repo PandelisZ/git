@@ -18,6 +18,7 @@ import os
 import re
 import signal
 import ssl
+import stat
 import subprocess
 import sys
 import tempfile
@@ -67,8 +68,37 @@ HELPER_PATH = os.environ.get("VEX_GIT_HELPER_PATH", "/usr/local/lib/vex-git-http
 INIT_REPOSITORY = os.environ.get("VEX_NATIVE_REPO_INIT", "/usr/local/bin/vex-init-mysql-s3-repo")
 READY_REPOSITORY = os.environ.get("VEX_STORAGE_READY_REPO", "vex-health.git")
 
+# ``/healthz`` exposes a convenience inventory, but it must never turn that
+# observability detail into a second, unbounded Git workload.  In particular,
+# a large repository can contain many object directories and an interrupted
+# receive can make a custom-Git config lookup wait for recovery.  These bounds
+# apply only to the health inventory; normal smart-HTTP routing below retains
+# its authoritative custom-Git validation.
+HEALTH_SCAN_MAX_REPOSITORIES = max(
+    1, int(os.environ.get("VEX_HTTP_HEALTH_SCAN_MAX_REPOSITORIES", "64"))
+)
+HEALTH_SCAN_MAX_DIRECTORIES = max(
+    1, int(os.environ.get("VEX_HTTP_HEALTH_SCAN_MAX_DIRECTORIES", "256"))
+)
+HEALTH_SCAN_MAX_DIRECTORY_ENTRIES = max(
+    1, int(os.environ.get("VEX_HTTP_HEALTH_SCAN_MAX_DIRECTORY_ENTRIES", "1024"))
+)
+HEALTH_SCAN_MAX_DEPTH = max(1, int(os.environ.get("VEX_HTTP_HEALTH_SCAN_MAX_DEPTH", "8")))
+HEALTH_SCAN_MAX_CONFIG_BYTES = max(
+    1, int(os.environ.get("VEX_HTTP_HEALTH_SCAN_MAX_CONFIG_BYTES", str(64 * 1024)))
+)
+
 REPO_COMPONENT_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 VEX_URI_RE = re.compile(r"vex://([0-9a-fA-F]{32})\Z")
+HEALTH_CONFIG_EXTENSIONS_SECTION_RE = re.compile(
+    rb"[ \t]*\[[ \t]*(?i:extensions)[ \t]*\][ \t]*(?:[;#].*)?\Z"
+)
+HEALTH_CONFIG_REFSTORAGE_RE = re.compile(
+    rb"[ \t]*(?i:refstorage)[ \t]*=[ \t]*(vex://[0-9a-fA-F]{32})[ \t]*(?:[;#].*)?\Z"
+)
+HEALTH_CONFIG_INCLUDE_SECTION_RE = re.compile(
+    rb"[ \t]*\[[ \t]*(?i:include)(?:(?i:if))?(?:[ \t]+[^\]]+)?\][ \t]*(?:[;#].*)?\Z"
+)
 GIT_PROTOCOL_HEADER = "Git-Protocol"
 # This is far larger than the normal ``version=2`` request while preventing a
 # client-controlled HTTP field from becoming an unbounded CGI environment
@@ -510,16 +540,171 @@ def cgi_environment_for_repository(
     return environ
 
 
-def known_repositories() -> dict[str, str]:
-    """Return the small local topology's configured Vex repositories."""
-    result: dict[str, str] = {}
-    for candidate in sorted(ROOT.rglob("*.git")):
-        if not candidate.is_dir() or not (candidate / "HEAD").is_file():
+def _regular_file(path: Path) -> bool:
+    """Whether ``path`` is a regular file without following a symlink."""
+    try:
+        return stat.S_ISREG(path.stat(follow_symlinks=False).st_mode)
+    except OSError:
+        return False
+
+
+def _read_bounded_regular_file(path: Path, maximum_bytes: int) -> bytes | None:
+    """Read a small regular file without traversing a symlink.
+
+    The health inventory only needs the local thin-repository ``config``
+    scaffold.  Reading it directly is deliberately less capable than Git's
+    configuration resolver: it does not follow includes, configs outside the
+    repository, or symlinks.  That makes it a safe, bounded observability
+    probe instead of another route-validation path.
+    """
+    flags = os.O_RDONLY
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags)
+    except OSError:
+        return None
+
+    try:
+        file_stat = os.fstat(descriptor)
+        if not stat.S_ISREG(file_stat.st_mode) or file_stat.st_size > maximum_bytes:
+            return None
+
+        content = bytearray()
+        while len(content) <= maximum_bytes:
+            chunk = os.read(descriptor, min(8192, maximum_bytes + 1 - len(content)))
+            if not chunk:
+                break
+            content.extend(chunk)
+        if len(content) > maximum_bytes:
+            return None
+        return bytes(content)
+    except OSError:
+        return None
+    finally:
+        os.close(descriptor)
+
+
+def health_repository_uri(repository: Path) -> str | None:
+    """Read one canonical local Vex URI for the bounded health inventory.
+
+    This compact parser intentionally recognizes only the plain local config
+    spelling emitted by ``git config``.  It rejects includes, duplicate or
+    non-canonical values, and anything which would need Git's full config
+    semantics.  Omission from a health response is harmless; accepting an
+    ambiguous repository would be misleading.  Request routing continues to
+    call :func:`repository_for_path`, which remains the authoritative check.
+    """
+    if not _regular_file(repository / "HEAD"):
+        return None
+    config = _read_bounded_regular_file(repository / "config", HEALTH_SCAN_MAX_CONFIG_BYTES)
+    if config is None:
+        return None
+
+    in_extensions = False
+    values: list[str] = []
+    for raw_line in config.splitlines():
+        line = raw_line.rstrip(b"\r")
+        stripped = line.lstrip()
+        if not stripped or stripped.startswith((b"#", b";")):
             continue
-        relative = candidate.relative_to(ROOT).as_posix()
-        repo = repository_for_path("/" + relative + "/info/refs")
-        if repo:
-            result[repo.name] = repo.repo_id
+        if HEALTH_CONFIG_INCLUDE_SECTION_RE.fullmatch(line):
+            # Includes can add or override refstorage values outside the
+            # bounded local file.  Do not attempt a partial interpretation.
+            return None
+        if HEALTH_CONFIG_EXTENSIONS_SECTION_RE.fullmatch(line):
+            in_extensions = True
+            continue
+        if stripped.startswith(b"["):
+            in_extensions = False
+            continue
+        if not in_extensions:
+            continue
+
+        match = HEALTH_CONFIG_REFSTORAGE_RE.fullmatch(line)
+        if match is not None:
+            values.append(match.group(1).decode("ascii"))
+            continue
+        # A refstorage-looking line with syntax this small parser cannot
+        # unambiguously interpret must fail closed rather than be guessed.
+        if b"refstorage" in line.lower():
+            return None
+
+    if len(values) != 1:
+        return None
+    uri = values[0]
+    return uri if VEX_URI_RE.fullmatch(uri) else None
+
+
+def health_repository_candidates() -> Iterable[tuple[str, Path]]:
+    """Yield a bounded set of direct ``*.git`` children beneath ``ROOT``.
+
+    Unlike ``Path.rglob()``, this walker never descends into a candidate bare
+    repository.  It also bounds traversal depth, directories, and entries per
+    directory so a malformed or unexpectedly large filesystem cannot delay
+    the health endpoint.  Symlinks are not followed.
+    """
+    if not ROOT.is_dir():
+        return
+
+    pending: list[tuple[Path, tuple[str, ...], int]] = [(ROOT, (), 0)]
+    scanned_directories = 0
+    yielded_repositories = 0
+    while pending and scanned_directories < HEALTH_SCAN_MAX_DIRECTORIES:
+        directory, relative_parts, depth = pending.pop()
+        scanned_directories += 1
+        try:
+            iterator = os.scandir(directory)
+        except OSError:
+            continue
+        with iterator:
+            entries_seen = 0
+            for entry in iterator:
+                entries_seen += 1
+                if entries_seen > HEALTH_SCAN_MAX_DIRECTORY_ENTRIES:
+                    break
+                try:
+                    is_directory = entry.is_dir(follow_symlinks=False)
+                except OSError:
+                    continue
+                if not is_directory or not REPO_COMPONENT_RE.fullmatch(entry.name):
+                    continue
+
+                candidate_depth = depth + 1
+                if candidate_depth > HEALTH_SCAN_MAX_DEPTH:
+                    continue
+                candidate_parts = (*relative_parts, entry.name)
+                candidate = Path(entry.path)
+                if entry.name.endswith(".git"):
+                    if yielded_repositories >= HEALTH_SCAN_MAX_REPOSITORIES:
+                        return
+                    yielded_repositories += 1
+                    yield "/".join(candidate_parts), candidate
+                    # A bare repository can contain an arbitrarily large
+                    # object tree.  Never recurse beneath it, even if its
+                    # local config is malformed or its receive is recovering.
+                    continue
+                if candidate_depth < HEALTH_SCAN_MAX_DEPTH:
+                    pending.append((candidate, candidate_parts, candidate_depth))
+
+
+def known_repositories() -> dict[str, str]:
+    """Return a bounded, config-file-only inventory for ``/healthz``.
+
+    This is intentionally an observability aid, not an authorization or
+    routing decision.  It must stay independent from custom Git so one
+    recovering repository cannot stall health for every other repository.
+    """
+    result: dict[str, str] = {}
+    for name, candidate in health_repository_candidates():
+        uri = health_repository_uri(candidate)
+        if uri is None:
+            continue
+        match = VEX_URI_RE.fullmatch(uri)
+        if match is not None:
+            result[name] = match.group(1).lower()
     return result
 
 

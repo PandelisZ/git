@@ -28,4 +28,9 @@ test_expect_success PYTHON3 'gateway isolates the one benchmark-only classic dis
 		"$GIT_BUILD_DIR/vex/docker/git-http/vex_mysql_s3_http.py"
 '
 
+test_expect_success PYTHON3 'gateway health inventory is bounded and never invokes custom Git per repository' '
+	"$PYTHON3_PATH" "$GIT_BUILD_DIR/t/vex/test-health-repository-discovery.py" \
+		"$GIT_BUILD_DIR/vex/docker/git-http/vex_mysql_s3_http.py"
+'
+
 test_done
