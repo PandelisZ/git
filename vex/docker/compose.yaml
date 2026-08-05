@@ -151,6 +151,11 @@ services:
     volumes:
       - vex_git_repositories:/srv/git
       - vex_git_scratch:/var/git-scratch
+      # A classic bare benchmark control only. It stays outside /srv/git so
+      # Vex repository discovery and its MySQL+S3 health probe cannot walk a
+      # large disk-control object tree. The gateway serves only one fixed,
+      # authenticated smart-HTTP namespace from this volume.
+      - vex_bench_disk:/srv/vex-bench-disk
       # The gateway needs the leaf key and CA certificate, never the local CA
       # private key used by certs/gen.sh.
       - ./certs/rootCA.pem:/certs/rootCA.pem:ro
@@ -194,6 +199,9 @@ volumes:
   # MySQL and canonical object bytes live in MinIO/S3.
   vex_git_repositories:
   vex_git_scratch:
+  # Explicit classic-bare control for same-listener clone benchmarks. It is
+  # not Vex storage and is mounted only at /srv/vex-bench-disk in git-http.
+  vex_bench_disk:
 
 networks:
   vex_net:

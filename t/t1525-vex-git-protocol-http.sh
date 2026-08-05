@@ -23,4 +23,9 @@ test_expect_success PYTHON3 'gateway streams Content-Length CGI requests and res
 		"$GIT_BUILD_DIR/vex/docker/git-http/vex_mysql_s3_http.py"
 '
 
+test_expect_success PYTHON3 'gateway isolates the one benchmark-only classic disk smart-HTTP route' '
+	"$PYTHON3_PATH" "$GIT_BUILD_DIR/t/vex/test-benchmark-disk-route.py" \
+		"$GIT_BUILD_DIR/vex/docker/git-http/vex_mysql_s3_http.py"
+'
+
 test_done

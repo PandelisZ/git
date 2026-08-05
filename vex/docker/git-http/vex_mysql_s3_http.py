@@ -30,6 +30,15 @@ from urllib.parse import unquote, urlsplit
 
 
 ROOT = Path(os.environ.get("GIT_HTTP_ROOT", "/srv/git")).resolve()
+# The classic repository used by the clone benchmark deliberately lives outside
+# ``ROOT``.  ``known_repositories()`` walks ROOT for thin Vex repositories as
+# part of the MySQL+S3 health response; putting a full git/git control there
+# would turn that small health probe into an object-tree traversal.
+BENCH_DISK_ROOT = Path(os.environ.get("VEX_BENCH_DISK_ROOT", "/srv/vex-bench-disk")).resolve()
+BENCH_DISK_NAMESPACE = "/__vex_bench_disk__"
+BENCH_DISK_REPOSITORY = "git-git-disk.git"
+BENCH_DISK_ROUTE = f"{BENCH_DISK_NAMESPACE}/{BENCH_DISK_REPOSITORY}"
+BENCH_DISK_MARKER = "vex.benchmarkcontrol"
 BIND = os.environ.get("VEX_HTTP_BIND", "0.0.0.0")
 HTTP_PORT = int(os.environ.get("VEX_HTTP_PORT", "8080"))
 HTTPS_PORT = int(os.environ.get("VEX_HTTPS_PORT", "8443"))
@@ -296,6 +305,19 @@ class VexRepository:
     repo_id: str
 
 
+@dataclass(frozen=True)
+class BenchmarkDiskRepository:
+    """The one explicit classic-bare control permitted by the gateway.
+
+    This is intentionally not a general classic-Git fallback.  It is mounted
+    in a separate Compose volume and gets a different CGI project root, so a
+    normal Vex URL can never resolve to its on-disk object bytes.
+    """
+
+    path: Path
+    path_info: str
+
+
 def repository_for_path(path: str) -> VexRepository | None:
     """Resolve one URL to a configured Vex thin repository.
 
@@ -347,6 +369,145 @@ def repository_for_path(path: str) -> VexRepository | None:
         uri=f"vex://{repo_id}",
         repo_id=repo_id,
     )
+
+
+def benchmark_disk_namespace_requested(path: str) -> bool:
+    """Whether a URL addresses the reserved benchmark-control namespace.
+
+    A malformed request inside this namespace must not fall through to the
+    Vex resolver: that would make a future Vex repository with the same path
+    unexpectedly change the benchmark-control boundary.
+    """
+    decoded = unquote(path)
+    return decoded == BENCH_DISK_NAMESPACE or decoded.startswith(BENCH_DISK_NAMESPACE + "/")
+
+
+def _git_config_value(git_dir: Path, key: str) -> str | None:
+    """Read one local repository config value, failing closed on any error."""
+    try:
+        completed = subprocess.run(
+            [GIT, f"--git-dir={git_dir}", "config", "--get", key],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if completed.returncode:
+        return None
+    return completed.stdout.strip()
+
+
+def benchmark_disk_repository_for_request(
+    path: str,
+    method: str,
+    query: str,
+) -> BenchmarkDiskRepository | None:
+    """Resolve the one authenticated smart-HTTP benchmark disk control.
+
+    Only the stock smart-HTTP discovery and RPC endpoints are accepted.  In
+    particular, this gateway does not expose arbitrary classic repositories,
+    object files, configs, or paths beneath the mounted control volume.
+    """
+    decoded = unquote(path)
+    if decoded == BENCH_DISK_ROUTE + "/info/refs":
+        if method not in {"GET", "HEAD"} or query not in {
+            "service=git-upload-pack",
+            "service=git-receive-pack",
+        }:
+            return None
+        path_info = f"/{BENCH_DISK_REPOSITORY}/info/refs"
+    elif decoded == BENCH_DISK_ROUTE + "/git-upload-pack":
+        if method != "POST" or query:
+            return None
+        path_info = f"/{BENCH_DISK_REPOSITORY}/git-upload-pack"
+    elif decoded == BENCH_DISK_ROUTE + "/git-receive-pack":
+        if method != "POST" or query:
+            return None
+        path_info = f"/{BENCH_DISK_REPOSITORY}/git-receive-pack"
+    else:
+        return None
+
+    try:
+        root = BENCH_DISK_ROOT.resolve()
+        candidate = (root / BENCH_DISK_REPOSITORY).resolve()
+        candidate.relative_to(root)
+    except (OSError, RuntimeError, ValueError):
+        return None
+    if not candidate.is_dir() or not (candidate / "HEAD").is_file() or not (candidate / "objects").is_dir():
+        return None
+
+    # A seeded classic control must opt in explicitly.  Reject a Vex thin
+    # repository even if it accidentally lands in the separate volume.
+    if _git_config_value(candidate, BENCH_DISK_MARKER) != "true":
+        return None
+    if _git_config_value(candidate, "extensions.refstorage") is not None:
+        return None
+    return BenchmarkDiskRepository(path=candidate, path_info=path_info)
+
+
+def repository_for_request(
+    path: str,
+    method: str,
+    query: str,
+) -> tuple[VexRepository | BenchmarkDiskRepository | None, bool]:
+    """Resolve a request and identify the reserved disk namespace.
+
+    The boolean records that the request entered the reserved namespace even
+    if it was malformed or the control is absent.  Callers use it to return a
+    terminal 404 instead of attempting the normal Vex path resolver.
+    """
+    if benchmark_disk_namespace_requested(path):
+        return benchmark_disk_repository_for_request(path, method, query), True
+    return repository_for_path(path), False
+
+
+def cgi_environment_for_repository(
+    repository: VexRepository | BenchmarkDiskRepository,
+    path: str,
+    query: str,
+    method: str,
+    content_type: str,
+    content_length: int,
+    remote_addr: str,
+) -> dict[str, str]:
+    """Build a clean request-scoped CGI environment for one routed repository."""
+    environ = dict(os.environ)
+    for key in (
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_REFERENCE_BACKEND",
+    ):
+        environ.pop(key, None)
+
+    if isinstance(repository, VexRepository):
+        project_root = ROOT
+        path_info = unquote(path)
+        environ["GIT_REFERENCE_BACKEND"] = repository.uri
+    else:
+        project_root = BENCH_DISK_ROOT
+        path_info = repository.path_info
+
+    environ.update(
+        {
+            "GIT_EXEC_PATH": GIT_EXEC_PATH,
+            "GIT_HTTP_EXPORT_ALL": "1",
+            "GIT_PROJECT_ROOT": str(project_root),
+            "PATH_INFO": path_info,
+            "QUERY_STRING": query,
+            "REQUEST_METHOD": method,
+            "CONTENT_TYPE": content_type,
+            "CONTENT_LENGTH": str(content_length),
+            "REMOTE_ADDR": remote_addr,
+        }
+    )
+    environ["PATH"] = HELPER_PATH + os.pathsep + environ.get("PATH", "")
+    return environ
 
 
 def known_repositories() -> dict[str, str]:
@@ -465,8 +626,8 @@ class VexMySQLS3HTTPRequestHandler(BaseHTTPRequestHandler):
         expected = (BASIC_USER + ":" + BASIC_PASSWORD).encode("utf-8")
         return hmac.compare_digest(supplied, expected)
 
-    def _auth_required(self) -> None:
-        body = b"authentication required for git-receive-pack\n"
+    def _auth_required(self, purpose: str = "git-receive-pack") -> None:
+        body = f"authentication required for {purpose}\n".encode("utf-8")
         self.send_response(401)
         self.send_header("WWW-Authenticate", 'Basic realm="Vex local push"')
         self.send_header("Content-Type", "text/plain; charset=utf-8")
@@ -725,41 +886,40 @@ class VexMySQLS3HTTPRequestHandler(BaseHTTPRequestHandler):
             self.send_error(404)
             return
 
-        repository = repository_for_path(split.path)
+        repository, benchmark_disk_namespace = repository_for_request(
+            split.path,
+            self.command,
+            split.query,
+        )
         if repository is None:
-            self.send_error(404, "unknown Vex repository")
+            self.send_error(
+                404,
+                "unknown benchmark disk control" if benchmark_disk_namespace else "unknown Vex repository",
+            )
             return
-        if self._needs_push_auth(split.path, split.query) and not self._authorized():
+        if isinstance(repository, BenchmarkDiskRepository):
+            # This route is an explicit benchmark fixture.  Unlike normal
+            # read-only Vex fetches it is never anonymously exposed, and the
+            # same authenticated control is used by fetch-after-push tests.
+            if not self._authorized():
+                self._auth_required("Vex benchmark disk control")
+                return
+        elif self._needs_push_auth(split.path, split.query) and not self._authorized():
             self._auth_required()
             return
         body = self._request_body()
         if body is None:
             return
 
-        environ = dict(os.environ)
-        for key in (
-            "GIT_DIR",
-            "GIT_WORK_TREE",
-            "GIT_INDEX_FILE",
-            "GIT_OBJECT_DIRECTORY",
-            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-        ):
-            environ.pop(key, None)
-        environ.update(
-            {
-                "GIT_EXEC_PATH": GIT_EXEC_PATH,
-                "GIT_HTTP_EXPORT_ALL": "1",
-                "GIT_PROJECT_ROOT": str(ROOT),
-                "GIT_REFERENCE_BACKEND": repository.uri,
-                "PATH_INFO": unquote(split.path),
-                "QUERY_STRING": split.query,
-                "REQUEST_METHOD": self.command,
-                "CONTENT_TYPE": self.headers.get("Content-Type", ""),
-                "CONTENT_LENGTH": str(body.length),
-                "REMOTE_ADDR": self.client_address[0],
-            }
+        environ = cgi_environment_for_repository(
+            repository,
+            split.path,
+            split.query,
+            self.command,
+            self.headers.get("Content-Type", ""),
+            body.length,
+            self.client_address[0],
         )
-        environ["PATH"] = HELPER_PATH + os.pathsep + environ.get("PATH", "")
         set_cgi_git_protocol(environ, self.headers)
         if self._authorized():
             environ["REMOTE_USER"] = BASIC_USER
