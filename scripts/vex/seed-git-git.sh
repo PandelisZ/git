@@ -189,7 +189,7 @@ compose=(docker compose -f "$compose_file" --env-file "$env_file")
 storage_is_ready() {
 	local health
 
-	health=$(curl --fail --silent --show-error --cacert "$ca_file" \
+	health=$(curl --connect-timeout 2 --max-time 5 --fail --silent --show-error --cacert "$ca_file" \
 		"https://localhost:${GIT_HTTPS_PORT}/healthz" 2>/dev/null) || return 1
 	case "$health" in
 	*'"blob_backend": "s3"'*'"metadata_backend": "mysql"'*'"vex_storage_active": true'*) return 0 ;;
