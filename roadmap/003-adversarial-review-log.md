@@ -140,14 +140,14 @@ Evidence from this repo, Mononoke/jj trees, and web research.
 **Attack:** Silent missing blobs; fsck absent.
 **Evidence:** Mononoke walker scrub/validate (`docs/6.2-walker-and-validation.md`).
 **Verdict:** High for prod.
-**Plan delta:** Stage 8+ `cloud scrub` job: tips→graph→blob exists; not Stage 1 blocker but required before multi-tenant.
+**Plan delta:** Stage 8+ `vex scrub` job: tips→graph→blob exists; not Stage 1 blocker but required before multi-tenant.
 
 ### Pass 17 — compat: alternates and object sharing
 
 **Attack:** Git alternates break when sources aren’t files paths.
 **Evidence:** `odb_source` alternates API path-based.
 **Verdict:** Medium.
-**Plan delta:** Cloud v1 **no alternates**; `read_alternates` empty; document non-support.
+**Plan delta:** Vex v1 **no alternates**; `read_alternates` empty; document non-support.
 
 ### Pass 18 — compat: shallow/partial clone
 
@@ -175,7 +175,7 @@ Evidence from this repo, Mononoke/jj trees, and web research.
 **Attack:** Something triggers commit-graph write → downcast.
 **Evidence:** `commit-graph.c` downcast usages.
 **Verdict:** High.
-**Plan delta:** Disable automatic commit-graph write in cloud mode; SQL parents replace it for server.
+**Plan delta:** Disable automatic commit-graph write in Vex mode; SQL parents replace it for server.
 
 ### Pass 22 — forge-SRE: multi-ref push atomicity
 
@@ -667,7 +667,7 @@ Criticals all have plan deltas landed in 001/004/005/006/007.
 - [x] ref_updates actor/push_id (Pass 05)
 - [x] Grace window for force-push (Pass 23)
 - [x] Long-lived daemon note (Pass 28)
-- [x] cloud scrub (Pass 16)
+- [x] vex scrub (Pass 16)
 - [x] Disable files commit-graph write (Pass 21)
 - [x] Derived pack invalidation + sweeper roots (51, 60)
 - [x] p50 pack stream path / no SQL-per-oid (52, 55)

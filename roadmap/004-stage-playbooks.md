@@ -1,7 +1,7 @@
 # Vex Stage Playbooks PRD
 
 **Status:** Active
-**Current Stage:** 2 - fs store + local ODB/ref foundation
+**Current Stage:** 3 - Vex-FS smart-HTTP and atomic receive epochs
 **Owner:** Codex
 **Created:** 2026-08-05
 **Updated:** 2026-08-05
@@ -132,11 +132,11 @@ the canonical blob-store object bytes.
 - [ ] Naive pack+bitmap on ≥10k objects: size, rebuild time (info only; not L2 gate)
 - [ ] Baseline `git clone` of disk git/git on bench hardware
 - [ ] Failure-injection skeleton
-- [ ] **push-stress plan.jsonl dry-run** against local bare git (no cloud) to validate harness
+- [ ] **push-stress plan.jsonl dry-run** against local bare git (no Vex backend) to validate harness
 
 ### Downcast inventory (maintenance guards)
 
-Must no-op/error in cloud mode (non-exhaustive starters):
+Must no-op/error in Vex mode (non-exhaustive starters):
 
 - `builtin/gc.c`
 - `repack.c`, `repack-midx.c`, `repack-geometry.c`
@@ -200,11 +200,18 @@ foundation, not an L1 protocol result.
 
 Owned: receive-pack/upload-pack integration via ODB txn
 
+**Implementation snapshot (2026-08-05):** the Vex-FS smart-HTTP server passes
+stock Git clone/fetch/push. Receive-pack exports a Vex epoch to child
+processes; accepted receives seal it with refs and rejected receives
+compensate it. `t1491`, `t1492`, and `t1493` are green.
+Hard-kill, hook-isolation, multi-ref/concurrent, and Vex-target push-stress
+coverage remain before an L1 claim.
+
 Tasks:
 
 1. Map receive-pack `ODB_TRANSACTION_RECEIVE` to open generation (`push_id`).
 2. Quarantine visibility for hooks (Pass 25).
-3. Implement `begin_transaction` / commit / `env` on cloud ODB (hard gate).
+3. Implement `begin_transaction` / commit / `env` on Vex ODB (hard gate).
 4. **Staging blob keys + compensate** on failure (W4-1).
 5. **Hash-verify** oid on write (W4-6).
 6. **Pack size/depth/tree limits** on receive (W4-5).
@@ -232,9 +239,10 @@ Acceptance:
 **Local-only dependencies:** Docker Compose stack in [006](006-local-docker-compose-test-environment.md).
 
 **Implementation snapshot (2026-08-05):** the local MySQL/MinIO/TLS topology,
-schema/bucket initialization, and a stock-Git bootstrap smoke are green. The
-bootstrap health response explicitly says `vex_storage_active:false`; it is
-not yet a Vex MySQL/S3 driver or an L2 result.
+schema/bucket initialization, stock-Git bootstrap smoke, native MySQL metadata
+probe, and signed MinIO blob probe are green. The bootstrap health response
+explicitly says `vex_storage_active:false` and `vex_store` is still
+FS-backed, so this is not yet a Vex MySQL/S3 data plane or an L2 result.
 
 Tasks:
 
@@ -269,7 +277,7 @@ Tasks:
 2. Tip cache optional
 3. No negative existence cache v1 (Pass 14)
 4. Invalidate on ref txn
-5. gc messaging; `cloud optimize` stub
+5. gc messaging; `vex optimize` stub
 6. Test: `docker compose exec valkey valkey-cli FLUSHALL` mid-traffic — tips still correct from MySQL.
 
 Acceptance: FLUSHALL safe; default profile still passes without Valkey.
@@ -337,7 +345,7 @@ Acceptance: **STATUS L4 go/no-go checklist (W4-12) fully green**.
 
 Tasks:
 
-1. Design doc `Documentation/technical/cloud-storage.adoc`
+1. Design doc `Documentation/technical/vex-storage.adoc`
 2. Short threat note for **local PoC only** (localhost binds, no client cloud creds) — full tenancy/auth threat model **out of scope**
 3. Long-lived git-http notes (already needed for L4)
 4. Repo delete lifecycle (single-tenant PoC is enough)

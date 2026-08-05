@@ -124,9 +124,9 @@ Apply C1–C10 and M1–M4 from PRD 002.
 7. **FR7** Reflog APIs no-op or audit-backed; must not block push.
 8. **FR8** Optional Valkey tip/existence cache; invalidate-after-commit.
 9. **FR9** Local disk scratch for pack build/spill only.
-10. **FR10** `gc`/`repack`/`midx` never files-downcast crash; no-op or cloud optimize.
+10. **FR10** `gc`/`repack`/`midx` never files-downcast crash; no-op or Vex optimize.
 11. **FR11** Sweeper deletes only non-tipped, non-pinned, sealed-old objects.
-12. **FR12** Config via extensions + `cloud.*` / env.
+12. **FR12** Config via extensions + `vex.*` / env.
 13. **FR13** commit_parents extracted on commit write for negotiation/seal walks.
 14. **FR14** Repo isolation by `repo_id` in all keys/rows.
 15. **FR15** Smart HTTP(S) front so `git clone https://localhost/<repo>.git` works with stock git (protocol v2 preferred).
@@ -136,13 +136,13 @@ Apply C1–C10 and M1–M4 from PRD 002.
 
 ### CLI Requirements
 
-| Surface | Cloud behavior |
+| Surface | Vex behavior |
 |---------|----------------|
-| init/bootstrap | cloud bare repo (stage 2+) |
+| init/bootstrap | Vex bare repo (stage 2+) |
 | upload-pack / receive-pack | primary path |
 | gc / repack | no-op or optimize stub |
 | reflog | empty or audit view |
-| cat-file / rev-list | debug via cloud ODB |
+| cat-file / rev-list | debug via Vex ODB |
 
 ### Data And State
 
@@ -192,7 +192,7 @@ Chaos tests (push-stress fault_inject + kill) must hit gaps between steps and as
 
 ```
 roadmap/001-006...
-Documentation/technical/cloud-storage.adoc   # impl stage
+Documentation/technical/vex-storage.adoc     # impl stage
 vex/
   schema.sql
   store.h store.c
@@ -321,7 +321,7 @@ env -u CARGO_TARGET_DIR make -C t unit-tests
 t/unit-tests/bin/unit-tests -r vex_store
 ```
 
-Evidence: the Vex fs unit group passes 3/3 for blob-before-metadata and
+Evidence: the Vex fs unit group passes 4/4 for blob-before-metadata and
 repository isolation, stale CAS atomicity, and `commit_parents` metadata.
 
 Acceptance reached for the fs foundation: round-trip without `.git/objects`;
@@ -348,35 +348,44 @@ receive-pack/upload-pack support.
 
 ### Stage 3: receive-pack / upload-pack
 
-**Status:** Draft
+**Status:** Active — Vex-FS smart-HTTP and accepted/rejected receive epochs
 **Owned Paths:** quarantine glue; `t/` tests; Vex txn + local blob cache
 
-- [ ] Map `ODB_TRANSACTION_RECEIVE` → open generation (`push_id`)
-- [ ] `begin_transaction` / commit / `odb_transaction_env` on cloud ODB (hard gate)
-- [ ] Quarantine visibility = git quarantine semantics (hooks see; others do not)
-- [ ] Publish objects + multi-ref CAS on success
-- [ ] abort/TTL drop open generation
-- [ ] negotiation using commit_parents when present
-- [ ] pack stream via scratch
+- [x] Map `ODB_TRANSACTION_RECEIVE` → open generation (`push_id`)
+- [x] `begin_transaction` / commit / `odb_transaction_env` on the Vex ODB, including cross-process `GIT_VEX_EPOCH` handoff
+- [~] Quarantine visibility: receive children read the parent epoch; hook-isolation coverage remains
+- [x] Publish objects with ref updates on accepted receive; compensate rejected receive objects
+- [~] abort rejected receive epochs; TTL expiry remains for the sweeper stage
+- [ ] negotiation using `commit_parents` when present
+- [x] pack stream via scratch for the Vex-FS protocol smoke
 - [ ] process-local blob LRU (+ optional scratch object cache)
 
-Acceptance: classic client push/fetch; interrupted push leaves tips unchanged; hook can read quarantine oid; **L1 only**.
+Evidence: `t1491-vex-fs-http.sh` passes stock-Git clone/fetch; the full
+`scripts/vex/fs-http-smoke.sh` passes stock clone/fetch/push.
+`t1492-vex-receive-pack.sh` and `t1493-vex-receive-epoch.sh` pass
+accepted/rejected receive epoch handling. Remaining L1 work is hard-kill fault
+injection, hook visibility/isolation, multi-ref/concurrent coverage, and the
+push-stress harness against this endpoint.
 
 ### Stage 4: MySQL + S3 via local Docker Compose (L2)
 
-**Status:** Active — Compose foundation only
+**Status:** Active — Compose foundation plus live native driver probes
 **Owned Paths:** `meta-mysql.c`, `blob-s3.c`, `vex/docker/compose.yaml`, `scripts/vex/*`, `t/vex/integration-mysql-minio.sh`
 
 - [x] Compose: mysql + minio + git-http (ports on 127.0.0.1)
 - [x] MinIO bucket init; Vex schema init
 - [x] TLS stock-Git bootstrap clone/fetch/push smoke
-- [ ] Vex MySQL/S3 driver and Vex-aware git-http command
+- [x] Native MySQL metadata probe (metadata rows only; no raw Git bytes)
+- [x] Signed S3/MinIO blob probe (stage, promote, read, Git hash verification)
+- [ ] Integrate the MySQL and S3 drivers into `vex_store` and the Vex-aware git-http command
 - [ ] Protocol tests against a Vex `https://localhost…` endpoint
 - [ ] CI: Compose → Vex seed → Vex smoke → down -v (no AWS)
 
 The current git-http image exposes an explicit classic-bare bootstrap and
 reports `vex_storage_active:false`. Its successful stock-Git smoke proves
-TLS/transport plumbing, not a Vex data-plane path or L2.
+TLS/transport plumbing, not a Vex data-plane path or L2. The live drivers
+exercise real MySQL and MinIO protocols independently; `vex_store` remains
+FS-backed until their shared-store integration lands.
 
 Acceptance remains pending: Stage 3 tests must pass on **local** MySQL+MinIO
 through a Vex-aware server; Valkey off; second machine can reproduce from
@@ -414,7 +423,7 @@ Acceptance: **S2+S3+S4+S9+S10 green**. User-facing “done” bar; fully local-r
 ### Stage 8: hardening + docs
 
 **Status:** Draft
-**Owned Paths:** `Documentation/technical/cloud-storage.adoc`
+**Owned Paths:** `Documentation/technical/vex-storage.adoc`
 
 Acceptance: threat model + runbook; critical review items closed.
 

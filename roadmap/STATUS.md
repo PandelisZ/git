@@ -4,15 +4,15 @@
 
 | ID | Title | Status | Stage | Updated | Notes | Next |
 |----|-------|--------|-------|---------|-------|------|
-| 001 | [Vex Git Forge Storage (PoC)](001-cloud-scale-git-forge-storage.md) | Active | 2 - fs store + local ODB/refs foundation | 2026-08-05 | Vex fs store and ODB/ref wiring are green; protocol is not yet complete. | Implement Stage 3 protocol |
+| 001 | [Vex Git Forge Storage (PoC)](001-cloud-scale-git-forge-storage.md) | Active | 3 - Vex-FS HTTP + atomic receive | 2026-08-05 | Stock-Git Vex-FS clone/fetch/push and accepted/rejected receive epochs are green; L1 fault/hook coverage and L2 integration remain. | Add fault/hook coverage and wire MySQL/S3 into the store |
 | 002 | [Comparative Research Digest](002-comparative-research-digest.md) | Draft | 0 - Research | 2026-08-05 | Prior art → constraints C1–C10 / M1–M4 | Add citations as found |
 | 003 | [Adversarial Review Log](003-adversarial-review-log.md) | Draft | 0 - Review | 2026-08-05 | **90** passes; wave 4 grok-4.5 agents 71–90 | New passes only on design changes |
-| 004 | [Vex Stage Playbooks](004-stage-playbooks.md) | Active | 2 - foundation | 2026-08-05 | Stages 1–2 have targeted green tests; no L1 protocol claim. | Implement receive/upload-pack epoch handoff |
+| 004 | [Vex Stage Playbooks](004-stage-playbooks.md) | Active | 3 - FS HTTP and atomic epochs | 2026-08-05 | Vex-FS stock-Git transport and epoch handoff are green; chaos/hook/multi-ref coverage remains. | Complete L1 fault coverage and MySQL/S3 store integration |
 | 005 | [Stock Client Verification & Benchmark](005-stock-client-verification-and-benchmark.md) | Draft | 0 - Verification design | 2026-08-05 | Stock git only; git/git clone ≤1.5× GitHub and ≤1.5× disk control | Wire harness on Compose in Stage 7 |
-| 006 | [Vex Local Docker Compose Test Environment](006-local-docker-compose-test-environment.md) | Active | Foundation — bootstrap transport | 2026-08-05 | MySQL, MinIO, TLS and stock Git bootstrap passed; health reports Vex storage inactive. | Wire Vex data plane into git-http |
+| 006 | [Vex Local Docker Compose Test Environment](006-local-docker-compose-test-environment.md) | Active | Foundation + live driver probes | 2026-08-05 | Native MySQL metadata and signed MinIO blob probes pass; Compose git-http remains an explicit classic-bare bootstrap. | Wire MySQL/S3 store into Vex git-http |
 | 007 | [Ten-Agent Adversarial Panel](007-ten-agent-adversarial-panel.md) | Superseded | Wave 3 | 2026-08-05 | In-process simulation (pre-grok routing) | Historical; see 008 |
 | 008 | [Grok-4.5 Ten-Agent Panel](008-grok45-ten-agent-panel.md) | Complete | Wave 4 | 2026-08-05 | **Authoritative** 10 agents on grok-4.5; W4-1…W4-12; passes 71–90 | Execute week 1–2 spikes; L4 go/no-go checklist |
-| 009 | [Incremental Push Stress Harness](009-incremental-push-stress-harness.md) | Active | Harness foundation | 2026-08-05 | Deterministic plan and classic-bare 20× batch=1 passed; Vex receiver remains pending. | Run smoke against Vex endpoint at L1 |
+| 009 | [Incremental Push Stress Harness](009-incremental-push-stress-harness.md) | Active | Harness foundation | 2026-08-05 | Classic-bare 20× batch=1 passed; a separate Vex-FS HTTP receiver smoke passes, but the stress harness is not wired to it yet. | Run smoke against the Vex-FS endpoint |
 | 010 | [Wave 5 Adversarial Panel](010-wave5-adversarial-panel.md) | Complete | Wave 5 | 2026-08-05 | 8× grok-4.5 agents; W5-1…W5-14; push-stress + dual-write focus | Epoch fencing; sequence packs after push correctness |
 
 ## Latest Evidence Notes
@@ -20,7 +20,7 @@
 ### 2026-08-05
 
 - Git insertion points: `odb/source.h` callbacks, `refs/refs-internal.h` `ref_storage_be`, `extensions.refstorage` URI payloads in `setup.c`, `odb/source-inmemory.c` as non-files template.
-- ~59 `odb_source_files_downcast` call sites (gc/repack/midx/bitmap/commit-graph/http) — cloud mode cannot share those paths blindly.
+- ~59 `odb_source_files_downcast` call sites (gc/repack/midx/bitmap/commit-graph/http) — Vex mode cannot share those paths blindly.
 - Mononoke: blobstore + SQL metadata; ephemeral bubbles; bookmark update log; Git protocol/derived data.
 - Jujutsu: `Backend` trait; thin WC; content-addressed store.
 - Web/prior art: GitLab still block-storage bare repos (epic #479); Gitea git-on-disk + S3 only for LFS/artifacts; gitgres SQL objects/refs (avoid bytes-in-SQL); JGit DFS pack-centric; Bitbucket Mesh replicated disks; GitHub pack/delta/MIDX economics; Piper centralized DB (Bigtable/Spanner); BucketGit/s3-git-server naïve S3 patterns.
@@ -33,11 +33,13 @@
 - **Local test stack:** Docker Compose with **MySQL + MinIO (S3) + optional Valkey + git HTTPS** ([006](006-local-docker-compose-test-environment.md)). All integration tests and reproducible benchmarks run locally; no AWS required for merge gates. CI: compose smoke; release bench host: add GitHub clone comparison.
 - **Wave 3** ([007](007-ten-agent-adversarial-panel.md)): historical in-process panel (51–70).
 - **Wave 4 authoritative** ([008](008-grok45-ten-agent-panel.md)): 10× **grok-4.5** agents (71–90). Consensus: architecture direction right; L4 keep; **6-month ship uncertain** (storage No-Go vs impl conditional Go). Hard adds: dual-write staging/chaos; sealed packs + **clone leases**; experimental not distro-default; pack DoS limits; bench anti-fraud; interop git versions; dogfood hammer/soak; cost SLIs; week-1 spikes.
-- **Incremental push harness** ([009](009-incremental-push-stress-harness.md)): from **empty** cloud repo, replay `git/git` history with stock `git push` in tunable batches (1 / ramp / N); stresses receive-pack/quarantine/ref CAS, not only clone or mirror-import. CI: smoke 20× batch=1; soak profiles optional.
+- **Incremental push harness** ([009](009-incremental-push-stress-harness.md)): from an **empty** Vex repo, replay `git/git` history with stock `git push` in tunable batches (1 / ramp / N); stresses receive-pack/quarantine/ref CAS, not only clone or mirror-import. CI: smoke 20× batch=1; soak profiles optional.
 - **Wave 5** ([010](010-wave5-adversarial-panel.md)): 8× grok-4.5 agents. Dual-write under push-stress = top risk; add **push epoch fencing**, harness fault inject + recon + anti-cheat; **sequence** sealed packs after L2/L3 push correctness; soft batch=1 latency budgets; compose resource limits; clearer PoC done definition.
-- **Wave A implementation (2026-08-05):** Vex fs metadata/blob storage, `ODB_SOURCE_VEX`, `REF_STORAGE_FORMAT_VEX`, typed ref CAS/audit rows, and maintenance safe-fail guards are implemented. Targeted checks are green: `u-vex-store` (3/3), `t1490-vex-storage.sh` (2/2), and `t9905-vex-fs-first-write.sh` (1/1).
+- **Wave A implementation (2026-08-05):** Vex fs metadata/blob storage, `ODB_SOURCE_VEX`, `REF_STORAGE_FORMAT_VEX`, typed ref CAS/audit rows, and maintenance safe-fail guards are implemented. Targeted checks are green: `u-vex-store` (4/4), `t1490-vex-storage.sh` (2/2), and `t9905-vex-fs-first-write.sh` (1/1).
 - **Compose boundary (2026-08-05):** local MySQL schema + MinIO bucket + TLS stock-Git bootstrap clone/fetch/push passed. Its `/healthz` reports `vex_storage_active:false`, so this is dependency/transport evidence only, not L1/L2 Vex storage evidence.
 - **Stress baseline (2026-08-05):** the stock-Git harness passed deterministic planning and 20/20 batch=1 pushes with fresh-fetch/fsck reconciliation against a temporary classic bare target. It is not yet a Vex receiver benchmark.
+- **Stage 3 Vex-FS transport (2026-08-05):** `t1491-vex-fs-http.sh` passes stock `/usr/bin/git` clone/fetch against the Vex-FS smart-HTTP server; the full smoke also passes stock clone/fetch/push. `t1492-vex-receive-pack.sh` and `t1493-vex-receive-epoch.sh` pass accepted and rejected receive epoch checks, including compensation of rejected objects. This is FS protocol evidence, not a hard-kill/hook-complete L1 claim.
+- **Stage 4 backend drivers (2026-08-05):** the live native MySQL metadata probe passes with `tables=10`, `ref_version=2`, and `metadata_only=1` (the throwaway generation number varies by run); the signed MinIO blob probe passes its stage/promote/read/hash checks. Raw Git object payloads remain outside MySQL. `vex_store` is still FS-backed and Compose `git-http` is still `bootstrap-classic-bare`, so this is not L2 or L4.
 
 ### PoC “done” means (Wave 5 product)
 

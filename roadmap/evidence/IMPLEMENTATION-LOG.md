@@ -71,3 +71,36 @@ The Compose result is intentionally limited: it proves local dependency and
 stock-Git transport wiring, not Vex MySQL/MinIO Git storage. The next
 functional gate is an unmodified Git push/fetch/clone through a Vex-aware
 receive-pack/upload-pack implementation.
+
+## 2026-08-05 — Vex-FS protocol epochs and live backend drivers
+
+The Vex-FS protocol path is operational with an unmodified `/usr/bin/git`
+client:
+
+- `t1491-vex-fs-http.sh` passes stock clone/fetch through the Vex-FS
+  smart-HTTP server; the full smoke passes clone/fetch/push.
+- `t1492-vex-receive-pack.sh` passes a stock push using the Vex ODB and
+  leaves no open receiver epoch.
+- `t1493-vex-receive-epoch.sh` passes accepted receive sealing and
+  rejected-receive compensation: no rejected metadata row, final blob, or
+  open epoch remains.
+- `t9905-vex-fs-first-write.sh` passes the first blob/tag write to a
+  fresh Vex bare repository.
+
+The HTTP harness now stops cleanly under the in-tree test environment and
+unsets the in-tree `GIT_EXEC_PATH` for the stock client, so its remote
+HTTP helper is the installed client helper rather than a Vex build artifact.
+
+Two native external drivers also passed against local Compose:
+
+- `meta-mysql` wrote and read metadata only (live result: `tables=10`,
+  `ref_version=2`, and `metadata_only=1`; its throwaway generation number
+  varies by run).
+- `blob-s3` used SigV4 with MinIO to stage, promote, fetch, and
+  re-hash Git object bytes under `git/v1/<repo>/objects/<oid>`.
+
+This is deliberately not an L2 or L4 claim. The central `vex_store` is
+still FS-backed, and the Compose `git-http` service reports
+`mode:"bootstrap-classic-bare"` with `vex_storage_active:false`.
+The next integration slice is a shared store backend that makes the same
+stock-Git protocol path use the MySQL metadata and S3 blob drivers.

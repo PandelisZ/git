@@ -1,7 +1,7 @@
 # Vex Local Docker Compose Test Environment PRD
 
 **Status:** Active
-**Current Stage:** Foundation — bootstrap transport only
+**Current Stage:** Foundation + live backend driver probes; Vex data plane pending
 **Owner:** Codex
 **Created:** 2026-08-05
 **Updated:** 2026-08-05
@@ -25,6 +25,11 @@ The bundled `git-http` process deliberately reports
 `mode:"bootstrap-classic-bare"` and `vex_storage_active:false`. It is a
 transport/dependency proof only: MySQL and MinIO are not yet Vex Git storage
 in that process, so no Stage 3/L1 or Stage 4/L2 claim follows from it.
+
+The native `meta-mysql` probe and signed `blob-s3` probe also run
+against these Compose services and are green. They use real MySQL and MinIO
+protocols, keep raw Git payloads out of MySQL, and do not yet make the
+central `vex_store` or bundled `git-http` process MySQL/S3-backed.
 
 ### Goals
 

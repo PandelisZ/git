@@ -1,7 +1,7 @@
 # Incremental Push Stress Harness PRD
 
 **Status:** Active
-**Current Stage:** Harness foundation — Vex target pending
+**Current Stage:** Harness foundation — Vex-FS target not yet wired
 **Owner:** Codex
 **Created:** 2026-08-05
 **Updated:** 2026-08-05
@@ -54,12 +54,16 @@ That target is intentionally a temporary classic bare repository. The same
 smoke remains a required gate against the Vex receiver, and this baseline does
 not claim epoch compensation, blob durability, or a Vex performance number.
 
+A separate Vex-FS smart-HTTP smoke now proves stock-Git clone/fetch/push and
+accepted/rejected receive epochs. The stress harness has not yet targeted that
+endpoint, so its classic-bare result remains only a baseline.
+
 ---
 
 ## Core idea
 
 ```text
-SOURCE (read-only)              HARNESS                         TARGET (cloud bare)
+SOURCE (read-only)              HARNESS                         TARGET (Vex bare)
 .git mirror of git/git    →   plan commit batches      →    empty ORIGIN via receive-pack
                               update local tip clone
                               git push stock client
@@ -184,8 +188,8 @@ Planning is pure local git; no server load. Re-runnable / diffable.
 ### Bootstrap
 
 ```sh
-# TARGET empty cloud bare already exists (seed script)
-git init --bare  # server-side empty cloud repo
+# TARGET empty Vex bare already exists (seed script)
+git init --bare  # server-side empty Vex repo
 
 # DRIVER
 rm -rf "$WORK"
@@ -416,7 +420,7 @@ PUSH_STRESS_READERS=4
 
 ```sh
 scripts/vex/up.sh
-scripts/vex/seed-empty-repo.sh stress/git-replay   # empty cloud bare
+scripts/vex/seed-empty-repo.sh stress/git-replay   # empty Vex bare
 # mirror once if needed
 scripts/vex/ensure-git-git-mirror.sh
 
@@ -426,7 +430,7 @@ scripts/vex/push-stress.sh --profile t/vex/push-stress/profiles/smoke.env
 git clone https://localhost:8443/stress/git-replay.git /tmp/after
 ```
 
-Empty repo helper creates cloud bare with HEAD→main unborn or empty tree policy documented.
+Empty repo helper creates Vex bare with HEAD→main unborn or empty tree policy documented.
 
 ---
 

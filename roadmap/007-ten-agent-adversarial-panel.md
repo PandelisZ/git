@@ -76,7 +76,7 @@ Split mutable tips (SQL) from immutable bytes (blob) is correct.
 - alternate object dir rejected cleanly  
 
 ### Verdict
-**Optional in-tree backend** behind extensions OK; treat as experimental. **Do not** claim “full git maintenance compatibility.” Prefer thin gitdir + explicit `git cloud-*` operator tools over lying that `git gc` optimizes S3.
+**Optional in-tree backend** behind extensions OK; treat as experimental. **Do not** claim “full git maintenance compatibility.” Prefer thin gitdir + explicit `git vex-*` operator tools over lying that `git gc` optimizes S3.
 
 ---
 
@@ -257,8 +257,8 @@ Local commit/rebase never hit server — OK. Remote gaps:
 ### Mandatory deltas
 - **Push auth** in compose (basic auth or ssh later) documented for F2–F8.  
 - **Fetch-after-push** benchmark secondary SLO: p50 fetch ≤ 2× disk.  
-- **Importer:** `git cloud import` / push --mirror path as first-class Stage 4/7.  
-- Operator UX: gc message points to `cloud optimize` / pack rebuild.  
+- **Importer:** `git vex import` / push --mirror path as first-class Stage 4/7.
+- Operator UX: gc message points to `vex optimize` / pack rebuild.
 - Sanitize errors to clients (no DSN).
 
 ---
