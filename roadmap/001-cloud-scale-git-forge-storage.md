@@ -12,9 +12,11 @@ Stage 0 design is frozen after 45 adversarial passes. Stages 1–4 now have a
 targeted implementation foundation: the active Compose path uses MySQL for
 metadata and MinIO/S3 for canonical Git object bytes. The 500-commit ramp,
 deterministic promotion-fault compensation, byte scrub, durable pins, and a
-read-only reachability mark plan are verified. Hard-kill chaos, destructive
-grace-period sweeping, pack/lease roots, and the sealed-pack L4 path remain
-pending.
+read-only reachability mark plan are verified. A deterministic pack/index
+artifact now reaches per-repository S3 keys with a MySQL envelope/object map,
+but it is not yet used to serve clones. Hard-kill chaos, destructive
+grace-period sweeping, pack/lease roots, invalidation, and the sealed-pack L4
+serve path remain pending.
 
 **Implementation identity:** this experiment is the **Vex backend**.  “Cloud
 storage” describes its MySQL + blob-store architecture; code, extension URIs,

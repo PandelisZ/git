@@ -2519,6 +2519,42 @@ struct vex_meta_mysql_saved_pins {
 	size_t alloc;
 };
 
+/*
+ * Derived packs are immutable S3 artifacts.  The current state adapter still
+ * replaces the ordinary per-repository metadata under one lock, so retain the
+ * pack rows exactly through that replacement rather than making packs block
+ * subsequent receives.  A future deletion path must obsolete a pack before it
+ * deletes an object referenced by that pack.
+ */
+struct vex_meta_mysql_saved_pack {
+	unsigned char pack_id[VEX_META_MYSQL_OID_BYTES];
+	unsigned char *pack_key;
+	size_t pack_key_len;
+	unsigned char *idx_key;
+	size_t idx_key_len;
+	unsigned char *bitmap_key;
+	size_t bitmap_key_len;
+	uint64_t covering_generation;
+	char *state;
+	char *created_at;
+	char *sealed_at;
+	char *obsolete_at;
+};
+
+struct vex_meta_mysql_saved_pack_object {
+	unsigned char pack_id[VEX_META_MYSQL_OID_BYTES];
+	unsigned char oid[VEX_META_MYSQL_OID_BYTES];
+};
+
+struct vex_meta_mysql_saved_packs {
+	struct vex_meta_mysql_saved_pack *items;
+	size_t nr;
+	size_t alloc;
+	struct vex_meta_mysql_saved_pack_object *objects;
+	size_t objects_nr;
+	size_t objects_alloc;
+};
+
 static void state_saved_pins_release(struct vex_meta_mysql_saved_pins *pins)
 {
 	size_t i;
@@ -2530,6 +2566,38 @@ static void state_saved_pins_release(struct vex_meta_mysql_saved_pins *pins)
 	}
 	free(pins->items);
 	memset(pins, 0, sizeof(*pins));
+}
+
+static unsigned char *state_row_bytes(const char *value, unsigned long length)
+{
+	unsigned char *result;
+
+	if (!value)
+		return NULL;
+	result = malloc(length ? length : 1);
+	if (!result)
+		return NULL;
+	if (length)
+		memcpy(result, value, length);
+	return result;
+}
+
+static void state_saved_packs_release(struct vex_meta_mysql_saved_packs *packs)
+{
+	size_t i;
+
+	for (i = 0; i < packs->nr; i++) {
+		free(packs->items[i].pack_key);
+		free(packs->items[i].idx_key);
+		free(packs->items[i].bitmap_key);
+		free(packs->items[i].state);
+		free(packs->items[i].created_at);
+		free(packs->items[i].sealed_at);
+		free(packs->items[i].obsolete_at);
+	}
+	free(packs->items);
+	free(packs->objects);
+	memset(packs, 0, sizeof(*packs));
 }
 
 /*
@@ -2632,33 +2700,204 @@ static int state_insert_pins(struct vex_meta_mysql *db, const char *repo,
 	return VEX_META_MYSQL_OK;
 }
 
-static int state_require_no_packs(struct vex_meta_mysql *db,
-				  const char *repo)
+static int state_load_packs(struct vex_meta_mysql *db, const char *repo,
+				    struct vex_meta_mysql_saved_packs *packs)
 {
 	char *sql;
-	uint64_t rows;
-	int found;
+	MYSQL_RES *res = NULL;
+	MYSQL_ROW row;
+	unsigned long *lengths;
 	int ret;
 
-	sql = vex_format("SELECT COUNT(*) FROM pack_envelopes WHERE repo_id = %s",
-			 repo);
+	sql = vex_format("SELECT pack_id, pack_key, idx_key, bitmap_key, "
+			 "covering_generation, state, "
+			 "DATE_FORMAT(created_at, '%%Y-%%m-%%d %%H:%%i:%%s.%%f'), "
+			 "DATE_FORMAT(sealed_at, '%%Y-%%m-%%d %%H:%%i:%%s.%%f'), "
+			 "DATE_FORMAT(obsolete_at, '%%Y-%%m-%%d %%H:%%i:%%s.%%f') "
+			 "FROM pack_envelopes WHERE repo_id = %s ORDER BY pack_id", repo);
 	if (!sql)
 		return set_error(db, VEX_META_MYSQL_ERR_NOMEM,
-				 "could not allocate Vex derived metadata check");
-	ret = query_one_u64(db, sql, &rows, &found);
+				 "could not allocate Vex pack preservation query");
+	ret = state_query_result(db, sql, &res);
 	free(sql);
 	if (ret)
 		return ret;
-	if (!found || rows)
-		return set_error(db, VEX_META_MYSQL_ERR_STATE,
-				 "Vex state replacement requires a repository without packs");
+	while ((row = mysql_fetch_row(res))) {
+		struct vex_meta_mysql_saved_pack *pack;
+		uint64_t covering_generation;
+
+		lengths = mysql_fetch_lengths(res);
+		if (!row[0] || !row[1] || !row[4] || !row[5] || !row[6] || !lengths ||
+		    lengths[0] != VEX_META_MYSQL_OID_BYTES || lengths[1] > 512 ||
+		    (row[2] && lengths[2] > 512) ||
+		    (row[3] && lengths[3] > 512) || lengths[5] == 0 ||
+		    lengths[5] > 16 || lengths[6] > 32 ||
+		    (row[7] && lengths[7] > 32) ||
+		    (row[8] && lengths[8] > 32) ||
+		    parse_u64(row[4], &covering_generation)) {
+			ret = set_error(db, VEX_META_MYSQL_ERR,
+					"MySQL returned invalid Vex pack metadata");
+			goto out;
+		}
+		ALLOC_GROW(packs->items, packs->nr + 1, packs->alloc);
+		pack = &packs->items[packs->nr++];
+		memset(pack, 0, sizeof(*pack));
+		memcpy(pack->pack_id, row[0], sizeof(pack->pack_id));
+		pack->pack_key = state_row_bytes(row[1], lengths[1]);
+		pack->pack_key_len = lengths[1];
+		if (row[2]) {
+			pack->idx_key = state_row_bytes(row[2], lengths[2]);
+			pack->idx_key_len = lengths[2];
+		}
+		if (row[3]) {
+			pack->bitmap_key = state_row_bytes(row[3], lengths[3]);
+			pack->bitmap_key_len = lengths[3];
+		}
+		pack->covering_generation = covering_generation;
+		pack->state = state_row_text(row[5], lengths[5]);
+		pack->created_at = state_row_text(row[6], lengths[6]);
+		pack->sealed_at = row[7] ? state_row_text(row[7], lengths[7]) : NULL;
+		pack->obsolete_at = row[8] ? state_row_text(row[8], lengths[8]) : NULL;
+		if (!pack->pack_key || !pack->state || !pack->created_at ||
+		    (row[2] && !pack->idx_key) ||
+		    (row[3] && !pack->bitmap_key) ||
+		    (row[7] && !pack->sealed_at) ||
+		    (row[8] && !pack->obsolete_at)) {
+			ret = set_error(db, VEX_META_MYSQL_ERR_NOMEM,
+					"could not preserve Vex pack metadata");
+			goto out;
+		}
+	}
+	mysql_free_result(res);
+	res = NULL;
+
+	sql = vex_format("SELECT pack_id, oid FROM pack_objects "
+			 "WHERE repo_id = %s ORDER BY pack_id, oid", repo);
+	if (!sql)
+		return set_error(db, VEX_META_MYSQL_ERR_NOMEM,
+				 "could not allocate Vex pack-object preservation query");
+	ret = state_query_result(db, sql, &res);
+	free(sql);
+	if (ret)
+		return ret;
+	while ((row = mysql_fetch_row(res))) {
+		struct vex_meta_mysql_saved_pack_object *object;
+
+		lengths = mysql_fetch_lengths(res);
+		if (!row[0] || !row[1] || !lengths ||
+		    lengths[0] != VEX_META_MYSQL_OID_BYTES ||
+		    lengths[1] != VEX_META_MYSQL_OID_BYTES) {
+			ret = set_error(db, VEX_META_MYSQL_ERR,
+					"MySQL returned invalid Vex pack object metadata");
+			goto out;
+		}
+		ALLOC_GROW(packs->objects, packs->objects_nr + 1,
+			   packs->objects_alloc);
+		object = &packs->objects[packs->objects_nr++];
+		memcpy(object->pack_id, row[0], sizeof(object->pack_id));
+		memcpy(object->oid, row[1], sizeof(object->oid));
+	}
+	mysql_free_result(res);
+	return VEX_META_MYSQL_OK;
+out:
+	if (res)
+		mysql_free_result(res);
+	return ret;
+}
+
+static int state_insert_packs(struct vex_meta_mysql *db, const char *repo,
+				      const struct vex_meta_mysql_saved_packs *packs)
+{
+	size_t i;
+
+	for (i = 0; i < packs->nr; i++) {
+		const struct vex_meta_mysql_saved_pack *pack = &packs->items[i];
+		char *pack_id = sql_hex_literal(pack->pack_id, sizeof(pack->pack_id));
+		char *pack_key = pack->pack_key ?
+			sql_hex_literal(pack->pack_key, pack->pack_key_len) : NULL;
+		char *idx_key = pack->idx_key ?
+			sql_hex_literal(pack->idx_key, pack->idx_key_len) : vex_strdup("NULL");
+		char *bitmap_key = pack->bitmap_key ?
+			sql_hex_literal(pack->bitmap_key, pack->bitmap_key_len) : vex_strdup("NULL");
+		char *state = sql_quote(db, pack->state);
+		char *created_at = sql_quote(db, pack->created_at);
+		char *sealed_at = pack->sealed_at ? sql_quote(db, pack->sealed_at) :
+			vex_strdup("NULL");
+		char *obsolete_at = pack->obsolete_at ? sql_quote(db, pack->obsolete_at) :
+			vex_strdup("NULL");
+		char *sql;
+		int ret;
+
+		if (!pack_id || !pack_key || !idx_key || !bitmap_key || !state ||
+		    !created_at || !sealed_at || !obsolete_at) {
+			free(obsolete_at);
+			free(sealed_at);
+			free(created_at);
+			free(state);
+			free(bitmap_key);
+			free(idx_key);
+			free(pack_key);
+			free(pack_id);
+			return set_error(db, VEX_META_MYSQL_ERR_NOMEM,
+					 "could not encode preserved Vex pack metadata");
+		}
+		sql = vex_format("INSERT INTO pack_envelopes "
+				 "(repo_id, pack_id, pack_key, idx_key, bitmap_key, "
+				 "covering_generation, state, created_at, sealed_at, obsolete_at) "
+				 "VALUES (%s, %s, %s, %s, %s, %" PRIu64 ", %s, %s, %s, %s)",
+				 repo, pack_id, pack_key, idx_key, bitmap_key,
+				 pack->covering_generation, state, created_at, sealed_at, obsolete_at);
+		free(obsolete_at);
+		free(sealed_at);
+		free(created_at);
+		free(state);
+		free(bitmap_key);
+		free(idx_key);
+		free(pack_key);
+		free(pack_id);
+		if (!sql)
+			return set_error(db, VEX_META_MYSQL_ERR_NOMEM,
+					 "could not allocate Vex pack restore query");
+		ret = mysql_exec(db, sql);
+		free(sql);
+		if (ret)
+			return ret;
+	}
+	for (i = 0; i < packs->objects_nr; i++) {
+		const struct vex_meta_mysql_saved_pack_object *object =
+			&packs->objects[i];
+		char *pack_id = sql_hex_literal(object->pack_id,
+						       sizeof(object->pack_id));
+		char *oid = sql_hex_literal(object->oid, sizeof(object->oid));
+		char *sql;
+		int ret;
+
+		if (!pack_id || !oid) {
+			free(oid);
+			free(pack_id);
+			return set_error(db, VEX_META_MYSQL_ERR_NOMEM,
+					 "could not encode preserved Vex pack object metadata");
+		}
+		sql = vex_format("INSERT INTO pack_objects (repo_id, pack_id, oid) "
+				 "VALUES (%s, %s, %s)", repo, pack_id, oid);
+		free(oid);
+		free(pack_id);
+		if (!sql)
+			return set_error(db, VEX_META_MYSQL_ERR_NOMEM,
+					 "could not allocate Vex pack-object restore query");
+		ret = mysql_exec(db, sql);
+		free(sql);
+		if (ret)
+			return ret;
+	}
 	return VEX_META_MYSQL_OK;
 }
 
 static int state_delete_rows(struct vex_meta_mysql *db, const char *repo)
 {
 	static const char *const tables[] = {
-		"commit_parents", "object_pins", "generation_objects", "objects",
+		"commit_parents", "object_pins", "generation_objects", "pack_objects",
+		"pack_envelopes", "objects",
 		"generations", "refs", "ref_updates",
 	};
 	size_t i;
@@ -3025,6 +3264,7 @@ int vex_meta_mysql_state_save_locked(struct vex_meta_mysql *db,
 {
 	char *repo;
 	struct vex_meta_mysql_saved_pins pins = { 0 };
+	struct vex_meta_mysql_saved_packs packs = { 0 };
 	int ret;
 
 	if (!db || !db->mysql || !db->state_transaction || !repo_id || !hash_algo ||
@@ -3035,7 +3275,7 @@ int vex_meta_mysql_state_save_locked(struct vex_meta_mysql *db,
 		return set_error(db, VEX_META_MYSQL_ERR_INVALID,
 				 "invalid Vex repository UUID");
 	if ((ret = state_load_pins(db, repo, &pins)) ||
-	    (ret = state_require_no_packs(db, repo)) ||
+	    (ret = state_load_packs(db, repo, &packs)) ||
 	    (ret = state_delete_rows(db, repo)) ||
 	    (ret = state_insert_epochs(db, repo, state)) ||
 	    (ret = state_insert_objects(db, repo, repo_id, hash_algo, state)) ||
@@ -3043,12 +3283,14 @@ int vex_meta_mysql_state_save_locked(struct vex_meta_mysql *db,
 	    (ret = state_insert_commit_parents(db, repo, hash_algo, state)) ||
 	    (ret = state_insert_refs(db, repo, hash_algo, state)) ||
 	    (ret = state_insert_ref_updates(db, repo, hash_algo, state)) ||
-	    (ret = state_insert_pins(db, repo, &pins)))
+	    (ret = state_insert_pins(db, repo, &pins)) ||
+	    (ret = state_insert_packs(db, repo, &packs)))
 		goto out;
 	ret = vex_mysql_commit(db);
 	if (!ret)
 		db->state_transaction = 0;
 	out:
+	state_saved_packs_release(&packs);
 	state_saved_pins_release(&pins);
 	free(repo);
 	return ret;

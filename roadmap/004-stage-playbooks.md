@@ -340,7 +340,7 @@ Runs on local Compose ([006](006-local-docker-compose-test-environment.md)).
 
 Tasks:
 
-1. Pack spike from Stage 4 continued: sealed packs, MIDX, local mmap cache + stock bitmaps.
+1. [~] Pack spike: `scripts/vex/build-pack.sh` builds a deterministic custom-Git pack/index, uploads per-repository S3 artifacts, and records a MySQL envelope/object map. MIDX, local mmap cache, stock bitmaps, and serving remain open.
 2. Compose `bench`: seed-git-git + disk-control bare (`repack -adf` flags documented).
 3. **Long-lived** git-http only.
 4. Derived immutable packs in MinIO; covering generation in MySQL; **clone leases**.
@@ -402,7 +402,7 @@ Tasks:
 
 - Playbooks derived from 001 stages + 003 passes 02,05,13,14,16,21,25,26,28,35.
 - receive-pack quarantine/`odb_transaction` integration requirement confirmed in-tree.
-- Compose Stage 4 data plane: source-built Vex Git, MySQL metadata, and MinIO canonical bytes verified by `t1497`; `t1498` is green for the serial 20× smoke plus reconciliation and the 500-commit ramp; `t1499` is green for receive compensation; `t1500` is green for two concurrent repositories; `t1501` forces S3-promotion compensation; `t1502` hashes canonical bytes; `t1503` proves pin/mark protection; and `t1518` runs eight readers during twenty writer pushes. Hard-kill chaos, destructive pack/lease-aware sweeping, and L4 pack work remain next.
+- Compose Stage 4 data plane: source-built Vex Git, MySQL metadata, and MinIO canonical bytes verified by `t1497`; `t1498` is green for the serial 20× smoke plus reconciliation and the 500-commit ramp; `t1499` is green for receive compensation; `t1500` is green for two concurrent repositories; `t1501` forces S3-promotion compensation; `t1502` hashes canonical bytes; `t1503` proves pin/mark protection; `t1518` runs eight readers during twenty writer pushes; `t1519` covers rebase/lease/merge workflows; `t1520` verifies measurement-only p50/p90 benchmark JSON; and `t1521` builds/records a per-repository S3 pack artifact that survives a later receive. Hard-kill chaos, destructive pack/lease-aware sweeping, pack invalidation/cache/serve, and the L4 SLO remain next.
 
 ## Open Questions
 

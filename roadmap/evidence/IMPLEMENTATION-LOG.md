@@ -247,3 +247,49 @@ only metadata and MinIO/S3 remains the canonical object-byte source.
 This is still below L3 and L4: hard-kill chaos, grace-period deletion,
 pack/clone-lease roots, sealed-pack serving, `git/git` import, and clone SLOs
 remain open.
+
+## 2026-08-05 — S3 immutable pack artifact and measurement harness
+
+Added the first derived-pack artifact slice while keeping raw Git payloads
+outside MySQL:
+
+- `scripts/vex/build-pack.sh <repo.git>` uses the source-built server Git to
+  make a deterministic single-threaded full pack/index from live refs. It
+  streams both artifacts to `git/v1/<repo_uuid>/packs/<pack_id>.{pack,idx}`
+  in MinIO/S3 and writes only their keys, covering generation, and object IDs
+  to `pack_envelopes` / `pack_objects`.
+- The MySQL state-replacement adapter now retains immutable pack rows through
+  a normal stock-Git receive, instead of refusing all writes once a pack row
+  exists. This is metadata preservation, not pack-currentness or deletion.
+- `t1521` proves pack/index S3 byte placement, MySQL object membership, a
+  subsequent stock-Git push, fresh clone/`fsck`, and full S3 object scrub.
+- `t1519` adds stock-client branch collaboration coverage: rebase,
+  exact `--force-with-lease`, and a `--no-ff` integration merge.
+- `scripts/vex/bench-clone.sh` and `t1520` emit stock-Git HTTPS-vs-local
+  disk p50/p90 JSON. The artifact explicitly marks itself
+  `measurement_only:true` and `l4_success_claim:false`.
+
+Verified locally:
+
+```sh
+make -j4 VEX_MYSQL=YesPlease git vex-sweep-plan
+make -C t unit-tests && t/unit-tests/bin/unit-tests -r vex_store
+# PASS: 262/262 full unit tests; Vex store 4/4
+
+VEX_COMPOSE_NO_BUILD=1 VEX_TEST_COMPOSE_MYSQL_S3=1 \
+  make -C t T=t1519-vex-compose-mysql-s3-workflows.sh
+# PASS: 1/1
+
+VEX_COMPOSE_NO_BUILD=1 VEX_TEST_COMPOSE_MYSQL_S3=1 \
+  make -C t T=t1521-vex-compose-mysql-s3-pack-artifact.sh
+# PASS: 1/1
+
+VEX_COMPOSE_NO_BUILD=1 VEX_TEST_COMPOSE_MYSQL_S3=1 \
+  make -C t T=t1520-vex-compose-clone-benchmark.sh
+# PASS: 1/1 measurement artifact shape and stock-client clone/fsck checks
+```
+
+This does not satisfy any pack-serving or L4 checkbox. There is no
+pack invalidation on tip move, clone lease, local pack cache, bitmap/MIDX
+acceleration, direct pack stream, `git/git` fixture, or accepted clone SLO
+yet.
