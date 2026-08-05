@@ -3,6 +3,7 @@
 #include "../hex.h"
 #include "../object.h"
 #include "../odb/source-vex.h"
+#include "../odb/transaction.h"
 #include "../refs.h"
 #include "../repository.h"
 #include "../strbuf.h"
@@ -23,6 +24,8 @@ struct vex_ref_store {
 struct vex_transaction_data {
 	struct vex_epoch *epoch;
 	struct vex_ref_transaction *transaction;
+	/* Non-NULL only while receive-pack's ODB epoch is being handed off. */
+	struct odb_transaction *receive_transaction;
 };
 
 struct vex_ref_iterator_entry {
@@ -480,7 +483,18 @@ static int vex_be_transaction_prepare(struct ref_store *ref_store,
 	struct vex_transaction_data *data = xcalloc(1, sizeof(*data));
 	int ret;
 
-	ret = vex_epoch_allocate(refs->store, "git-ref", &data->epoch);
+	ret = odb_vex_receive_transaction_attach(
+		refs->base.repo->objects->transaction, refs->store, &data->epoch);
+	if (ret < 0) {
+		strbuf_addstr(err, _("unable to join Vex receive object epoch"));
+		goto fail;
+	}
+	if (ret > 0) {
+		data->receive_transaction = refs->base.repo->objects->transaction;
+		ret = 0;
+	} else {
+		ret = vex_epoch_allocate(refs->store, "git-ref", &data->epoch);
+	}
 	if (!ret)
 		ret = vex_ref_transaction_begin(refs->store, data->epoch,
 						&data->transaction);
@@ -501,8 +515,14 @@ static int vex_be_transaction_prepare(struct ref_store *ref_store,
 	return 0;
 
 fail:
-	if (data->transaction)
+	if (data->transaction) {
 		vex_ref_transaction_abort(data->transaction);
+		data->transaction = NULL;
+		if (data->receive_transaction)
+			odb_vex_receive_transaction_finish(data->receive_transaction);
+	} else if (data->receive_transaction) {
+		odb_vex_receive_transaction_abort(data->receive_transaction);
+	}
 	if (data->epoch)
 		vex_epoch_free(data->epoch);
 	free(data);
@@ -517,8 +537,14 @@ static int vex_be_transaction_abort(struct ref_store *ref_store UNUSED,
 	struct vex_transaction_data *data = transaction->backend_data;
 
 	if (data) {
-		if (data->transaction)
+		if (data->transaction) {
 			vex_ref_transaction_abort(data->transaction);
+			data->transaction = NULL;
+			if (data->receive_transaction)
+				odb_vex_receive_transaction_finish(data->receive_transaction);
+		} else if (data->receive_transaction) {
+			odb_vex_receive_transaction_abort(data->receive_transaction);
+		}
 		if (data->epoch)
 			vex_epoch_free(data->epoch);
 		free(data);
@@ -539,6 +565,8 @@ static int vex_be_transaction_finish(struct ref_store *ref_store UNUSED,
 	/* commit retains the transaction allocation; abort releases it after commit. */
 	vex_ref_transaction_abort(data->transaction);
 	data->transaction = NULL;
+	if (data->receive_transaction)
+		odb_vex_receive_transaction_finish(data->receive_transaction);
 	if (data->epoch)
 		vex_epoch_free(data->epoch);
 	free(data);

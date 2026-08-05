@@ -5,6 +5,8 @@
 
 struct odb_source_vex;
 struct vex_store;
+struct vex_epoch;
+struct odb_transaction;
 struct repository;
 
 /*
@@ -24,5 +26,19 @@ int vex_store_open_for_repository(struct repository *repo, const char *gitdir,
 
 bool odb_source_is_vex(const struct odb_source *source);
 bool repo_uses_vex_storage(const struct repository *repo);
+
+/*
+ * Receive-pack starts its Vex ODB transaction in the parent process.  These
+ * helpers let the Vex ref backend join that exact durable epoch rather than
+ * allocating a second one.  `attach` returns 1 when a Vex receive transaction
+ * was found, 0 when it was not, and a negative value on failure.
+ */
+int odb_vex_receive_transaction_attach(struct odb_transaction *transaction,
+				       struct vex_store *store,
+				       struct vex_epoch **epoch);
+void odb_vex_receive_transaction_finish(struct odb_transaction *transaction);
+void odb_vex_receive_transaction_abort(struct odb_transaction *transaction);
+bool odb_vex_receive_transaction_is_active(
+		const struct odb_transaction *transaction);
 
 #endif /* ODB_SOURCE_VEX_H */

@@ -2029,6 +2029,23 @@ cleanup:
 	strbuf_release(&err);
 }
 
+/*
+ * A Vex receive ODB transaction is terminalized by the Vex ref backend, not
+ * by the normal pre-ref object migration below.  This is also the cleanup
+ * point for a pack which passed unpacking but was rejected by connectivity,
+ * policy, or a hook before a ref transaction could join its epoch.
+ */
+static void finish_vex_receive_transaction(struct odb_transaction **transaction)
+{
+	if (!*transaction || !repo_uses_vex_storage(the_repository))
+		return;
+	if (odb_vex_receive_transaction_is_active(*transaction))
+		odb_vex_receive_transaction_abort(*transaction);
+	if (odb_transaction_commit(*transaction))
+		error(_("unable to finish Vex receive object transaction"));
+	*transaction = NULL;
+}
+
 static void execute_commands(struct command *commands,
 			     const char *unpacker_error,
 			     struct shallow_info *si,
@@ -2045,6 +2062,7 @@ static void execute_commands(struct command *commands,
 	if (unpacker_error) {
 		for (cmd = commands; cmd; cmd = cmd->next)
 			cmd->error_string = "unpacker error";
+		finish_vex_receive_transaction(&transaction);
 		return;
 	}
 
@@ -2100,6 +2118,7 @@ static void execute_commands(struct command *commands,
 			if (!cmd->error_string)
 				cmd->error_string = "pre-receive hook declined";
 		}
+		finish_vex_receive_transaction(&transaction);
 		return;
 	}
 
@@ -2109,14 +2128,17 @@ static void execute_commands(struct command *commands,
 	 */
 	for (cmd = commands; cmd && cmd->error_string; cmd = cmd->next)
 		; /* nothing */
-	if (!cmd)
+	if (!cmd) {
+		finish_vex_receive_transaction(&transaction);
 		return;
+	}
 
 	/*
 	 * Now we'll start writing out refs, which means the objects need
 	 * to be in their final positions so that other processes can see them.
 	 */
-	if (odb_transaction_commit(transaction)) {
+	if (!repo_uses_vex_storage(the_repository) &&
+	    odb_transaction_commit(transaction)) {
 		for (cmd = commands; cmd; cmd = cmd->next) {
 			if (!cmd->error_string)
 				cmd->error_string = "unable to migrate objects to permanent storage";
@@ -2139,13 +2161,15 @@ static void execute_commands(struct command *commands,
 			    (cmd->run_proc_receive || use_atomic))
 				cmd->error_string = "fail to run proc-receive hook";
 
-	if (use_atomic)
+	if (use_atomic || odb_vex_receive_transaction_is_active(transaction))
 		execute_commands_atomic(commands, si);
 	else
 		execute_commands_non_atomic(commands, si);
 
 	if (shallow_update)
 		BUG_if_skipped_connectivity_check(commands, si);
+
+	finish_vex_receive_transaction(&transaction);
 }
 
 static struct command **queue_command(struct command **tail,
@@ -2717,17 +2741,13 @@ int cmd_receive_pack(int argc,
 			/*
 			 * The receive helper is a separate process.  Files-backed ODBs
 			 * hand their quarantine directory to it through transaction.env.
-			 * Vex has no attach-an-existing-epoch API yet; allocating one here
-			 * would only leave an unused epoch when that child commits its own
-			 * Vex ODB transaction.  Let the child publish its complete object
-			 * epoch before we validate and advance refs.  A rejected push can
-			 * therefore leave only unreachable objects, never a ref to hidden
-			 * Vex data.
+			 * Vex passes an opaque, repository-bound epoch lease instead.  The
+			 * child stages objects into that parent-owned epoch; its ref backend
+			 * later joins the same epoch and seals objects, refs, and audit rows
+			 * together.  No object is published merely because unpack succeeded.
 			 */
-			if (repo_uses_vex_storage(the_repository))
-				unpack_status = unpack_with_sideband(&si, NULL);
-			else if (odb_transaction_begin(the_repository->objects, &transaction,
-						       ODB_TRANSACTION_RECEIVE))
+			if (odb_transaction_begin(the_repository->objects, &transaction,
+					  ODB_TRANSACTION_RECEIVE))
 				unpack_status = "unable to start object transaction";
 			else
 				unpack_status = unpack_with_sideband(&si, transaction);
@@ -2748,7 +2768,8 @@ int cmd_receive_pack(int argc,
 		run_update_post_hook(commands);
 		free_commands(commands);
 		string_list_clear(&push_options, 0);
-		if (auto_gc) {
+		/* Vex has no pack/maintenance adapter yet; never spawn a crashing one. */
+		if (auto_gc && !repo_uses_vex_storage(the_repository)) {
 			struct child_process proc = CHILD_PROCESS_INIT;
 
 			if (prepare_auto_maintenance(the_repository, 1, &proc)) {

@@ -124,6 +124,24 @@ int vex_blob_key(const struct vex_store *store, const struct object_id *oid,
 int vex_epoch_allocate(struct vex_store *store, const char *push_id,
 			 struct vex_epoch **epoch);
 uint64_t vex_epoch_id(const struct vex_epoch *epoch);
+
+/*
+ * Attach a process-local handle to an already-open epoch.  This is the
+ * receive-pack handoff primitive: a child that inherited the lease may stage
+ * and read only that epoch's quarantined objects, but cannot publish it on
+ * its own.  The handle must be released with vex_epoch_detach().
+ */
+int vex_epoch_attach(struct vex_store *store, uint64_t epoch_id,
+		     struct vex_epoch **epoch);
+
+/*
+ * Release a local epoch handle without changing durable epoch state.  This is
+ * used by a child process after it has staged data for its parent, and by the
+ * parent after the joined ref transaction has sealed or compensated the
+ * epoch.  Call vex_epoch_free() for an owner that should compensate an open
+ * epoch on cleanup.
+ */
+void vex_epoch_detach(struct vex_epoch *epoch);
 int vex_epoch_seal(struct vex_epoch *epoch);
 int vex_epoch_compensate(struct vex_epoch *epoch);
 void vex_epoch_free(struct vex_epoch *epoch);

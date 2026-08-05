@@ -94,6 +94,8 @@ struct vex_epoch {
 	struct vex_store *store;
 	uint64_t id;
 	int active;
+	/* An attached child must never compensate its parent's durable epoch. */
+	int owner;
 };
 
 struct vex_ref_transaction {

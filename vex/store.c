@@ -624,6 +624,7 @@ int vex_epoch_allocate(struct vex_store *store, const char *push_id,
 	epoch->store = store;
 	epoch->id = meta_epoch->id;
 	epoch->active = 1;
+	epoch->owner = 1;
 	*epoch_out = epoch;
 	vex_meta_state_release(&state);
 	return VEX_STORE_OK;
@@ -632,6 +633,44 @@ int vex_epoch_allocate(struct vex_store *store, const char *push_id,
 uint64_t vex_epoch_id(const struct vex_epoch *epoch)
 {
 	return epoch ? epoch->id : 0;
+}
+
+int vex_epoch_attach(struct vex_store *store, uint64_t epoch_id,
+		     struct vex_epoch **epoch_out)
+{
+	struct vex_meta_state state;
+	struct vex_meta_epoch *meta_epoch;
+	struct vex_epoch *epoch;
+	int ret;
+
+	if (!store || !epoch_out || !epoch_id)
+		return VEX_STORE_ERR_INVALID;
+	*epoch_out = NULL;
+	if ((ret = vex_meta_fs_load(store->meta, &state)))
+		return ret;
+	meta_epoch = find_epoch(&state, epoch_id);
+	if (!meta_epoch || meta_epoch->state != VEX_EPOCH_OPEN) {
+		ret = VEX_STORE_ERR_STATE;
+		goto out;
+	}
+	CALLOC_ARRAY(epoch, 1);
+	epoch->store = store;
+	epoch->id = epoch_id;
+	epoch->active = 1;
+	epoch->owner = 0;
+	*epoch_out = epoch;
+	ret = VEX_STORE_OK;
+out:
+	vex_meta_state_release(&state);
+	return ret;
+}
+
+void vex_epoch_detach(struct vex_epoch *epoch)
+{
+	if (!epoch)
+		return;
+	epoch->active = 0;
+	free(epoch);
 }
 
 int vex_epoch_seal(struct vex_epoch *epoch)
@@ -713,7 +752,7 @@ void vex_epoch_free(struct vex_epoch *epoch)
 {
 	if (!epoch)
 		return;
-	if (epoch->active)
+	if (epoch->active && epoch->owner)
 		vex_epoch_compensate(epoch);
 	free(epoch);
 }

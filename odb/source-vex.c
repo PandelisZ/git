@@ -10,6 +10,7 @@
 #include "odb/transaction.h"
 #include "repository.h"
 #include "strbuf.h"
+#include "strvec.h"
 
 /*
  * The Vex source deliberately keeps source.path pointed at the thin
@@ -19,11 +20,18 @@
 struct odb_source_vex {
 	struct odb_source base;
 	struct vex_store *store;
+	/* A child process's non-owning handle to the parent's receive epoch. */
+	struct vex_epoch *inherited_epoch;
 };
 
 struct odb_transaction_vex {
 	struct odb_transaction base;
 	struct vex_epoch *epoch;
+	/* The parent owns a receive-pack epoch and waits for the ref backend. */
+	unsigned int receive_handoff:1;
+	/* A receive helper attached its parent's epoch and must only detach. */
+	unsigned int inherited_handoff:1;
+	unsigned int handoff_finished:1;
 };
 
 struct odb_read_stream_vex {
@@ -120,6 +128,69 @@ static struct odb_transaction_vex *vex_source_transaction(
 	return container_of(transaction, struct odb_transaction_vex, base);
 }
 
+/*
+ * The lease is deliberately scoped to an already-selected vex:// repository.
+ * The child verifies the repository id again before attaching, so a lease
+ * cannot cross repository namespaces even when a process inherits its env.
+ */
+static int vex_source_parse_inherited_epoch(struct odb_source_vex *source,
+					     uint64_t *epoch_id)
+{
+	const char *value = getenv("GIT_VEX_EPOCH");
+	const char *repo_id;
+	char *end;
+	unsigned long long parsed;
+
+	if (!value || !*value)
+		return 0;
+	repo_id = vex_store_repo_id(source->store);
+	if (!skip_prefix(value, "v1:", &value) ||
+	    !starts_with(value, repo_id))
+		return -1;
+	value += strlen(repo_id);
+	if (*value++ != ':')
+		return -1;
+	errno = 0;
+	parsed = strtoull(value, &end, 10);
+	if (errno || !*value || *end || !parsed || parsed > UINT64_MAX)
+		return -1;
+	*epoch_id = parsed;
+	return 1;
+}
+
+static int vex_source_inherited_epoch(struct odb_source_vex *source,
+				      struct vex_epoch **epoch)
+{
+	uint64_t epoch_id;
+	int ret;
+
+	*epoch = NULL;
+	if (source->inherited_epoch) {
+		*epoch = source->inherited_epoch;
+		return 0;
+	}
+	ret = vex_source_parse_inherited_epoch(source, &epoch_id);
+	if (!ret)
+		return 0;
+	if (ret < 0 || vex_epoch_attach(source->store, epoch_id,
+					  &source->inherited_epoch))
+		return error(_("unable to attach inherited Vex receive epoch"));
+	*epoch = source->inherited_epoch;
+	return 0;
+}
+
+static int vex_source_active_epoch(struct odb_source_vex *source,
+				   struct vex_epoch **epoch)
+{
+	struct odb_transaction_vex *transaction = vex_source_transaction(source);
+
+	if (transaction) {
+		*epoch = transaction->epoch;
+		return 0;
+	}
+	return vex_source_inherited_epoch(source, epoch);
+}
+
 static int vex_source_stage_object(struct odb_source_vex *source,
 				     struct vex_epoch *epoch,
 				     const struct object_id *oid,
@@ -198,7 +269,7 @@ static int odb_source_vex_read_object_info(struct odb_source *base,
 					     enum object_info_flags flags UNUSED)
 {
 	struct odb_source_vex *source = container_of(base, struct odb_source_vex, base);
-	struct odb_transaction_vex *transaction;
+	struct vex_epoch *epoch;
 	struct vex_object_info info;
 	enum object_type type;
 	unsigned long size;
@@ -208,10 +279,11 @@ static int odb_source_vex_read_object_info(struct odb_source *base,
 	if (vex_source_open(source))
 		return -1;
 
-	transaction = vex_source_transaction(source);
+	if (vex_source_active_epoch(source, &epoch))
+		return -1;
 	if (oi && oi->contentp) {
-		if (transaction)
-			ret = vex_store_read_object_in_epoch(source->store, transaction->epoch,
+		if (epoch)
+			ret = vex_store_read_object_in_epoch(source->store, epoch,
 							     oid, &type, &size, &data);
 		else
 			ret = vex_store_read_object(source->store, oid, &type, &size, &data);
@@ -223,7 +295,7 @@ static int odb_source_vex_read_object_info(struct odb_source *base,
 
 	ret = vex_object_index_get(source->store, oid, &info);
 	if (ret || (info.state != VEX_OBJECT_PUBLISHED &&
-		    (!transaction || info.epoch != vex_epoch_id(transaction->epoch))))
+		    (!epoch || info.epoch != vex_epoch_id(epoch))))
 		return -1;
 	vex_populate_object_info(source, oi, info.type, info.size, NULL);
 	return 0;
@@ -257,7 +329,7 @@ static int odb_source_vex_read_object_stream(struct odb_read_stream **out,
 					       const struct object_id *oid)
 {
 	struct odb_source_vex *source = container_of(base, struct odb_source_vex, base);
-	struct odb_transaction_vex *transaction;
+	struct vex_epoch *epoch;
 	struct odb_read_stream_vex *stream;
 	enum object_type type;
 	unsigned long size;
@@ -266,9 +338,10 @@ static int odb_source_vex_read_object_stream(struct odb_read_stream **out,
 
 	if (vex_source_open(source))
 		return -1;
-	transaction = vex_source_transaction(source);
-	if (transaction)
-		ret = vex_store_read_object_in_epoch(source->store, transaction->epoch,
+	if (vex_source_active_epoch(source, &epoch))
+		return -1;
+	if (epoch)
+		ret = vex_store_read_object_in_epoch(source->store, epoch,
 						     oid, &type, &size, &data);
 	else
 		ret = vex_store_read_object(source->store, oid, &type, &size, &data);
@@ -321,7 +394,7 @@ static int odb_source_vex_for_each_object(struct odb_source *base,
 					     const struct odb_for_each_object_options *opts)
 {
 	struct odb_source_vex *source = container_of(base, struct odb_source_vex, base);
-	struct odb_transaction_vex *transaction;
+	struct vex_epoch *epoch;
 	struct vex_for_each_object_data data = {
 		.source = source,
 		.request = request,
@@ -335,9 +408,10 @@ static int odb_source_vex_for_each_object(struct odb_source *base,
 		return 0;
 	if (vex_source_open(source))
 		return -1;
-	transaction = vex_source_transaction(source);
+	if (vex_source_active_epoch(source, &epoch))
+		return -1;
 	ret = vex_store_for_each_object(source->store,
-					transaction ? transaction->epoch : NULL,
+					epoch,
 					opts->prefix, opts->prefix_hex_len,
 					vex_for_each_object_cb, &data);
 	if (ret < 0)
@@ -350,14 +424,15 @@ static int odb_source_vex_count_objects(struct odb_source *base,
 					  unsigned long *out)
 {
 	struct odb_source_vex *source = container_of(base, struct odb_source_vex, base);
-	struct odb_transaction_vex *transaction;
+	struct vex_epoch *epoch;
 	int ret;
 
 	if (vex_source_open(source))
 		return -1;
-	transaction = vex_source_transaction(source);
+	if (vex_source_active_epoch(source, &epoch))
+		return -1;
 	ret = vex_store_count_objects(source->store,
-				      transaction ? transaction->epoch : NULL, out);
+				      epoch, out);
 	if (ret)
 		return error(_("unable to count Vex objects"));
 	return 0;
@@ -369,14 +444,15 @@ static int odb_source_vex_find_abbrev_len(struct odb_source *base,
 					     unsigned *out)
 {
 	struct odb_source_vex *source = container_of(base, struct odb_source_vex, base);
-	struct odb_transaction_vex *transaction;
+	struct vex_epoch *epoch;
 	int ret;
 
 	if (vex_source_open(source))
 		return -1;
-	transaction = vex_source_transaction(source);
+	if (vex_source_active_epoch(source, &epoch))
+		return -1;
 	ret = vex_store_find_abbrev_len(source->store,
-					 transaction ? transaction->epoch : NULL,
+					 epoch,
 					 oid, min_length, out);
 	if (ret)
 		return error(_("unable to find Vex object abbreviation"));
@@ -388,9 +464,17 @@ static int odb_source_vex_freshen_object(struct odb_source *base,
 					    const time_t *mtime UNUSED)
 {
 	struct odb_source_vex *source = container_of(base, struct odb_source_vex, base);
+	struct vex_epoch *epoch;
+	struct vex_object_info info;
 
 	if (vex_source_open(source))
 		return 0;
+	if (vex_source_active_epoch(source, &epoch))
+		return 0;
+	if (epoch && !vex_object_index_get(source->store, oid, &info) &&
+	    (info.state == VEX_OBJECT_PUBLISHED ||
+	     info.epoch == vex_epoch_id(epoch)))
+		return 1;
 	return vex_store_has_object(source->store, oid) > 0;
 }
 
@@ -403,16 +487,17 @@ static int odb_source_vex_write_object(struct odb_source *base,
 					 enum odb_write_object_flags flags)
 {
 	struct odb_source_vex *source = container_of(base, struct odb_source_vex, base);
-	struct odb_transaction_vex *transaction;
+	struct vex_epoch *epoch;
 
 	if (vex_source_open(source))
 		return -1;
 	if (vex_store_has_object(source->store, oid) > 0)
 		return 0;
 
-	transaction = vex_source_transaction(source);
-	if (transaction)
-		return vex_source_stage_object(source, transaction->epoch, oid, type,
+	if (vex_source_active_epoch(source, &epoch))
+		return -1;
+	if (epoch)
+		return vex_source_stage_object(source, epoch, oid, type,
 						 data, size, flags);
 	return vex_source_publish_object(source, oid, type, data, size, flags);
 }
@@ -483,6 +568,29 @@ static int odb_transaction_vex_commit(struct odb_transaction *base)
 		container_of(base->source, struct odb_source_vex, base);
 	int ret;
 
+	/*
+	 * receive-pack keeps this ODB transaction open while its ref backend joins
+	 * the same epoch.  That backend has already sealed or compensated the
+	 * epoch; this final call merely releases the parent's local handle.
+	 */
+	if (transaction->inherited_handoff) {
+		vex_epoch_detach(transaction->epoch);
+		transaction->epoch = NULL;
+		return 0;
+	}
+	if (transaction->receive_handoff) {
+		if (!transaction->handoff_finished) {
+			ret = vex_epoch_compensate(transaction->epoch);
+			if (ret)
+				error(_("unable to compensate unfinished Vex receive epoch"));
+		} else {
+			ret = 0;
+		}
+		vex_epoch_detach(transaction->epoch);
+		transaction->epoch = NULL;
+		return ret;
+	}
+
 	ret = vex_blob_promote(source->store, transaction->epoch);
 	if (!ret)
 		ret = vex_object_index_publish(source->store, transaction->epoch);
@@ -497,24 +605,28 @@ static int odb_transaction_vex_commit(struct odb_transaction *base)
 	return ret;
 }
 
-static int odb_transaction_vex_env(struct odb_transaction *base UNUSED,
-					     struct strvec *env UNUSED)
+static int odb_transaction_vex_env(struct odb_transaction *base,
+					     struct strvec *env)
 {
-	/*
-	 * There is no portable process-local epoch handoff in the store API yet.
-	 * Child Git processes therefore open the same Vex repository normally;
-	 * their objects are published before a subsequent ref transaction can
-	 * advance a tip.  Receive-pack epoch handoff is completed by protocol work.
-	 */
+	struct odb_transaction_vex *transaction =
+		container_of(base, struct odb_transaction_vex, base);
+	struct odb_source_vex *source =
+		container_of(base->source, struct odb_source_vex, base);
+
+	if (transaction->receive_handoff || transaction->inherited_handoff)
+		strvec_pushf(env, "GIT_VEX_EPOCH=v1:%s:%"PRIu64,
+			     vex_store_repo_id(source->store),
+			     vex_epoch_id(transaction->epoch));
 	return 0;
 }
 
 static int odb_source_vex_begin_transaction(struct odb_source *base,
 					      struct odb_transaction **out,
-					      enum odb_transaction_flags flags UNUSED)
+					      enum odb_transaction_flags flags)
 {
 	struct odb_source_vex *source = container_of(base, struct odb_source_vex, base);
 	struct odb_transaction_vex *transaction;
+	struct vex_epoch *inherited_epoch = NULL;
 	int ret;
 
 	if (vex_source_open(source))
@@ -525,7 +637,16 @@ static int odb_source_vex_begin_transaction(struct odb_source *base,
 	transaction->base.commit = odb_transaction_vex_commit;
 	transaction->base.write_object_stream = odb_transaction_vex_write_object_stream;
 	transaction->base.env = odb_transaction_vex_env;
-	ret = vex_epoch_allocate(source->store, "git-odb", &transaction->epoch);
+	transaction->receive_handoff = !!(flags & ODB_TRANSACTION_RECEIVE);
+	ret = vex_source_inherited_epoch(source, &inherited_epoch);
+	if (!ret && inherited_epoch) {
+		/* Transfer the child's non-owning lease into its ODB transaction. */
+		transaction->epoch = inherited_epoch;
+		source->inherited_epoch = NULL;
+		transaction->inherited_handoff = 1;
+	} else if (!ret) {
+		ret = vex_epoch_allocate(source->store, "git-odb", &transaction->epoch);
+	}
 	if (ret) {
 		free(transaction);
 		return error(_("unable to allocate Vex object epoch"));
@@ -533,6 +654,70 @@ static int odb_source_vex_begin_transaction(struct odb_source *base,
 
 	*out = &transaction->base;
 	return 0;
+}
+
+static struct odb_transaction_vex *vex_receive_transaction(
+		struct odb_transaction *base)
+{
+	struct odb_source_vex *source;
+
+	if (!base || !base->source || !odb_source_is_vex(base->source))
+		return NULL;
+	source = container_of(base->source, struct odb_source_vex, base);
+	if (base->source != &source->base)
+		return NULL;
+	return container_of(base, struct odb_transaction_vex, base);
+}
+
+bool odb_vex_receive_transaction_is_active(
+		const struct odb_transaction *base)
+{
+	struct odb_transaction_vex *transaction =
+		vex_receive_transaction((struct odb_transaction *)base);
+
+	return transaction && transaction->receive_handoff &&
+		transaction->epoch &&
+		!transaction->handoff_finished;
+}
+
+int odb_vex_receive_transaction_attach(struct odb_transaction *base,
+				       struct vex_store *store,
+				       struct vex_epoch **epoch)
+{
+	struct odb_transaction_vex *transaction = vex_receive_transaction(base);
+	int ret;
+
+	if (!transaction)
+		return 0;
+	if (!transaction->receive_handoff)
+		return 0;
+	if (!store || !epoch || transaction->handoff_finished ||
+	    !transaction->epoch)
+		return -1;
+	ret = vex_epoch_attach(store, vex_epoch_id(transaction->epoch), epoch);
+	if (ret)
+		return -1;
+	return 1;
+}
+
+void odb_vex_receive_transaction_finish(struct odb_transaction *base)
+{
+	struct odb_transaction_vex *transaction = vex_receive_transaction(base);
+
+	if (transaction && transaction->receive_handoff)
+		transaction->handoff_finished = 1;
+}
+
+void odb_vex_receive_transaction_abort(struct odb_transaction *base)
+{
+	struct odb_transaction_vex *transaction = vex_receive_transaction(base);
+
+	if (!transaction || !transaction->receive_handoff ||
+	    transaction->handoff_finished)
+		return;
+	if (transaction->epoch && vex_epoch_compensate(transaction->epoch))
+		error(_("unable to compensate Vex receive epoch"));
+	transaction->handoff_finished = 1;
 }
 
 static int odb_source_vex_read_alternates(struct odb_source *base UNUSED,
@@ -551,6 +736,8 @@ static void odb_source_vex_close(struct odb_source *base)
 {
 	struct odb_source_vex *source = container_of(base, struct odb_source_vex, base);
 
+	vex_epoch_detach(source->inherited_epoch);
+	source->inherited_epoch = NULL;
 	if (source->store)
 		vex_store_close(source->store);
 	source->store = NULL;
@@ -565,6 +752,8 @@ static void odb_source_vex_free(struct odb_source *base)
 {
 	struct odb_source_vex *source = container_of(base, struct odb_source_vex, base);
 
+	vex_epoch_detach(source->inherited_epoch);
+	source->inherited_epoch = NULL;
 	if (source->store)
 		vex_store_close(source->store);
 	odb_source_release(base);
