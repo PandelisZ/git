@@ -139,6 +139,11 @@ services:
       # bounded admission limit rather than an in-memory request buffer.
       # Eight GiB admits a git/git-scale local mirror import by default.
       VEX_HTTP_MAX_REQUEST_BYTES: ${VEX_HTTP_MAX_REQUEST_BYTES:-8589934592}
+      # Per-request CGI and socket-idle bounds remain conservative by default.
+      # The git/git seeder temporarily raises both while it is importing the
+      # mirror, then restores the active values before it exits.
+      VEX_HTTP_CGI_TIMEOUT_SECONDS: ${VEX_HTTP_CGI_TIMEOUT_SECONDS:-300}
+      VEX_HTTP_IO_TIMEOUT_SECONDS: ${VEX_HTTP_IO_TIMEOUT_SECONDS:-300}
       GIT_ALLOW_HTTP: ${GIT_ALLOW_HTTP:-1}
     ports:
       - "127.0.0.1:${GIT_HTTP_PORT:-8080}:8080"
