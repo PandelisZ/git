@@ -418,7 +418,9 @@ def main() -> int:
     def stop(_signum: int, _frame: object) -> None:
         if not stopped.is_set():
             stopped.set()
-            server.shutdown()
+            # BaseServer.shutdown() waits for serve_forever() to finish, so it
+            # must not run on the serve_forever signal-handling thread.
+            threading.Thread(target=server.shutdown, daemon=True).start()
 
     signal.signal(signal.SIGINT, stop)
     signal.signal(signal.SIGTERM, stop)

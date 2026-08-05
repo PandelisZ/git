@@ -13,14 +13,14 @@ usage() {
 }
 
 server_git="$repo_root/git"
-stock_git=''
+stock_git_bin=''
 read_only=0
 keep=0
 while [ "$#" -gt 0 ]; do
 	case "$1" in
 	--git|--stock-git)
 		[ "$#" -ge 2 ] || { usage >&2; exit 2; }
-		if [ "$1" = --git ]; then server_git=$2; else stock_git=$2; fi
+		if [ "$1" = --git ]; then server_git=$2; else stock_git_bin=$2; fi
 		shift 2
 		;;
 	--read-only)
@@ -44,10 +44,17 @@ while [ "$#" -gt 0 ]; do
 done
 
 [ -x "$server_git" ] || { printf 'vex fs-http smoke: Vex Git executable not found: %s\n' "$server_git" >&2; exit 2; }
-[ -n "$stock_git" ] || stock_git=$server_git
-[ -x "$stock_git" ] || { printf 'vex fs-http smoke: stock Git executable not found: %s\n' "$stock_git" >&2; exit 2; }
+[ -n "$stock_git_bin" ] || stock_git_bin=$server_git
+[ -x "$stock_git_bin" ] || { printf 'vex fs-http smoke: stock Git executable not found: %s\n' "$stock_git_bin" >&2; exit 2; }
 command -v python3 >/dev/null || { printf '%s\n' 'vex fs-http smoke: python3 is required' >&2; exit 2; }
 command -v curl >/dev/null || { printf '%s\n' 'vex fs-http smoke: curl is required' >&2; exit 2; }
+
+# The in-tree test harness exports its build directory as GIT_EXEC_PATH.  A
+# stock client must discover its own remote helpers rather than accidentally
+# loading the in-tree helper set.
+stock_git() {
+	env -u GIT_EXEC_PATH "$stock_git_bin" "$@"
+}
 
 work=$(mktemp -d "${TMPDIR:-/tmp}/vex-fs-http-smoke.XXXXXX")
 server_pid=''
@@ -166,16 +173,16 @@ case "$health" in
 	;;
 esac
 
-"$stock_git" clone -q "$origin" "$work/client"
-actual_one=$("$stock_git" -C "$work/client" rev-parse HEAD)
+stock_git clone -q "$origin" "$work/client"
+actual_one=$(stock_git -C "$work/client" rev-parse HEAD)
 [ "$actual_one" = "$tip_one" ] || { printf '%s\n' 'vex fs-http smoke: clone did not receive Vex seed tip' >&2; exit 1; }
 
 tip_two=$(make_commit 'Vex FS smart-HTTP fetch' "$tip_one")
 vex_git update-ref refs/heads/main "$tip_two" "$tip_one"
-"$stock_git" -C "$work/client" fetch -q origin main
-actual_two=$("$stock_git" -C "$work/client" rev-parse FETCH_HEAD)
+stock_git -C "$work/client" fetch -q origin main
+actual_two=$(stock_git -C "$work/client" rev-parse FETCH_HEAD)
 [ "$actual_two" = "$tip_two" ] || { printf '%s\n' 'vex fs-http smoke: fetch did not receive the Vex tip' >&2; exit 1; }
-"$stock_git" -C "$work/client" fsck --no-progress >/dev/null
+stock_git -C "$work/client" fsck --no-progress >/dev/null
 assert_no_classic_bytes
 
 if [ "$read_only" -eq 1 ]; then
@@ -183,13 +190,13 @@ if [ "$read_only" -eq 1 ]; then
 	exit 0
 fi
 
-"$stock_git" -C "$work/client" config user.name vex-fs-stock-client
-"$stock_git" -C "$work/client" config user.email vex-fs-stock-client@example.invalid
+stock_git -C "$work/client" config user.name vex-fs-stock-client
+stock_git -C "$work/client" config user.email vex-fs-stock-client@example.invalid
 printf 'stock Git receiver check\n' >"$work/client/STOCK-PUSH"
-"$stock_git" -C "$work/client" add STOCK-PUSH
-"$stock_git" -C "$work/client" -c commit.gpgSign=false commit -q -m 'stock Git Vex FS push'
-expected_push=$("$stock_git" -C "$work/client" rev-parse HEAD)
-"$stock_git" -C "$work/client" push -q origin HEAD:refs/heads/stock-client
+stock_git -C "$work/client" add STOCK-PUSH
+stock_git -C "$work/client" -c commit.gpgSign=false commit -q -m 'stock Git Vex FS push'
+expected_push=$(stock_git -C "$work/client" rev-parse HEAD)
+stock_git -C "$work/client" push -q origin HEAD:refs/heads/stock-client
 actual_push=$(vex_git rev-parse refs/heads/stock-client)
 [ "$actual_push" = "$expected_push" ] || { printf '%s\n' 'vex fs-http smoke: Vex ref did not match stock-client push' >&2; exit 1; }
 # `git fsck` currently reaches file-ODB-only maintenance code.  Prove the
