@@ -1,0 +1,149 @@
+-- Vex metadata schema.  Raw Git object and pack bytes never belong
+-- here: they live in the blob store under git/v1/<repo_uuid>/objects/<oid>.
+
+CREATE TABLE IF NOT EXISTS repositories (
+	repo_id BINARY(16) NOT NULL,
+	name VARBINARY(255) NULL,
+	hash_algo VARCHAR(16) NOT NULL,
+	created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+	deleted_at DATETIME(6) NULL,
+	PRIMARY KEY (repo_id),
+	UNIQUE KEY repositories_name (name)
+) ENGINE=InnoDB;
+
+CREATE TABLE IF NOT EXISTS generations (
+	repo_id BINARY(16) NOT NULL,
+	generation BIGINT UNSIGNED NOT NULL,
+	state ENUM('open', 'sealed', 'sweepable', 'swept', 'aborted') NOT NULL,
+	push_id BINARY(16) NULL,
+	created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+	expires_at DATETIME(6) NULL,
+	sealed_at DATETIME(6) NULL,
+	PRIMARY KEY (repo_id, generation),
+	CONSTRAINT generations_repo_fk FOREIGN KEY (repo_id)
+		REFERENCES repositories (repo_id)
+) ENGINE=InnoDB;
+
+CREATE TABLE IF NOT EXISTS objects (
+	repo_id BINARY(16) NOT NULL,
+	oid BINARY(32) NOT NULL,
+	obj_type TINYINT UNSIGNED NOT NULL,
+	size BIGINT UNSIGNED NOT NULL,
+	-- This records a key, never object payload bytes.
+	blob_key VARBINARY(512) NOT NULL,
+	generation BIGINT UNSIGNED NOT NULL,
+	state ENUM('quarantine', 'published') NOT NULL,
+	created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+	published_at DATETIME(6) NULL,
+	PRIMARY KEY (repo_id, oid),
+	KEY objects_generation (repo_id, generation, state),
+	CONSTRAINT objects_repo_fk FOREIGN KEY (repo_id)
+		REFERENCES repositories (repo_id),
+	CONSTRAINT objects_generation_fk FOREIGN KEY (repo_id, generation)
+		REFERENCES generations (repo_id, generation)
+) ENGINE=InnoDB;
+
+-- A deduplicated object can be staged by more than one open epoch.  This
+-- relation lets compensation remove one epoch without deleting another's
+-- visibility claim; it remains metadata only.
+CREATE TABLE IF NOT EXISTS generation_objects (
+	repo_id BINARY(16) NOT NULL,
+	generation BIGINT UNSIGNED NOT NULL,
+	oid BINARY(32) NOT NULL,
+	PRIMARY KEY (repo_id, generation, oid),
+	KEY generation_objects_oid (repo_id, oid),
+	CONSTRAINT generation_objects_generation_fk FOREIGN KEY (repo_id, generation)
+		REFERENCES generations (repo_id, generation),
+	CONSTRAINT generation_objects_object_fk FOREIGN KEY (repo_id, oid)
+		REFERENCES objects (repo_id, oid)
+) ENGINE=InnoDB;
+
+CREATE TABLE IF NOT EXISTS commit_parents (
+	repo_id BINARY(16) NOT NULL,
+	commit_oid BINARY(32) NOT NULL,
+	parent_pos INT UNSIGNED NOT NULL,
+	parent_oid BINARY(32) NOT NULL,
+	PRIMARY KEY (repo_id, commit_oid, parent_pos),
+	KEY commit_parents_parent (repo_id, parent_oid),
+	CONSTRAINT commit_parents_object_fk FOREIGN KEY (repo_id, commit_oid)
+		REFERENCES objects (repo_id, oid)
+) ENGINE=InnoDB;
+
+CREATE TABLE IF NOT EXISTS refs (
+	repo_id BINARY(16) NOT NULL,
+	refname VARBINARY(1024) NOT NULL,
+	is_symbolic BOOLEAN NOT NULL DEFAULT FALSE,
+	target_oid BINARY(32) NULL,
+	symref_target VARBINARY(1024) NULL,
+	peeled_oid BINARY(32) NULL,
+	version BIGINT UNSIGNED NOT NULL,
+	updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
+		ON UPDATE CURRENT_TIMESTAMP(6),
+	PRIMARY KEY (repo_id, refname),
+	CONSTRAINT refs_repo_fk FOREIGN KEY (repo_id)
+		REFERENCES repositories (repo_id)
+) ENGINE=InnoDB;
+
+CREATE TABLE IF NOT EXISTS ref_updates (
+	repo_id BINARY(16) NOT NULL,
+	id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+	refname VARBINARY(1024) NOT NULL,
+	old_oid BINARY(32) NULL,
+	new_oid BINARY(32) NULL,
+	old_target VARBINARY(1024) NULL,
+	new_target VARBINARY(1024) NULL,
+	is_ff BOOLEAN NULL,
+	actor VARBINARY(255) NULL,
+	push_id BINARY(16) NULL,
+	reason VARCHAR(32) NOT NULL,
+	message VARBINARY(1024) NULL,
+	ts DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+	PRIMARY KEY (repo_id, id),
+	UNIQUE KEY ref_updates_id (id),
+	KEY ref_updates_ref (repo_id, refname, id),
+	CONSTRAINT ref_updates_repo_fk FOREIGN KEY (repo_id)
+		REFERENCES repositories (repo_id)
+) ENGINE=InnoDB;
+
+CREATE TABLE IF NOT EXISTS object_pins (
+	repo_id BINARY(16) NOT NULL,
+	oid BINARY(32) NOT NULL,
+	reason VARBINARY(255) NOT NULL,
+	expires_at DATETIME(6) NULL,
+	created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+	PRIMARY KEY (repo_id, oid, reason),
+	KEY object_pins_expiry (repo_id, expires_at),
+	CONSTRAINT object_pins_object_fk FOREIGN KEY (repo_id, oid)
+		REFERENCES objects (repo_id, oid)
+) ENGINE=InnoDB;
+
+-- Immutable derived-pack metadata.  The bytes and idx/bitmap payloads use
+-- blob keys; a pack never becomes a second object-byte source of truth.
+CREATE TABLE IF NOT EXISTS pack_envelopes (
+	repo_id BINARY(16) NOT NULL,
+	pack_id BINARY(32) NOT NULL,
+	pack_key VARBINARY(512) NOT NULL,
+	idx_key VARBINARY(512) NULL,
+	bitmap_key VARBINARY(512) NULL,
+	covering_generation BIGINT UNSIGNED NOT NULL,
+	state ENUM('building', 'sealed', 'obsolete', 'deleted') NOT NULL,
+	created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+	sealed_at DATETIME(6) NULL,
+	obsolete_at DATETIME(6) NULL,
+	PRIMARY KEY (repo_id, pack_id),
+	KEY pack_envelopes_covering (repo_id, state, covering_generation),
+	CONSTRAINT pack_envelopes_repo_fk FOREIGN KEY (repo_id)
+		REFERENCES repositories (repo_id)
+) ENGINE=InnoDB;
+
+CREATE TABLE IF NOT EXISTS pack_objects (
+	repo_id BINARY(16) NOT NULL,
+	pack_id BINARY(32) NOT NULL,
+	oid BINARY(32) NOT NULL,
+	PRIMARY KEY (repo_id, pack_id, oid),
+	KEY pack_objects_oid (repo_id, oid),
+	CONSTRAINT pack_objects_pack_fk FOREIGN KEY (repo_id, pack_id)
+		REFERENCES pack_envelopes (repo_id, pack_id),
+	CONSTRAINT pack_objects_object_fk FOREIGN KEY (repo_id, oid)
+		REFERENCES objects (repo_id, oid)
+) ENGINE=InnoDB;

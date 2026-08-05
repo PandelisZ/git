@@ -1786,14 +1786,14 @@ int apply_repository_format(struct repository *repo,
 			set_alternate_shallow_file(repo, shallow_file);
 	}
 
+	repo_set_ref_storage_format(repo,
+				    format->ref_storage_format,
+				    format->ref_storage_payload);
 	repo->bare_cfg = format->is_bare;
 	repo_set_hash_algo(repo, format->hash_algo);
 	repo->objects = odb_new(repo, object_directory,
 				alternate_object_directories);
 	repo_set_compat_hash_algo(repo, format->compat_hash_algo);
-	repo_set_ref_storage_format(repo,
-				    format->ref_storage_format,
-				    format->ref_storage_payload);
 	repo->repository_format_worktree_config =
 		format->worktree_config;
 	repo->repository_format_submodule_path_cfg =

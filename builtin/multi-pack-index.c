@@ -11,6 +11,7 @@
 #include "odb.h"
 #include "odb/source.h"
 #include "odb/source-files.h"
+#include "odb/source-vex.h"
 #include "replace-object.h"
 #include "repository.h"
 
@@ -418,6 +419,11 @@ int cmd_multi_pack_index(int argc,
 		OPT_END(),
 	};
 	struct option *options = parse_options_concat(builtin_multi_pack_index_options, common_opts);
+
+	if (repo_uses_vex_storage(repo)) {
+		FREE_AND_NULL(options);
+		return error(_("git multi-pack-index is not supported for Vex storage"));
+	}
 
 	disable_replace_refs();
 

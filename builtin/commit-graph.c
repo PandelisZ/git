@@ -8,6 +8,7 @@
 #include "parse-options.h"
 #include "commit-graph.h"
 #include "odb.h"
+#include "odb/source-vex.h"
 #include "progress.h"
 #include "replace-object.h"
 #include "strbuf.h"
@@ -220,7 +221,7 @@ static int git_commit_graph_write_config(const char *var, const char *value,
 }
 
 static int graph_write(int argc, const char **argv, const char *prefix,
-		       struct repository *repo UNUSED)
+		       struct repository *repo)
 {
 	struct string_list pack_indexes = STRING_LIST_INIT_DUP;
 	struct strbuf buf = STRBUF_INIT;
@@ -229,6 +230,9 @@ static int graph_write(int argc, const char **argv, const char *prefix,
 	int result = 0;
 	enum commit_graph_write_flags flags = 0;
 	struct progress *progress = NULL;
+
+	if (repo_uses_vex_storage(repo))
+		return error(_("git commit-graph write is not supported for Vex storage"));
 
 	static struct option builtin_commit_graph_write_options[] = {
 		OPT_BOOL(0, "reachable", &opts.reachable,

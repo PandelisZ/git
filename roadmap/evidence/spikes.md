@@ -38,6 +38,21 @@ No local `git/git` mirror was present in this worktree (`find . -maxdepth 4
 baseline was attempted during this spike. It must be measured later on the
 designated benchmark host and cannot support an L4 claim.
 
+## Completion — 2026-08-05
+
+The remaining Wave A3 informational measurements were run after the harness
+foundation landed:
+
+| Spike | Result | Measurement |
+|---|---|---|
+| Naive pack + bitmap | PASS | A synthetic bare repo with 10,002 objects packed with `git repack -adb --write-bitmap-index` in **0.03 s**. It produced one **679.95 KiB** pack and its matching bitmap. |
+| `git/git` source fixture | PASS | A fresh public mirror resolved to `5b2471720c93ee30e5764a19f3d3b3ae9ec9712a` with **846,402** packed objects and a **590.60 MiB** pack. |
+| Disk clone control | PASS (informational) | Default local clone took **0.10 s** because it may hardlink. The meaningful `git clone --no-local --no-checkout` transfer control took **15.03 s** on this machine. |
+
+These are single-run, local-machine measurements. They establish a reproducible
+fixture and confirm bitmap generation; they are not a GitHub comparison, an L4
+SLO result, or a Vex serving benchmark.
+
 ## Canonical-byte reconciliation
 
 The harness intentionally makes no metadata or object-store calls. Its portable

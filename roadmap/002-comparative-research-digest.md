@@ -1,10 +1,10 @@
 # Comparative Research Digest PRD
 
-**Status:** Draft  
-**Current Stage:** 0 - Research  
-**Owner:** Codex  
-**Created:** 2026-08-05  
-**Updated:** 2026-08-05  
+**Status:** Draft
+**Current Stage:** 0 - Research
+**Owner:** Codex
+**Created:** 2026-08-05
+**Updated:** 2026-08-05
 **Related:** [001-cloud-scale-git-forge-storage.md](001-cloud-scale-git-forge-storage.md), [003-adversarial-review-log.md](003-adversarial-review-log.md)
 
 ---
@@ -59,7 +59,7 @@ Bubble tables (shape): `ephemeral_bubbles(expires_at,…)`, bubble↔changeset m
 **Sources:** `odb/source.h`, `odb/source-inmemory.c`, `refs/refs-internal.h`, `setup.c`, downcast audit
 
 - Insert cloud as `odb_source` + `ref_storage_be`.
-- `extensions.refstorage=cloud://payload` already fits URI parser.
+- `extensions.refstorage=vex://payload` already fits URI parser.
 - ~59 `odb_source_files_downcast` sites → explicit cloud guards required.
 
 ### 4. GitLab Gitaly + object-storage epic
@@ -140,23 +140,23 @@ Bubble tables (shape): `ephemeral_bubbles(expires_at,…)`, bubble↔changeset m
 
 ### Must (C1–C10)
 
-1. C1 MySQL (canonical) for tips, object index, audit, generations  
-2. C2 Blob store for bytes + pack envelopes  
-3. C3 Valkey optional non-SoT  
-4. C4 Local disk scratch/cache only  
-5. C5 Native Git objects v1  
-6. C6 Push quarantine bubbles/generations  
-7. C7 No classic gc as durability  
-8. C8 Pack/bundle acceleration before perf claims  
-9. C9 Opt-in cloud mode for forge bare repos  
-10. C10 Downcast/maintenance call-site plan  
+1. C1 MySQL (canonical) for tips, object index, audit, generations
+2. C2 Blob store for bytes + pack envelopes
+3. C3 Valkey optional non-SoT
+4. C4 Local disk scratch/cache only
+5. C5 Native Git objects v1
+6. C6 Push quarantine bubbles/generations
+7. C7 No classic gc as durability
+8. C8 Pack/bundle acceleration before perf claims
+9. C9 Opt-in cloud mode for forge bare repos
+10. C10 Downcast/maintenance call-site plan
 
 ### Must not (M1–M4)
 
-1. M1 Required classic server reflog  
-2. M2 Bonsai required v1  
-3. M3 S3 LIST as index  
-4. M4 Redis durability  
+1. M1 Required classic server reflog
+2. M2 Bonsai required v1
+3. M3 S3 LIST as index
+4. M4 Redis durability
 
 ---
 
@@ -169,15 +169,15 @@ Bubble tables (shape): `ephemeral_bubbles(expires_at,…)`, bubble↔changeset m
 
 ## Additional citations (review wave 2)
 
-- Git `odb/transaction.h` / receive-pack quarantine integration (in-tree).  
-- Gitaly [object quarantine doc](https://gitlab.com/gitlab-org/gitaly/-/blob/master/doc/object_quarantine.md).  
-- Git [bundle-uri](https://git-scm.com/docs/bundle-uri); GitLab Gitaly bundle URI admin docs; [git-bundle-server](https://github.com/git-ecosystem/git-bundle-server).  
-- High-latency / many-small-files git performance reports (directional; clone/fetch sensitivity to RTT).  
-- Smart HTTP: [gitprotocol-http](https://git-scm.com/docs/gitprotocol-http), upload-pack/receive-pack — required for stock `git clone https://localhost…`.  
-- Benchmark fixture: [github.com/git/git](https://github.com/git/git) (~80k+ commits).  
-- Local verification stack: Docker Compose + MinIO-as-S3 + MySQL (PRD 006) — tests must not require real AWS.  
+- Git `odb/transaction.h` / receive-pack quarantine integration (in-tree).
+- Gitaly [object quarantine doc](https://gitlab.com/gitlab-org/gitaly/-/blob/master/doc/object_quarantine.md).
+- Git [bundle-uri](https://git-scm.com/docs/bundle-uri); GitLab Gitaly bundle URI admin docs; [git-bundle-server](https://github.com/git-ecosystem/git-bundle-server).
+- High-latency / many-small-files git performance reports (directional; clone/fetch sensitivity to RTT).
+- Smart HTTP: [gitprotocol-http](https://git-scm.com/docs/gitprotocol-http), upload-pack/receive-pack — required for stock `git clone https://localhost…`.
+- Benchmark fixture: [github.com/git/git](https://github.com/git/git) (~80k+ commits).
+- Local verification stack: Docker Compose + MinIO-as-S3 + MySQL (PRD 006) — tests must not require real AWS.
 
 ## Open Questions
 
-- [x] Bundle URI phase placement → **Stage 7 primary** (envelopes secondary)  
-- [ ] Whether to document Gitaly as deployment peer (RPC front) vs in-process only → Stage 8 daemon design  
+- [x] Bundle URI phase placement → **Stage 7 primary** (envelopes secondary)
+- [ ] Whether to document Gitaly as deployment peer (RPC front) vs in-process only → Stage 8 daemon design

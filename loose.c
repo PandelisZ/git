@@ -4,6 +4,7 @@
 #include "object-file.h"
 #include "odb.h"
 #include "odb/source-files.h"
+#include "odb/source-vex.h"
 #include "hex.h"
 #include "repository.h"
 #include "wrapper.h"
@@ -112,6 +113,9 @@ int repo_read_loose_object_map(struct repository *repo)
 
 	if (!should_use_loose_object_map(repo))
 		return 0;
+	/* Vex stores canonical object bytes and has no loose-object map. */
+	if (repo->objects && odb_source_is_vex(repo->objects->sources))
+		return 0;
 
 	odb_prepare_alternates(repo->objects);
 
@@ -126,8 +130,8 @@ int repo_read_loose_object_map(struct repository *repo)
 
 int repo_write_loose_object_map(struct repository *repo)
 {
-	struct odb_source_files *files = odb_source_files_downcast(repo->objects->sources);
-	kh_oid_map_t *map = files->loose->map->to_compat;
+	struct odb_source_files *files;
+	kh_oid_map_t *map;
 	struct lock_file lock;
 	int fd;
 	khiter_t iter;
@@ -135,6 +139,10 @@ int repo_write_loose_object_map(struct repository *repo)
 
 	if (!should_use_loose_object_map(repo))
 		return 0;
+	if (repo->objects && odb_source_is_vex(repo->objects->sources))
+		return 0;
+	files = odb_source_files_downcast(repo->objects->sources);
+	map = files->loose->map->to_compat;
 
 	repo_common_path_replace(repo, &path, "objects/loose-object-idx");
 	fd = repo_hold_lock_file_for_update_timeout(repo, &lock, path.buf,
@@ -234,6 +242,9 @@ int repo_loose_object_map_oid(struct repository *repo,
 	struct odb_source *source;
 	kh_oid_map_t *map;
 	khiter_t pos;
+
+	if (repo->objects && odb_source_is_vex(repo->objects->sources))
+		return -1;
 
 	for (source = repo->objects->sources; source; source = source->next) {
 		struct odb_source_files *files = odb_source_files_downcast(source);

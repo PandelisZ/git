@@ -14,6 +14,7 @@
 #include "hash-lookup.h"
 #include "commit-graph.h"
 #include "odb.h"
+#include "odb/source-vex.h"
 #include "oid-array.h"
 #include "path.h"
 #include "alloc.h"
@@ -2581,6 +2582,9 @@ int write_commit_graph(struct odb_source *source,
 	struct bloom_filter_settings bloom_settings = DEFAULT_BLOOM_FILTER_SETTINGS;
 	struct topo_level_slab topo_levels;
 	struct commit_graph *g;
+
+	if (odb_source_is_vex(source))
+		return error(_("commit-graph write is not supported for Vex storage"));
 
 	prepare_repo_settings(r);
 	if (!r->settings.core_commit_graph) {

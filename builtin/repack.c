@@ -14,6 +14,7 @@
 #include "promisor-remote.h"
 #include "repack.h"
 #include "shallow.h"
+#include "odb/source-vex.h"
 
 #define ALL_INTO_ONE 1
 #define LOOSEN_UNREACHABLE 2
@@ -162,6 +163,9 @@ int cmd_repack(int argc,
 	const char *opt_depth = NULL;
 	const char *opt_threads = NULL;
 	unsigned long combine_cruft_below_size = 0ul;
+
+	if (repo_uses_vex_storage(repo))
+		return error(_("git repack is not supported for Vex storage"));
 
 	struct option builtin_repack_options[] = {
 		OPT_BIT('a', NULL, &pack_everything,

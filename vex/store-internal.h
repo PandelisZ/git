@@ -1,0 +1,117 @@
+#ifndef VEX_STORE_INTERNAL_H
+#define VEX_STORE_INTERNAL_H
+
+#include "vex/store.h"
+#include "vex/blob-fs.h"
+#include "vex/meta-fs.h"
+#include "lockfile.h"
+
+struct vex_meta_fs;
+struct vex_blob_fs;
+
+enum vex_epoch_state {
+	VEX_EPOCH_OPEN = 1,
+	VEX_EPOCH_SEALED,
+	VEX_EPOCH_SWEEPABLE,
+	VEX_EPOCH_SWEPT,
+	VEX_EPOCH_ABORTED,
+};
+
+struct vex_meta_epoch {
+	uint64_t id;
+	enum vex_epoch_state state;
+	char *push_id;
+};
+
+struct vex_meta_object {
+	struct object_id oid;
+	enum object_type type;
+	unsigned long size;
+	uint64_t epoch;
+	enum vex_object_state state;
+};
+
+struct vex_meta_epoch_object {
+	uint64_t epoch;
+	struct object_id oid;
+};
+
+struct vex_meta_ref {
+	char *name;
+	struct vex_ref_target target;
+	uint64_t version;
+};
+
+struct vex_meta_ref_update {
+	uint64_t id;
+	struct vex_ref_update update;
+};
+
+struct vex_meta_commit_parent {
+	struct object_id commit_oid;
+	unsigned int position;
+	struct object_id parent_oid;
+};
+
+struct vex_meta_state {
+	uint64_t next_epoch;
+	uint64_t next_update;
+	struct vex_meta_epoch *epochs;
+	size_t epochs_nr;
+	size_t epochs_alloc;
+	struct vex_meta_object *objects;
+	size_t objects_nr;
+	size_t objects_alloc;
+	struct vex_meta_epoch_object *epoch_objects;
+	size_t epoch_objects_nr;
+	size_t epoch_objects_alloc;
+	struct vex_meta_ref *refs;
+	size_t refs_nr;
+	size_t refs_alloc;
+	struct vex_meta_ref_update *ref_updates;
+	size_t ref_updates_nr;
+	size_t ref_updates_alloc;
+	struct vex_meta_commit_parent *commit_parents;
+	size_t commit_parents_nr;
+	size_t commit_parents_alloc;
+};
+
+struct vex_meta_fs_lock {
+	struct lock_file lock;
+	int held;
+};
+
+struct vex_store {
+	enum vex_store_backend backend;
+	char *root;
+	char *repo_id;
+	const struct git_hash_algo *hash_algo;
+	struct vex_meta_fs *meta;
+	struct vex_blob_fs *blob;
+};
+
+struct vex_epoch {
+	struct vex_store *store;
+	uint64_t id;
+	int active;
+};
+
+struct vex_ref_transaction {
+	struct vex_store *store;
+	struct vex_epoch *epoch;
+	struct vex_ref_update *updates;
+	size_t updates_nr;
+	size_t updates_alloc;
+	int committed;
+};
+
+void vex_ref_target_release(struct vex_ref_target *target);
+int vex_ref_target_dup(struct vex_ref_target *dst,
+			 const struct vex_ref_target *src);
+int vex_ref_target_equal(const struct vex_ref_target *a,
+			   const struct vex_ref_target *b);
+void vex_ref_update_release(struct vex_ref_update *update);
+int vex_ref_update_dup(struct vex_ref_update *dst,
+			 const struct vex_ref_update *src);
+
+#endif /* VEX_STORE_INTERNAL_H */

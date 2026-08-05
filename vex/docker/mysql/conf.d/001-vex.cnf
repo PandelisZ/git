@@ -1,0 +1,6 @@
+[mysqld]
+# Correctness-oriented defaults for the local metadata source of truth.
+innodb_flush_log_at_trx_commit = 1
+sync_binlog = 1
+skip_name_resolve = ON
+max_connections = 200

@@ -30,6 +30,7 @@
 #include "commit-graph.h"
 #include "packfile.h"
 #include "object-file.h"
+#include "odb/source-vex.h"
 #include "pack.h"
 #include "pack-objects.h"
 #include "path.h"
@@ -844,7 +845,7 @@ static int gc_foreground_tasks(struct maintenance_run_opts *opts,
 int cmd_gc(int argc,
 	   const char **argv,
 	   const char *prefix,
-	   struct repository *repo UNUSED)
+	   struct repository *repo)
 {
 	int aggressive = 0;
 	int force = 0;
@@ -890,6 +891,9 @@ int cmd_gc(int argc,
 			   N_("skip maintenance tasks typically done in the foreground")),
 		OPT_END()
 	};
+
+	if (repo_uses_vex_storage(repo))
+		return error(_("git gc is not supported for Vex storage"));
 
 	show_usage_with_options_if_asked(argc, argv,
 					 builtin_gc_usage, builtin_gc_options);

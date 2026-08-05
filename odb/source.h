@@ -23,6 +23,9 @@ enum odb_source_type {
 
 	/* The "in-memory" backend that stores objects in memory. */
 	ODB_SOURCE_INMEMORY,
+
+	/* The experimental Vex backend. */
+	ODB_SOURCE_VEX,
 };
 
 struct object_id;

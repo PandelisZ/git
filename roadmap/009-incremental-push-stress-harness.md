@@ -1,10 +1,10 @@
 # Incremental Push Stress Harness PRD
 
-**Status:** Draft  
-**Current Stage:** 0 - Harness design  
-**Owner:** Codex  
-**Created:** 2026-08-05  
-**Updated:** 2026-08-05  
+**Status:** Active
+**Current Stage:** Harness foundation — Vex target pending
+**Owner:** Codex
+**Created:** 2026-08-05
+**Updated:** 2026-08-05
 **Related:** [001](001-cloud-scale-git-forge-storage.md), [004](004-stage-playbooks.md), [005](005-stock-client-verification-and-benchmark.md), [006](006-local-docker-compose-test-environment.md)
 
 ---
@@ -15,33 +15,44 @@
 
 Current verification overweights:
 
-1. **Cold full clone** (read path / pack serve)  
+1. **Cold full clone** (read path / pack serve)
 2. **One-shot mirror push** (`git push --mirror` of entire history)
 
 Real forge load is mostly **many small receive-pack transactions**: 1 commit, a few commits, a branch tip move, tags, force-with-lease. A system can pass clone SLO and still die on:
 
-- quarantine open/commit/abort churn  
-- dual-write staging promote per push  
-- ref CAS + `ref_updates` write amp  
-- pack invalidation / debounced rebuild thrash  
-- commit_parents extraction latency  
-- MySQL connection behavior under thousands of short pushes  
+- quarantine open/commit/abort churn
+- dual-write staging promote per push
+- ref CAS + `ref_updates` write amp
+- pack invalidation / debounced rebuild thrash
+- commit_parents extraction latency
+- MySQL connection behavior under thousands of short pushes
 
 ### Goals
 
-1. Start from an **empty** cloud-backed bare repo.  
-2. Replay history from a **source fixture** (default: local mirror of `github.com/git/git`) by pushing commits **1-by-1 or in tunable batches**.  
-3. Use **stock `git` only** on the wire (no custom push protocol).  
-4. Produce **shareable, resumable, metric-rich** runs on Docker Compose.  
-5. Stress **commit/push flow**, not only clone/mirror-import.  
+1. Start from an **empty** Vex-backed bare repo.
+2. Replay history from a **source fixture** (default: local mirror of `github.com/git/git`) by pushing commits **1-by-1 or in tunable batches**.
+3. Use **stock `git` only** on the wire (no custom push protocol).
+4. Produce **shareable, resumable, metric-rich** runs on Docker Compose.
+5. Stress **commit/push flow**, not only clone/mirror-import.
 6. Remain PoC-scoped: no tenancy/auth product (shared compose push password OK).
 
 ### Non-goals
 
-- Replacing the L4 clone SLO (complementary).  
-- Perfect recreation of GitHub’s exact push traffic mix.  
-- Multi-tenant concurrent auth matrices.  
+- Replacing the L4 clone SLO (complementary).
+- Perfect recreation of GitHub’s exact push traffic mix.
+- Multi-tenant concurrent auth matrices.
 - Reimplementing `git` pack negotiation in the harness (shell out to git).
+
+### Implemented boundary (2026-08-05)
+
+The plan/run/verify implementation and smoke/ramp/chaos profiles are
+committed. `test-plan-determinism.sh` and `test-classic-bare.sh` passed; the
+latter performed 20/20 stock-Git batch=1 pushes with a fresh-fetch and
+`git fsck --full` reconciliation.
+
+That target is intentionally a temporary classic bare repository. The same
+smoke remains a required gate against the Vex receiver, and this baseline does
+not claim epoch compensation, blob durability, or a Vex performance number.
 
 ---
 
@@ -57,9 +68,9 @@ SOURCE (read-only)              HARNESS                         TARGET (cloud ba
 
 The harness never speaks MySQL/S3. It only:
 
-1. Reads source history with stock git.  
-2. Maintains a **driver work clone** bound to `ORIGIN`.  
-3. Advances `refs/heads/main` (or configured branch) by **fetching objects from source** into the driver and **pushing** to ORIGIN.  
+1. Reads source history with stock git.
+2. Maintains a **driver work clone** bound to `ORIGIN`.
+3. Advances `refs/heads/main` (or configured branch) by **fetching objects from source** into the driver and **pushing** to ORIGIN.
 4. Optionally runs concurrent readers (clone/fetch) against ORIGIN.
 
 ---
@@ -69,9 +80,9 @@ The harness never speaks MySQL/S3. It only:
 ### Layout (implement later)
 
 ```text
-scripts/cloud/
+scripts/vex/
   push-stress.sh              # CLI entry
-t/cloud/push-stress/
+t/vex/push-stress/
   README.md
   plan.py                     # or plan.sh — build batch plan from source
   run.sh                      # execute plan
@@ -81,7 +92,7 @@ t/cloud/push-stress/
     metrics.sh
   profiles/
     smoke.env                 # batch=1, max_commits=20
-    ramp.env                  # 1, then 2,4,8,... 
+    ramp.env                  # 1, then 2,4,8,...
     steady-8.env              # batch=8 through first N commits
     git-git-1by1.env          # batch=1, first-parent full (long)
     git-git-batches.env       # batch=50 first-parent
@@ -95,7 +106,7 @@ t/cloud/push-stress/
 ### CLI surface
 
 ```sh
-scripts/cloud/push-stress.sh \
+scripts/vex/push-stress.sh \
   --source /mirror/git.git \
   --origin https://localhost:8443/stress/git-replay.git \
   --profile profiles/ramp.env \
@@ -122,23 +133,23 @@ All knobs also via env file (`PUSH_STRESS_*`).
 
 | Input | Default |
 |-------|---------|
-| `--source` | `$CLOUD_GIT_MIRROR` or `cloud/docker/volumes/git-mirror/git.git` |
+| `--source` | `$VEX_GIT_MIRROR` or `vex/docker/volumes/git-mirror/git.git` |
 | Tip | `source/HEAD` → default branch |
 | Object set | commits along chosen order, each with full tree closure needed for push |
 
 ### Order modes
 
-1. **`first-parent`** (default for long runs)  
-   - Walk `rev-list --first-parent --reverse HEAD`  
-   - Simulates “mainline landing” stream  
-   - Cheaper, still ~tens of thousands of steps on git/git  
+1. **`first-parent`** (default for long runs)
+   - Walk `rev-list --first-parent --reverse HEAD`
+   - Simulates “mainline landing” stream
+   - Cheaper, still ~tens of thousands of steps on git/git
 
-2. **`topo`**  
-   - `rev-list --topo-order --reverse HEAD`  
-   - Includes merge commits with side history as dependencies appear  
-   - Heavier; better coverage of merge pushes  
+2. **`topo`**
+   - `rev-list --topo-order --reverse HEAD`
+   - Includes merge commits with side history as dependencies appear
+   - Heavier; better coverage of merge pushes
 
-3. **`explicit`**  
+3. **`explicit`**
    - File of OIDs or refs (for tiny synthetic fixtures)
 
 ### Batching modes
@@ -151,8 +162,8 @@ All knobs also via env file (`PUSH_STRESS_*`).
 | `list` | Comma list e.g. `1,1,1,10,50,1` cycling |
 | `bytes-cap` | Grow batch until estimated new objects exceed `--max-objects-per-push` (optional advanced) |
 
-**Batch = 1** is the primary stress for quarantine/ref CAS.  
-**Batch = 50–200** stresses medium receive-pack.  
+**Batch = 1** is the primary stress for quarantine/ref CAS.
+**Batch = 50–200** stresses medium receive-pack.
 **Occasional large batch** (e.g. 1000) optional via list mode — still not full-mirror unless configured.
 
 ### Plan artifact (`plan.jsonl`)
@@ -189,8 +200,8 @@ git -C "$WORK" fetch src --filter=blob:none   # or full fetch once into driver
 
 Avoid clever partial clones for the harness itself:
 
-1. **Once:** `git clone --mirror $SOURCE_URL /mirror/git.git` (or use existing).  
-2. **Driver repo** starts empty, `origin` = cloud ORIGIN.  
+1. **Once:** `git clone --mirror $SOURCE_URL /mirror/git.git` (or use existing).
+2. **Driver repo** starts empty, `origin` = cloud ORIGIN.
 3. For each plan step with `want_tip`:
 
 ```sh
@@ -204,7 +215,7 @@ git -C "$WORK" update-ref refs/heads/$BRANCH "$want_tip"
 git -C "$WORK" push origin "refs/heads/$BRANCH:$refs/heads/$BRANCH"
 ```
 
-For **batch size 1**, each push is one new commit (+ trees/blobs not yet on server).  
+For **batch size 1**, each push is one new commit (+ trees/blobs not yet on server).
 For **batch size N**, tip jumps N first-parent commits; one receive-pack sends all missing objects.
 
 **Empty → first push:** allow unborn → first commit (`--set-upstream`).
@@ -215,7 +226,7 @@ Harness must use ORIGIN as the cloud server under test; source is local disk don
 
 ### Alternate implementation: bundle slices
 
-For each batch, `git bundle create step.bundle $base..$want` then `git fetch bundle && git push`.  
+For each batch, `git bundle create step.bundle $base..$want` then `git fetch bundle && git push`.
 More moving parts; **OID fetch + update-ref + push** is enough for PoC.
 
 ---
@@ -287,16 +298,16 @@ On `--resume`, skip plan lines `i < next_i`, confirm `origin/BRANCH == last_ok_t
 
 Optional with `GIT_TRACE2_EVENT` parse:
 
-- `receive-pack` wall on server if logs mounted  
+- `receive-pack` wall on server if logs mounted
 - objects offered/negotiated (best-effort from trace)
 
 ### Summary (`summary.json`)
 
-- total pushes, commits, wall time  
-- p50/p90/p99 `dt_ms` overall and by batch size  
-- failures, retries  
-- commits/s, pushes/s  
-- tip match final `origin` vs plan last want  
+- total pushes, commits, wall time
+- p50/p90/p99 `dt_ms` overall and by batch size
+- failures, retries
+- commits/s, pushes/s
+- tip match final `origin` vs plan last want
 - optional: clone time of ORIGIN after run (links to read-path after write stress)
 
 ---
@@ -404,12 +415,12 @@ PUSH_STRESS_READERS=4
 ## Compose integration
 
 ```sh
-scripts/cloud/up.sh
-scripts/cloud/seed-empty-repo.sh stress/git-replay   # empty cloud bare
+scripts/vex/up.sh
+scripts/vex/seed-empty-repo.sh stress/git-replay   # empty cloud bare
 # mirror once if needed
-scripts/cloud/ensure-git-git-mirror.sh
+scripts/vex/ensure-git-git-mirror.sh
 
-scripts/cloud/push-stress.sh --profile t/cloud/push-stress/profiles/smoke.env
+scripts/vex/push-stress.sh --profile t/vex/push-stress/profiles/smoke.env
 
 # after write stress, optional read SLO sample
 git clone https://localhost:8443/stress/git-replay.git /tmp/after
@@ -467,27 +478,27 @@ Document hardware. Soft only until calibrated (Wave 5 perf agent):
 
 ## Failure injection modes
 
-1. **`kill_every`** — SIGKILL driver `git push` child mid-transfer  
-2. **`pause_ms` + restart server container** every N pushes  
-3. **`network_delay`** (optional `tc` in compose profile)  
-4. **Reader stampede** — 20 fetchers during batch=1 stream  
-5. **`fault_inject`** (server-side or proxy, Wave 5): after N pushes, force MinIO 503 / MySQL rollback / delay between blob promote and ref CAS — harness asserts tip unchanged and recon clean  
+1. **`kill_every`** — SIGKILL driver `git push` child mid-transfer
+2. **`pause_ms` + restart server container** every N pushes
+3. **`network_delay`** (optional `tc` in compose profile)
+4. **Reader stampede** — 20 fetchers during batch=1 stream
+5. **`fault_inject`** (server-side or proxy, Wave 5): after N pushes, force MinIO 503 / MySQL rollback / delay between blob promote and ref CAS — harness asserts tip unchanged and recon clean
 6. **`concurrent_drivers`** — K parallel push-stress workers on **different branches** (optional profile; not default CI)
 
 ### Anti-cheat (W5-5)
 
-- `summary.json` must embed `plan_sha256` and count of metrics lines with `push_exit` present.  
-- Resume refused if server tip ≠ checkpoint.  
-- CI fails if `dt_ms` all zeros or pushes &lt; plan steps without errors.  
+- `summary.json` must embed `plan_sha256` and count of metrics lines with `push_exit` present.
+- Resume refused if server tip ≠ checkpoint.
+- CI fails if `dt_ms` all zeros or pushes &lt; plan steps without errors.
 
 ---
 
 ## Implementation notes (when coding)
 
-- Language: `bash` + `python3` for plan/metrics is fine; keep push as subprocess `git`.  
-- Do not parse packfiles in harness.  
-- Prefer `GIT_TRACE2_EVENT` to files per step for debug profiles.  
-- Ensure `http.sslCAInfo` set for compose TLS like other tests.  
+- Language: `bash` + `python3` for plan/metrics is fine; keep push as subprocess `git`.
+- Do not parse packfiles in harness.
+- Prefer `GIT_TRACE2_EVENT` to files per step for debug profiles.
+- Ensure `http.sslCAInfo` set for compose TLS like other tests.
 - Windows: out of scope for harness v1 (Linux/macOS).
 
 ---
@@ -505,14 +516,14 @@ Document hardware. Soft only until calibrated (Wave 5 perf agent):
 
 ## Acceptance (design → impl)
 
-- [ ] Plan from git/git first-parent produces deterministic `plan.jsonl`  
-- [ ] Empty ORIGIN + batch=1 pushes 20 commits; tip matches  
-- [ ] batch=50 jumps tip by 50; one receive-pack per step  
-- [ ] resume works after Ctrl-C  
-- [ ] chaos kill does not publish tip without objects  
-- [ ] metrics.jsonl + summary.json emitted  
-- [ ] Documented in `t/cloud/push-stress/README.md`  
-- [ ] Wired in 005 as write-path stress alongside clone SLO  
+- [ ] Plan from git/git first-parent produces deterministic `plan.jsonl`
+- [ ] Empty ORIGIN + batch=1 pushes 20 commits; tip matches
+- [ ] batch=50 jumps tip by 50; one receive-pack per step
+- [ ] resume works after Ctrl-C
+- [ ] chaos kill does not publish tip without objects
+- [ ] metrics.jsonl + summary.json emitted
+- [ ] Documented in `t/vex/push-stress/README.md`
+- [ ] Wired in 005 as write-path stress alongside clone SLO
 
 ---
 
@@ -520,11 +531,11 @@ Document hardware. Soft only until calibrated (Wave 5 perf agent):
 
 ### 2026-08-05
 
-- User request: harness from empty repo; push 1-by-1 or tunable batches from git/git; stress commit/push flow not only clone/big push.  
+- User request: harness from empty repo; push 1-by-1 or tunable batches from git/git; stress commit/push flow not only clone/big push.
 - Complements 005 clone SLO and mirror import path.
 
 ## Open Questions
 
-- [ ] Default branch name when replaying ancient git/git (`master` vs `main`) — follow source HEAD  
-- [ ] Whether topo-order merge batches need special “push merge with parents already present” asserts (yes if topo enabled)  
-- [ ] Soft latency budgets calibration hardware  
+- [ ] Default branch name when replaying ancient git/git (`master` vs `main`) — follow source HEAD
+- [ ] Whether topo-order merge batches need special “push merge with parents already present” asserts (yes if topo enabled)
+- [ ] Soft latency budgets calibration hardware

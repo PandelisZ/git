@@ -1,10 +1,10 @@
 # Stock Client Verification & git/git Benchmark PRD
 
-**Status:** Draft  
-**Current Stage:** 0 - Verification design  
-**Owner:** Codex  
-**Created:** 2026-08-05  
-**Updated:** 2026-08-05  
+**Status:** Draft
+**Current Stage:** 0 - Verification design
+**Owner:** Codex
+**Created:** 2026-08-05
+**Updated:** 2026-08-05
 **Related:** [001](001-cloud-scale-git-forge-storage.md), [004](004-stage-playbooks.md)
 
 ---
@@ -102,9 +102,9 @@ Split local vs remote (important):
 
 Let:
 
-- \(T_{gh}\) = cold wall-clock time of  
+- \(T_{gh}\) = cold wall-clock time of
   `git clone --progress https://github.com/git/git /tmp/gh-git-$$`
-- \(T_{us}\) = cold wall-clock time of  
+- \(T_{us}\) = cold wall-clock time of
   `git clone --progress https://localhost:<port>/git/git.git /tmp/us-git-$$`
 
 **Pass condition (primary):**
@@ -113,7 +113,7 @@ Let:
 T_us <= 1.5 * T_gh
 ```
 
-Interpretation of user wording *“within 50% of the performance boundary of doing a git clone from github”*: **no more than 50% slower than GitHub** (1.5×).  
+Interpretation of user wording *“within 50% of the performance boundary of doing a git clone from github”*: **no more than 50% slower than GitHub** (1.5×).
 If product later wants the looser “at least half as fast” (2.0×), that is a conscious waiver — **not** the default.
 
 ### Benchmark repository
@@ -138,34 +138,34 @@ All functional verification and the **reproducible** benchmark path run against 
 | Git HTTPS | `git-http` service on `localhost:8443` | 006 |
 
 ```sh
-scripts/cloud/up.sh                  # compose up --wait
-scripts/cloud/seed-git-git.sh        # mirror import
-t/cloud/compat-stock-client.sh
-scripts/cloud/bench-clone.sh         # SLO harness
+scripts/vex/up.sh                  # compose up --wait
+scripts/vex/seed-git-git.sh        # mirror import
+t/vex/compat-stock-client.sh
+scripts/vex/bench-clone.sh         # SLO harness
 ```
 
-- **No AWS account** required for merge gates.  
-- Same `meta-mysql` + `blob-s3` code paths as production (endpoint = MinIO).  
-- Shareable: committed `cloud/docker/compose.yaml` + scripts.  
-- Resettable: `scripts/cloud/reset.sh` → `down -v && up && seed`.
+- **No AWS account** required for merge gates.
+- Same `meta-mysql` + `blob-s3` code paths as production (endpoint = MinIO).
+- Shareable: committed `vex/docker/compose.yaml` + scripts.
+- Resettable: `scripts/vex/reset.sh` → `down -v && up && seed`.
 
 ### Methodology (must be automated)
 
-1. **Machine:** fixed bench host **or** any Docker-capable laptop; document CPU, RAM, disk, Docker version.  
-2. **Stack:** Compose project `gitcloud` healthy (006); pin image tags.  
-3. **Client:** same `git --version` for all clones; stock git only.  
-4. **Cold client:** new target dir each run; no existing repo.  
-5. **Server modes:**  
-   - **A. Cold process cache** (restart `git-http` container / drop LRU)  
-   - **B. Warm server cache** (steady-state after one warmup clone)  
-   **Primary SLO uses mode B (warm server, cold client).**  
-   **Secondary report mode A.**  
-6. **Network:**  
-   - \(T_{us}\), \(T_{disk}\): localhost → Compose HTTPS (loopback).  
-   - \(T_{gh}\): real network to `github.com` when `BENCH_INCLUDE_GITHUB=1` (release bench / optional nightly).  
-7. **Runs:** N≥5; report p50 and p95.  
-8. **Integrity:** `HEAD` match, `git fsck` clean.  
-9. **Artifact:** JSON under `t/cloud/out/` or `roadmap/evidence/` (bench script).  
+1. **Machine:** fixed bench host **or** any Docker-capable laptop; document CPU, RAM, disk, Docker version.
+2. **Stack:** Compose project `gitcloud` healthy (006); pin image tags.
+3. **Client:** same `git --version` for all clones; stock git only.
+4. **Cold client:** new target dir each run; no existing repo.
+5. **Server modes:**
+   - **A. Cold process cache** (restart `git-http` container / drop LRU)
+   - **B. Warm server cache** (steady-state after one warmup clone)
+   **Primary SLO uses mode B (warm server, cold client).**
+   **Secondary report mode A.**
+6. **Network:**
+   - \(T_{us}\), \(T_{disk}\): localhost → Compose HTTPS (loopback).
+   - \(T_{gh}\): real network to `github.com` when `BENCH_INCLUDE_GITHUB=1` (release bench / optional nightly).
+7. **Runs:** N≥5; report p50 and p95.
+8. **Integrity:** `HEAD` match, `git fsck` clean.
+9. **Artifact:** JSON under `t/vex/out/` or `roadmap/evidence/` (bench script).
 10. **CI vs laptop:** CI **must** run disk-gate + functional; GitHub-gate required on designated bench host before claiming L4 release.
 
 ### Fairness & anti-cheat rules
@@ -179,11 +179,11 @@ scripts/cloud/bench-clone.sh         # SLO harness
 
 **RTT fairness addendum:** Loopback vs `github.com` is not equal RTT. To prevent empty bragging:
 
-- Always publish \(T_{gh}\), \(T_{us}\), and **bytes transferred**.  
-- Additionally run **same-LAN control**: clone from a **classic bare git/git on local disk** via same HTTPS frontend (`T_disk`).  
-- **Structural efficiency gate:** `T_us <= 1.5 * T_disk` on same host/frontend.  
-  This proves cloud backend overhead is within 50% of disk git over the same protocol stack.  
-- **Product gate (user-facing):** still `T_us <= 1.5 * T_gh` from the bench host.  
+- Always publish \(T_{gh}\), \(T_{us}\), and **bytes transferred**.
+- Additionally run **same-LAN control**: clone from a **classic bare git/git on local disk** via same HTTPS frontend (`T_disk`).
+- **Structural efficiency gate:** `T_us <= 1.5 * T_disk` on same host/frontend.
+  This proves cloud backend overhead is within 50% of disk git over the same protocol stack.
+- **Product gate (user-facing):** still `T_us <= 1.5 * T_gh` from the bench host.
 
 Both gates must pass for **L4 complete**.
 
@@ -345,10 +345,10 @@ Run F1–F3 with stock git **2.39, 2.42, 2.45** (or platform equivalents) agains
 
 ```sh
 # empty cloud bare + replay source history with stock git pushes
-scripts/cloud/push-stress.sh --profile t/cloud/push-stress/profiles/smoke.env
-scripts/cloud/push-stress.sh --profile t/cloud/push-stress/profiles/ramp.env
+scripts/vex/push-stress.sh --profile t/vex/push-stress/profiles/smoke.env
+scripts/vex/push-stress.sh --profile t/vex/push-stress/profiles/ramp.env
 # optional soak:
-# scripts/cloud/push-stress.sh --profile t/cloud/push-stress/profiles/steady-1.env
+# scripts/vex/push-stress.sh --profile t/vex/push-stress/profiles/steady-1.env
 ```
 
 See [009](009-incremental-push-stress-harness.md). Complements clone SLO (read path).
@@ -386,7 +386,7 @@ Hitting ≤1.5× GitHub on git/git **will not** happen with naïve per-oid S3 GE
 git clone --mirror https://github.com/git/git git.git
 # push mirror into cloud-backed bare (once receive-pack + auth exist)
 git --git-dir=git.git push --mirror https://localhost:<port>/git/git.git
-# or server-side importer reading mirror packs into cloud_store
+# or server-side importer reading mirror packs into vex_store
 ```
 
 Verification:
@@ -406,27 +406,27 @@ Document at import: commit count, object count, uncompressed/compressed pack siz
 
 ## Automated harness sketch (Compose-backed)
 
-All harnesses assume `scripts/cloud/up.sh` already succeeded (or they call it).
+All harnesses assume `scripts/vex/up.sh` already succeeded (or they call it).
 
-`scripts/cloud/bench-clone.sh` → wraps `t/cloud/perf-clone-git-git.sh` (Stage 7+):
+`scripts/vex/bench-clone.sh` → wraps `t/vex/perf-clone-git-git.sh` (Stage 7+):
 
-1. Resolve from env/compose: `US_URL` (cloud), `DISK_URL` (classic bare on same front), optional `GH_URL`.  
-2. Discard 1 warmup clone; time N≥5 (prefer ≥10) cold-client clones.  
-3. Emit JSON with **required fields**:  
-   `benchmark_id, timestamp_utc, git_commit, manifest_seed, compose_hash, n_trials, trials[], p50_wall_s, p90_wall_s, p99_wall_s, cv, baselines, ratios, env, optional_github_gate`.  
-4. Fail if CV>15% (unstable) or gates fail.  
-5. `--require-github` for full L4 release; CI uses disk gate only.  
-6. Publish **raw trials** (no best-of cherry-pick).  
+1. Resolve from env/compose: `US_URL` (cloud), `DISK_URL` (classic bare on same front), optional `GH_URL`.
+2. Discard 1 warmup clone; time N≥5 (prefer ≥10) cold-client clones.
+3. Emit JSON with **required fields**:
+   `benchmark_id, timestamp_utc, git_commit, manifest_seed, compose_hash, n_trials, trials[], p50_wall_s, p90_wall_s, p99_wall_s, cv, baselines, ratios, env, optional_github_gate`.
+4. Fail if CV>15% (unstable) or gates fail.
+5. `--require-github` for full L4 release; CI uses disk gate only.
+6. Publish **raw trials** (no best-of cherry-pick).
 
-`t/cloud/compat-stock-client.sh`:
+`t/vex/compat-stock-client.sh`:
 
-1. Run F1–F8 (F9 soft) against `$GIT_CLOUD_ORIGIN`.  
-2. Fail on any non-zero.  
+1. Run F1–F8 (F9 soft) against `$GIT_VEX_ORIGIN`.
+2. Fail on any non-zero.
 3. Use `http.sslCAInfo` pointing at compose dev CA when HTTPS.
 
-`t/cloud/integration-mysql-minio.sh`:
+`t/vex/integration-mysql-minio.sh`:
 
-1. Verify MySQL schema reachable and MinIO bucket non-empty after seed.  
+1. Verify MySQL schema reachable and MinIO bucket non-empty after seed.
 2. `git ls-remote` + tiny push/clone round-trip.
 
 ---
@@ -462,14 +462,14 @@ All harnesses assume `scripts/cloud/up.sh` already succeeded (or they call it).
 
 ### 2026-08-05
 
-- User verification criteria captured: stock client only; full workflows; ≤50% of GitHub clone boundary; benchmark `github.com/git/git`.  
-- Protocol surface: smart HTTP upload-pack/receive-pack (upstream docs).  
-- Industry: GitHub clone performance depends on packed representation + edge caching — forces L4 pack/bundle/bitmap work as acceptance, not stretch.  
+- User verification criteria captured: stock client only; full workflows; ≤50% of GitHub clone boundary; benchmark `github.com/git/git`.
+- Protocol surface: smart HTTP upload-pack/receive-pack (upstream docs).
+- Industry: GitHub clone performance depends on packed representation + edge caching — forces L4 pack/bundle/bitmap work as acceptance, not stretch.
 - **Local Docker Compose** mandated for MySQL + MinIO (+ Valkey) tests/benchmarks (user follow-up; PRD 006).
 
 ## Open Questions
 
-- [ ] SSH in L4 gate or HTTPS-only? Recommendation: **HTTPS required**, SSH soon after.  
-- [ ] Auth mode for push tests (basic, mTLS, unix socket)? Recommendation for compose: **HTTP basic** or push over loopback with test hook auth.  
-- [ ] Exact default branch name at import time (`master` vs `main`) follow GitHub HEAD.  
-- [ ] Whether protocol v2 + bundle-uri may be enabled by default on server advertisement.  
+- [ ] SSH in L4 gate or HTTPS-only? Recommendation: **HTTPS required**, SSH soon after.
+- [ ] Auth mode for push tests (basic, mTLS, unix socket)? Recommendation for compose: **HTTP basic** or push over loopback with test hook auth.
+- [ ] Exact default branch name at import time (`master` vs `main`) follow GitHub HEAD.
+- [ ] Whether protocol v2 + bundle-uri may be enabled by default on server advertisement.

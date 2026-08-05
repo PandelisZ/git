@@ -1,4 +1,6 @@
 #include "git-compat-util.h"
+#include "repository.h"
+#include "odb/source-vex.h"
 #include "object-file.h"
 #include "odb/source-files.h"
 #include "odb/source.h"
@@ -8,6 +10,8 @@ struct odb_source *odb_source_new(struct object_database *odb,
 				  const char *path,
 				  bool local)
 {
+	if (odb->repo->ref_storage_format == REF_STORAGE_FORMAT_VEX)
+		return odb_source_vex_new(odb, path, local);
 	return &odb_source_files_new(odb, path, local)->base;
 }
 

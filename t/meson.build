@@ -27,6 +27,7 @@ clar_test_suites = [
   'unit-tests/u-trailer.c',
   'unit-tests/u-urlmatch-normalization.c',
   'unit-tests/u-utf8-width.c',
+  'unit-tests/u-vex-store.c',
 ]
 
 clar_sources = [
@@ -229,6 +230,7 @@ integration_tests = [
   't1465-refs-update.sh',
   't1466-refs-create.sh',
   't1467-refs-rename.sh',
+  't1490-vex-storage.sh',
   't1500-rev-parse.sh',
   't1501-work-tree.sh',
   't1502-rev-parse-parseopt.sh',
@@ -1128,6 +1130,7 @@ integration_tests = [
   't9902-completion.sh',
   't9903-bash-prompt.sh',
   't9904-url-parse.sh',
+  't9905-vex-fs-first-write.sh',
 ]
 
 benchmarks = [

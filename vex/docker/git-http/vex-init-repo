@@ -1,0 +1,47 @@
+#!/bin/sh
+
+# Create a repository only for the intentionally classic-bare bootstrap.  A
+# real Vex server must provide its own explicit init hook, rather than silently
+# placing data on this fallback volume.
+set -eu
+
+repo_name=${1:?vex-init-repo: repository name is required}
+case "$repo_name" in
+'' | /* | *'..'* | *'//'*)
+	printf 'vex-init-repo: unsafe repository name: %s\n' "$repo_name" >&2
+	exit 64
+	;;
+esac
+
+if [ -n "${VEX_GIT_HTTP_COMMAND:-}" ]; then
+	if [ -z "${VEX_REPO_INIT_COMMAND:-}" ]; then
+		printf '%s\n' 'vex-init-repo: Vex storage is active but VEX_REPO_INIT_COMMAND is not configured' >&2
+		exit 69
+	fi
+	export VEX_REPO_NAME="$repo_name"
+	exec /bin/sh -c "$VEX_REPO_INIT_COMMAND"
+fi
+
+root=${GIT_HTTP_ROOT:-/srv/git}
+repo_path="$root/$repo_name"
+case "$repo_name" in
+*.git) ;;
+*)
+	printf 'vex-init-repo: repository must end in .git: %s\n' "$repo_name" >&2
+	exit 64
+	;;
+esac
+
+if [ -e "$repo_path" ]; then
+	if git --git-dir="$repo_path" rev-parse --is-bare-repository >/dev/null 2>&1; then
+		printf 'vex-init-repo: bootstrap repository already exists: %s\n' "$repo_name"
+		exit 0
+	fi
+	printf 'vex-init-repo: existing path is not a bare repository: %s\n' "$repo_name" >&2
+	exit 1
+fi
+
+mkdir -p "$(dirname "$repo_path")"
+git init --bare --initial-branch=main "$repo_path" >/dev/null
+git --git-dir="$repo_path" config http.receivepack true
+printf 'vex-init-repo: created bootstrap classic-bare repository: %s\n' "$repo_name"
