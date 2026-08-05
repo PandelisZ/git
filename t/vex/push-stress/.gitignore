@@ -1,0 +1,4 @@
+# Run artifacts are intentionally local and may contain endpoint details.
+/out/
+/work/
+/*.trace
