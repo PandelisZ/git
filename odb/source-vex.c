@@ -285,30 +285,102 @@ static int odb_source_vex_read_object_stream(struct odb_read_stream **out,
 	return 0;
 }
 
-static int odb_source_vex_for_each_object(struct odb_source *base UNUSED,
-					     const struct object_info *request UNUSED,
-					     odb_for_each_object_cb cb UNUSED,
-					     void *cb_data UNUSED,
-					     const struct odb_for_each_object_options *opts UNUSED)
+struct vex_for_each_object_data {
+	struct odb_source_vex *source;
+	const struct object_info *request;
+	odb_for_each_object_cb cb;
+	void *cb_data;
+};
+
+static int vex_for_each_object_cb(const struct object_id *oid,
+				  const struct vex_object_info *info UNUSED,
+				  void *cb_data)
 {
-	return error(_("Vex object enumeration is not implemented"));
+	struct vex_for_each_object_data *data = cb_data;
+
+	if (data->request) {
+		struct object_info oi = *data->request;
+
+		/*
+		 * Keep the object-info contract: a request can include content, not
+		 * only metadata supplied by the Vex index.
+		 */
+		if (odb_source_vex_read_object_info(&data->source->base, oid,
+						    &oi, 0))
+			return -1;
+		return data->cb(oid, &oi, data->cb_data);
+	}
+
+	return data->cb(oid, NULL, data->cb_data);
 }
 
-static int odb_source_vex_count_objects(struct odb_source *base UNUSED,
+static int odb_source_vex_for_each_object(struct odb_source *base,
+					     const struct object_info *request,
+					     odb_for_each_object_cb cb,
+					     void *cb_data,
+					     const struct odb_for_each_object_options *opts)
+{
+	struct odb_source_vex *source = container_of(base, struct odb_source_vex, base);
+	struct odb_transaction_vex *transaction;
+	struct vex_for_each_object_data data = {
+		.source = source,
+		.request = request,
+		.cb = cb,
+		.cb_data = cb_data,
+	};
+	int ret;
+
+	if ((opts->flags & ODB_FOR_EACH_OBJECT_PROMISOR_ONLY) ||
+	    ((opts->flags & ODB_FOR_EACH_OBJECT_LOCAL_ONLY) && !base->local))
+		return 0;
+	if (vex_source_open(source))
+		return -1;
+	transaction = vex_source_transaction(source);
+	ret = vex_store_for_each_object(source->store,
+					transaction ? transaction->epoch : NULL,
+					opts->prefix, opts->prefix_hex_len,
+					vex_for_each_object_cb, &data);
+	if (ret < 0)
+		return error(_("unable to enumerate Vex objects"));
+	return ret;
+}
+
+static int odb_source_vex_count_objects(struct odb_source *base,
 					  enum odb_count_objects_flags flags UNUSED,
 					  unsigned long *out)
 {
-	*out = 0;
-	return error(_("Vex object enumeration is not implemented"));
+	struct odb_source_vex *source = container_of(base, struct odb_source_vex, base);
+	struct odb_transaction_vex *transaction;
+	int ret;
+
+	if (vex_source_open(source))
+		return -1;
+	transaction = vex_source_transaction(source);
+	ret = vex_store_count_objects(source->store,
+				      transaction ? transaction->epoch : NULL, out);
+	if (ret)
+		return error(_("unable to count Vex objects"));
+	return 0;
 }
 
-static int odb_source_vex_find_abbrev_len(struct odb_source *base UNUSED,
-					     const struct object_id *oid UNUSED,
+static int odb_source_vex_find_abbrev_len(struct odb_source *base,
+					     const struct object_id *oid,
 					     unsigned min_length,
 					     unsigned *out)
 {
-	*out = min_length;
-	return error(_("Vex object abbreviation lookup is not implemented"));
+	struct odb_source_vex *source = container_of(base, struct odb_source_vex, base);
+	struct odb_transaction_vex *transaction;
+	int ret;
+
+	if (vex_source_open(source))
+		return -1;
+	transaction = vex_source_transaction(source);
+	ret = vex_store_find_abbrev_len(source->store,
+					 transaction ? transaction->epoch : NULL,
+					 oid, min_length, out);
+	if (ret)
+		return error(_("unable to find Vex object abbreviation"));
+	return 0;
 }
 
 static int odb_source_vex_freshen_object(struct odb_source *base,

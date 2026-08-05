@@ -231,6 +231,7 @@ integration_tests = [
   't1466-refs-create.sh',
   't1467-refs-rename.sh',
   't1490-vex-storage.sh',
+  't1492-vex-receive-pack.sh',
   't1500-rev-parse.sh',
   't1501-work-tree.sh',
   't1502-rev-parse-parseopt.sh',

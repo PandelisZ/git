@@ -20,6 +20,7 @@
 #include "object-file.h"
 #include "object-name.h"
 #include "odb.h"
+#include "odb/source-vex.h"
 #include "oid-array.h"
 #include "oidset.h"
 #include "pack.h"
@@ -2362,7 +2363,15 @@ static const char *unpack(int err_fd, struct shallow_info *si,
 
 	odb_transaction_env(transaction, &child.env);
 
-	if (ntohl(hdr.hdr_entries) < unpack_limit) {
+	/*
+	 * Vex stores canonical object bytes outside the thin gitdir.  index-pack
+	 * writes a pack directly below that gitdir and would bypass the Vex ODB,
+	 * leaving the subsequent connectivity check unable to see the received
+	 * objects.  Until Vex has a pack-ingest path, keep receive-pack on the
+	 * unpack-objects path, whose child process writes through the Vex ODB.
+	 */
+	if (repo_uses_vex_storage(the_repository) ||
+	    ntohl(hdr.hdr_entries) < unpack_limit) {
 		strvec_push(&child.args, "unpack-objects");
 		push_header_arg(&child.args, &hdr);
 		if (quiet)
@@ -2705,7 +2714,20 @@ int cmd_receive_pack(int argc,
 		if (!si.nr_ours && !si.nr_theirs)
 			shallow_update = 0;
 		if (!delete_only(commands)) {
-			if (odb_transaction_begin(the_repository->objects, &transaction, ODB_TRANSACTION_RECEIVE))
+			/*
+			 * The receive helper is a separate process.  Files-backed ODBs
+			 * hand their quarantine directory to it through transaction.env.
+			 * Vex has no attach-an-existing-epoch API yet; allocating one here
+			 * would only leave an unused epoch when that child commits its own
+			 * Vex ODB transaction.  Let the child publish its complete object
+			 * epoch before we validate and advance refs.  A rejected push can
+			 * therefore leave only unreachable objects, never a ref to hidden
+			 * Vex data.
+			 */
+			if (repo_uses_vex_storage(the_repository))
+				unpack_status = unpack_with_sideband(&si, NULL);
+			else if (odb_transaction_begin(the_repository->objects, &transaction,
+						       ODB_TRANSACTION_RECEIVE))
 				unpack_status = "unable to start object transaction";
 			else
 				unpack_status = unpack_with_sideband(&si, transaction);
