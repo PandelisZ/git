@@ -24,7 +24,8 @@ build a Vex immutable pack artifact, and write t/vex/out/seed-manifest.json.
 
 The import itself is a normal stock-Git HTTPS `push --mirror`. --replace is
 required before changing a non-empty target whose refs differ from the mirror.
-The script never starts Compose and never deletes a disk-control repository.
+The script never starts Compose and never deletes the host disk-control
+repository; it installs a validated copy into the separate benchmark volume.
 
 Defaults:
   --mirror       $VEX_GIT_MIRROR or t/vex/out/git-git-mirror.git
@@ -146,6 +147,13 @@ case "$origin" in
 https://*/git/git.git) ;;
 *) die "--origin must be the HTTPS git/git endpoint: $origin" ;;
 esac
+origin_authority=${origin#https://}
+origin_authority=${origin_authority%%/*}
+[ -n "$origin_authority" ] || die "--origin has no HTTPS authority: $origin"
+# Keep the matched disk control on the same listener as the Vex candidate.
+# The installer independently rejects any URL that is not this exact fixed
+# namespace, then proves authenticated discovery and upload-pack reads.
+disk_origin="https://${origin_authority}/__vex_bench_disk__/git-git-disk.git"
 
 if [ -n "${VEX_STOCK_GIT:-}" ]; then
 	stock_git=$VEX_STOCK_GIT
@@ -555,6 +563,9 @@ case "$idx_key" in "git/v1/$repo_id/packs/$pack_id.idx") ;; *) die "unexpected V
 pack_sha256=$(s3_object_sha256 "$pack_key")
 require_sha256 "$pack_sha256"
 
+"$repo_root/scripts/vex/install-bench-disk-control.sh" \
+	--source "$disk_control" --origin "$disk_origin"
+
 : >"$images_tsv"
 collect_image_fact mysql "$images_tsv"
 collect_image_fact minio "$images_tsv"
@@ -568,7 +579,7 @@ python3 - "$manifest" "$source_refs" "$target_refs" \
 	"$upstream" "$source_head_ref" "$source_head_oid" "$source_commit_count" "$source_object_count" \
 	"$origin" "$repo_id" "$target_head_ref" "$target_head_oid" \
 	"$pack_id" "$pack_key" "$idx_key" "$pack_object_count" "$pack_generation" \
-	"$pack_bytes" "$idx_bytes" "$pack_sha256" "$disk_control" "$images_tsv" \
+	"$pack_bytes" "$idx_bytes" "$pack_sha256" "$disk_control" "$disk_origin" "$images_tsv" \
 	"$compose_file" "${COMPOSE_PROJECT_NAME:-vex}" "$stock_git_version" <<'PY'
 import hashlib
 import json
@@ -601,6 +612,7 @@ from urllib.parse import urlsplit, urlunsplit
     idx_bytes,
     pack_sha256,
     disk_control_name,
+    disk_origin,
     images_name,
     compose_name,
     compose_project,
@@ -680,11 +692,14 @@ payload = {
     },
     "disk_control": {
         "head": {"oid": source_head_oid, "ref": source_head_ref},
+        "origin": redact_url(disk_origin),
         "objects": {"reachable_count": int(source_object_count)},
         "pack_files": disk_packs,
         "repack": "git repack -adf --write-bitmap-index",
         "repository": disk_control.name,
         "refs": ref_facts(source_refs_name),
+        "storage": {"compose_volume": "vex_bench_disk", "kind": "classic-bare"},
+        "transport": "authenticated-stock-git-smart-https",
     },
     "created_at": created_at,
     "default_branch": default_branch,
@@ -740,5 +755,5 @@ PY
 
 restore_gateway_limits || die 'git-http gateway limits could not be restored after the seed'
 
-printf 'vex seed-git-git: PASS repository=git/git.git refs=%s objects=%s pack=%s disk_control=%s manifest=%s\n' \
-	"$source_ref_count" "$source_object_count" "$pack_id" "$disk_control" "$manifest"
+printf 'vex seed-git-git: PASS repository=git/git.git refs=%s objects=%s pack=%s disk_control=%s disk_origin=%s manifest=%s\n' \
+	"$source_ref_count" "$source_object_count" "$pack_id" "$disk_control" "$disk_origin" "$manifest"
