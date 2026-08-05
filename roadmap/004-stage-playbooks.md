@@ -1,7 +1,7 @@
 # Vex Stage Playbooks PRD
 
 **Status:** Active
-**Current Stage:** 4 + Stage 6 read-only retention roots
+**Current Stage:** 4 + Stage 6 destructive sweep + Stage 7 direct-pack relay
 **Owner:** Codex
 **Created:** 2026-08-05
 **Updated:** 2026-08-05
@@ -309,17 +309,19 @@ Tasks:
 
 1. [x] Seal published generations
 2. [x] Read-only graph mark from tips, durable pins, current sealed packs,
-   and non-expired clone leases; grace-period policy remains pending
-3. Delete blob+index **only if** not in tips ∪ pins ∪ **active advertised
-   packs** ∪ **live clone leases**
+   and non-expired clone leases
+3. [x] Delete blob+index **only if** not in tips ∪ pins ∪ **active advertised
+   packs** ∪ **live clone leases**, after a tombstone grace and a second root
+   check; final-S3 cleanup retries safely
 4. [x] Durable pins
 5. Optional auto-pin previous default-branch tip on force (open product flag)
 6. [x] Test: a pack becomes obsolete after a stock-Git state rewrite, but its
    members remain roots while a clone lease is live and return as candidates
    after release
 
-Acceptance: **not reached**. Pins, current packs, and clone leases are proven
-conservative roots, but deletion remains required.
+Acceptance: `t1528` proves pin protection, grace tombstones, a forced final
+S3 delete failure/retry, and a current stock clone/`fsck`. Broader L3 soak is
+still distinct from Stage 7 L4 acceptance.
 
 ### Stage 6 add-on — push stress soak
 
@@ -350,12 +352,12 @@ Runs on local Compose ([006](006-local-docker-compose-test-environment.md)).
 
 Tasks:
 
-1. [~] Pack spike: `scripts/vex/build-pack.sh` builds a deterministic custom-Git pack/index, uploads per-repository S3 artifacts, and records a MySQL envelope/object map. MIDX, local mmap cache, stock bitmaps, and serving remain open.
+1. [~] Pack spike: `scripts/vex/build-pack.sh` builds a deterministic custom-Git pack/index, uploads per-repository S3 artifacts, and records a MySQL envelope/object map. `t1526` now directly relays a verified current cache pack for eligible stock v0/v2 full clones; MIDX, lifecycle rebuild, and scale evidence remain open.
 2. Compose `bench`: seed-git-git + disk-control bare (`repack -adf` flags documented).
 3. **Long-lived** git-http only.
 4. Derived immutable packs in MinIO; covering generation in MySQL; **clone leases**.
 5. Invalidate on tip move; debounced/incremental rebuild (no per-push full repack).
-6. p50: stream pack (range/zero-copy); fallback circuit-broken.
+6. [~] Stream pack: verified cache-pack relay is proven on stock v0/v2 full clones; p50/large-repo proof and fallback circuit-break measurement remain open.
 7. Automate F1–F16 (P0+P1, interop, hammer, chaos).
 8. `bench-clone.sh` anti-fraud JSON (raw trials, compose_hash, CV).
 9. Gates: disk; GitHub with `BENCH_INCLUDE_GITHUB=1`; fetch-after-push ≤2× disk.
@@ -412,7 +414,7 @@ Tasks:
 
 - Playbooks derived from 001 stages + 003 passes 02,05,13,14,16,21,25,26,28,35.
 - receive-pack quarantine/`odb_transaction` integration requirement confirmed in-tree.
-- Compose Stage 4 data plane: source-built Vex Git, MySQL metadata, and MinIO canonical bytes verified by `t1497`; `t1498` is green for the serial 20× smoke plus reconciliation and the 500-commit ramp; `t1499` is green for receive compensation; `t1500` is green for two concurrent repositories; `t1501` forces S3-promotion compensation; `t1502` hashes canonical bytes; `t1503` proves pin/mark protection; `t1518` runs eight readers during twenty writer pushes; `t1519` covers rebase/lease/merge workflows; `t1520` verifies measurement-only p50/p90 benchmark JSON; `t1521` builds/records a per-repository S3 pack artifact that survives a later receive; `t1522` proves a fresh stock clone and `fsck` use the verified current packed cache when every S3 byte read is faulted; `t1523` proves current pack plus live clone-lease members remain read-only sweep roots across a stock-Git state rewrite and return as candidates only after release; and `t1524` proves two actual `SIGKILL` receive-worker offsets recover through the MySQL state lock, remove stale staging/final S3 keys, retain no tip/audit metadata, and permit the exact commit to retry/clone/`fsck`. The cache remains a server-side normal-object-read accelerator, not a direct precomputed-pack client stream. Destructive pack/lease-aware sweeping, cache lifecycle invalidation, direct pack serve, and the L4 SLO remain next.
+- Compose Stage 4 data plane: source-built Vex Git, MySQL metadata, and MinIO canonical bytes verified by `t1497`; `t1498` is green for the serial 20× smoke plus reconciliation and the 500-commit ramp; `t1499` is green for receive compensation; `t1500` is green for two concurrent repositories; `t1501` forces S3-promotion compensation; `t1502` hashes canonical bytes; `t1503` proves pin/mark protection; `t1518` runs eight readers during twenty writer pushes; `t1519` covers rebase/lease/merge workflows; `t1520` verifies measurement-only p50/p90 benchmark JSON; `t1521` builds/records a per-repository S3 pack artifact that survives a later receive; `t1522` proves a fresh stock clone and `fsck` use the verified current packed cache when every S3 byte read is faulted; `t1523` proves current pack plus live clone-lease members remain read-only sweep roots across a stock-Git state rewrite and return as candidates only after release; and `t1524` proves two actual `SIGKILL` receive-worker offsets recover through the MySQL state lock, remove stale staging/final S3 keys, retain no tip/audit metadata, and permit the exact commit to retry/clone/`fsck`. `t1525` restores stock protocol v2 through the gateway; `t1526` relays a verified current pack for stock v0/v2 full clones while `git-pack-objects` is forbidden; `t1527` streams a >64 MiB stock-Git request; and `t1528` proves tombstoned S3 reclamation with pin protection and retry-safe final-byte cleanup. Cache lifecycle, git/git-scale measurements, and the L4 SLO remain next.
 
 ## Open Questions
 

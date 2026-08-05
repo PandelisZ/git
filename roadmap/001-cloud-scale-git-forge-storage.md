@@ -1,7 +1,7 @@
 # Vex Git Forge Storage (Cloud-Scale PoC) PRD
 
 **Status:** Active
-**Current Stage:** 4 - MySQL metadata + S3 object-byte data plane; L3 read-only retention roots
+**Current Stage:** 4 - MySQL metadata + S3 object-byte data plane; L3 destructive sweep; Stage 7 direct-pack relay
 **Owner:** Codex
 **Created:** 2026-08-05
 **Updated:** 2026-08-05
@@ -17,14 +17,17 @@ artifact now reaches per-repository S3 keys with a MySQL envelope/object map;
 the current sealed artifact is downloaded into a verified, disposable local
 packed-object cache for normal server-side object reads. `t1522` proves a
 fresh stock clone and `fsck` still succeed after all S3 byte reads are faulted.
-The read-only sweep plan now marks current sealed-pack members and live
-clone-lease members in addition to tips and pins. This is not direct
-precomputed-pack streaming to the client, destructive sweeping, or an L4
-result. `t1524` now SIGKILLs a real receive worker before ref commit and after
-S3 promotion, then proves a configured TTL restart reclaims the MySQL epoch,
-removes both staging and newly-promoted final keys, and permits a stock-Git
-retry/clone/`fsck`. Grace-period deletion, cache lifecycle invalidation, and
-the sealed-pack L4 serve path remain pending.
+The sweep now marks current sealed-pack members and live clone-lease members
+in addition to tips and pins, then deletes only after a durable tombstone
+delay and a second root check. `t1524` SIGKILLs a real receive worker before
+ref commit and after S3 promotion, then proves a configured TTL restart
+reclaims the MySQL epoch, removes both staging and newly-promoted final keys,
+and permits a stock-Git retry/clone/`fsck`. `t1526` proves stock v0 and v2
+full clones relay a verified cached S3 pack while `git-pack-objects` is
+forbidden; `t1527` streams a 72 MiB stock-Git HTTP request without buffering
+the body. `t1528` proves grace deletion, pin protection, final-S3 retry, and
+current clone/`fsck`. Cache lifecycle, git/git-scale measurements, and the L4
+SLO remain pending.
 
 **Implementation identity:** this experiment is the **Vex backend**.  “Cloud
 storage” describes its MySQL + blob-store architecture; code, extension URIs,
@@ -430,7 +433,7 @@ Acceptance: FLUSHALL safe on compose Valkey; stale cache cannot resurrect tips; 
 
 ### Stage 6: sealer / sweeper / pins
 
-**Status:** Active — pins plus pack/clone-lease roots in a read-only mark
+**Status:** Complete
 **Owned Paths:** `vex/store.[ch]`, `vex/meta-mysql.[ch]`, operator helper,
 Compose tests
 
@@ -439,19 +442,23 @@ Compose tests
 - [x] Current sealed pack members are durable read-only sweep roots.
 - [x] Opaque TTL-bound clone leases retain obsolete pack members across a
   normal MySQL state rewrite; the local packed cache acquires one before use.
-- [ ] Grace-period deletion of blob+index only after tip/pin/**pack/lease** roots.
+- [x] Grace-period deletion of blob+index only after tip/pin/**pack/lease** roots,
+  using a durable tombstone, second root check, and retry-safe final-S3 cleanup.
 
-Acceptance: **not reached**. Tips, pins, current packs, and live leases are
-proven roots; destructive grace-period sweeping remains pending.
+Acceptance: `t1528` passes pin protection, delayed tombstones, a forced
+final-S3 delete failure/retry, and a current stock clone/`fsck`. This does not
+replace the Stage 7 git/git or load acceptance work.
 
 ### Stage 7: Bundle URI / pack path + git/git SLO (L4) — **acceptance stage**
 
-**Status:** Draft
+**Status:** In progress
 **Owned Paths:** pack/bundle builder; compose profile `bench`; `scripts/vex/seed-git-git.sh`, `bench-clone.sh`; `t/vex/*`
 
 - [ ] Compose bench profile: seed git/git into mysql+minio; disk-control bare on same HTTPS front
 - [ ] Stock `git clone https://localhost:8443/git/git.git`
-- [ ] Precomputed pack and/or bundle-uri artifacts in **MinIO**
+- [x] Precomputed immutable pack artifacts in **MinIO**, with a verified local
+  cache and direct stock v0/v2 full-clone relay; all ineligible requests fall
+  back to normal Git pack generation.
 - [ ] Reachability bitmap or equivalent
 - [ ] Warm cache path inside git-http container
 - [ ] F1–F8 via [005](005-stock-client-verification-and-benchmark.md) on localhost
