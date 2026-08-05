@@ -1782,6 +1782,8 @@ static int want_object_in_pack_mtime(const struct object_id *oid,
 	odb_prepare_alternates(the_repository->objects);
 
 	for (source = the_repository->objects->sources; source; source = source->next) {
+		if (source->type != ODB_SOURCE_FILES)
+			continue;
 		struct odb_source_files *files = odb_source_files_downcast(source);
 		struct multi_pack_index *m = get_multi_pack_index(files->packed);
 		struct pack_entry e;
@@ -1794,6 +1796,8 @@ static int want_object_in_pack_mtime(const struct object_id *oid,
 	}
 
 	for (source = the_repository->objects->sources; source; source = source->next) {
+		if (source->type != ODB_SOURCE_FILES)
+			continue;
 		struct odb_source_files *files = odb_source_files_downcast(source);
 
 		for (e = files->packed->packs.head; e; e = e->next) {

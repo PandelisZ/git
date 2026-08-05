@@ -719,6 +719,8 @@ static int open_bitmap(struct repository *r,
 
 	odb_prepare_alternates(r->objects);
 	for (source = r->objects->sources; source; source = source->next) {
+		if (source->type != ODB_SOURCE_FILES)
+			continue;
 		struct odb_source_files *files = odb_source_files_downcast(source);
 
 		if (!open_bitmap_for_source(files->packed, bitmap_git))

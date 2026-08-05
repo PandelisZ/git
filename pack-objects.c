@@ -1,5 +1,7 @@
 #include "git-compat-util.h"
 #include "object.h"
+#include "odb/source-files.h"
+#include "odb/source-packed.h"
 #include "pack.h"
 #include "pack-objects.h"
 #include "packfile.h"
@@ -87,7 +89,8 @@ struct object_entry *packlist_find(struct packing_data *pdata,
 
 static void prepare_in_pack_by_idx(struct packing_data *pdata)
 {
-	struct packed_git **mapping, *p;
+	struct packed_git **mapping;
+	struct odb_source *source;
 	int cnt = 0, nr = 1U << OE_IN_PACK_BITS;
 
 	ALLOC_ARRAY(mapping, nr);
@@ -96,13 +99,24 @@ static void prepare_in_pack_by_idx(struct packing_data *pdata)
 	 * (i.e. in_pack_idx also zero) should return NULL.
 	 */
 	mapping[cnt++] = NULL;
-	repo_for_each_pack(pdata->repo, p) {
-		if (cnt == nr) {
-			free(mapping);
-			return;
+	odb_prepare_alternates(pdata->repo->objects);
+	for (source = pdata->repo->objects->sources; source; source = source->next) {
+		struct odb_source_files *files;
+		struct packfile_list_entry *entry;
+
+		if (source->type != ODB_SOURCE_FILES)
+			continue;
+		files = odb_source_files_downcast(source);
+		for (entry = files->packed->packs.head; entry; entry = entry->next) {
+			struct packed_git *p = entry->pack;
+
+			if (cnt == nr) {
+				free(mapping);
+				return;
+			}
+			p->index = cnt;
+			mapping[cnt++] = p;
 		}
-		p->index = cnt;
-		mapping[cnt++] = p;
 	}
 	pdata->in_pack_by_idx = mapping;
 }
