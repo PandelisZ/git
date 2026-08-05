@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""Loopback smart-HTTP gateway for an FS-backed Vex repository.
+"""Loopback smart-HTTP gateway for an FS-metadata Vex repository.
 
 This is deliberately a small integration harness, not the production Vex
 data-plane service.  It serves only repositories that have an on-disk
 ``extensions.refStorage=vex://<uuid>`` configuration, passes that UUID and
-the configured FS store to every ``git http-backend`` process, and binds to
+the configured FS metadata root to every ``git http-backend`` process, and binds to
 loopback by default.  That makes a successful client run meaningful Vex-FS
-protocol evidence without conflating it with the Docker classic-bare
-bootstrap or with the future MySQL/MinIO service.
+metadata protocol evidence without conflating it with the Docker classic-bare
+bootstrap or the future MySQL-metadata service.
 """
 
 from __future__ import annotations
@@ -149,6 +149,7 @@ class VexFSHTTPServer(ThreadingHTTPServer):
         helper_path: str,
         root: Path,
         store: Path,
+        blob_backend: str,
         max_request_bytes: int,
     ) -> None:
         self.git = git
@@ -157,6 +158,7 @@ class VexFSHTTPServer(ThreadingHTTPServer):
         self.helper_path = helper_path
         self.root = root
         self.store = store
+        self.blob_backend = blob_backend
         self.max_request_bytes = max_request_bytes
         self.repositories = VexRepositoryIndex(git, root, store)
         super().__init__((bind, port), VexFSHTTPRequestHandler)
@@ -190,15 +192,18 @@ class VexFSHTTPRequestHandler(BaseHTTPRequestHandler):
 
     def _healthz(self) -> None:
         server = self.vex_server
+        storage_backend = "fs" if server.blob_backend == "fs" else "fs+s3"
         payload = {
+            "blob_backend": server.blob_backend,
+            "metadata_backend": "fs",
             "mode": "vex-fs-test",
             "repositories": {
                 name: repo.repo_id for name, repo in sorted(server.repositories.repositories.items())
             },
             "service": "vex-fs-git-http",
-            "storage_backend": "fs",
+            "storage_backend": storage_backend,
             "vex_storage_active": True,
-            "warning": "loopback integration harness; not MySQL/MinIO or production service evidence",
+            "warning": "loopback integration harness; not MySQL metadata or bundled production-service evidence",
         }
         body = (json.dumps(payload, sort_keys=True) + "\n").encode()
         self.send_response(200)
@@ -329,7 +334,7 @@ class VexFSHTTPRequestHandler(BaseHTTPRequestHandler):
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="serve explicit FS-backed Vex repos to normal Git smart-HTTP clients"
+        description="serve explicit FS-metadata Vex repos to normal Git smart-HTTP clients"
     )
     parser.add_argument("--git", required=True, help="Vex-enabled Git executable")
     parser.add_argument(
@@ -341,7 +346,7 @@ def parse_args() -> argparse.Namespace:
         help="directory containing the source Git executable and built-ins (default: --git parent)",
     )
     parser.add_argument("--root", required=True, help="directory holding single-level *.git repos")
-    parser.add_argument("--store", required=True, help="FS Vex store root shared by those repos")
+    parser.add_argument("--store", required=True, help="FS Vex metadata root shared by those repos")
     parser.add_argument("--bind", default="127.0.0.1", help="listener address (default: loopback)")
     parser.add_argument("--port", type=int, default=0, help="listener port (default: ephemeral)")
     parser.add_argument("--ready-file", help="write the HTTP base URL here once listening")
@@ -352,6 +357,14 @@ def parse_args() -> argparse.Namespace:
         help="maximum HTTP POST body accepted by this integration harness",
     )
     return parser.parse_args()
+
+
+def blob_backend_from_environment() -> str:
+    """Report the backend selected for the Vex subprocesses we launch."""
+    backend = os.environ.get("GIT_VEX_BLOB_BACKEND", "fs")
+    if backend not in {"fs", "s3"}:
+        fail("GIT_VEX_BLOB_BACKEND must be fs or s3")
+    return backend
 
 
 def make_helper_path(git: str) -> Path:
@@ -385,6 +398,7 @@ def main() -> int:
         )
     root = Path(args.root).resolve()
     store = Path(args.store).resolve()
+    blob_backend = blob_backend_from_environment()
     if not root.is_dir():
         fail(f"--root does not exist: {root}")
     if not store.is_dir():
@@ -402,6 +416,7 @@ def main() -> int:
         str(helper_path),
         root,
         store,
+        blob_backend,
         args.max_request_bytes,
     )
     url = f"http://{args.bind}:{server.server_port}"
@@ -411,7 +426,12 @@ def main() -> int:
         temporary = ready.with_name(ready.name + ".tmp")
         temporary.write_text(url + "\n", encoding="utf-8")
         temporary.replace(ready)
-    print(f"vex fs-http: listening on {url} for {len(server.repositories.repositories)} Vex-FS repository(s)", flush=True)
+    print(
+        f"vex fs-http: listening on {url} for "
+        f"{len(server.repositories.repositories)} Vex repository(s) "
+        f"(FS metadata, {blob_backend} blobs)",
+        flush=True,
+    )
 
     stopped = threading.Event()
 

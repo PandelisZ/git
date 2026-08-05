@@ -20,7 +20,7 @@ test_expect_success VEX_STOCK_GIT,VEX_HTTP_BACKEND 'stock Git clone and fetch us
 		--git "$GIT_BINARY" \
 		--stock-git "$stock_git" \
 		--read-only >out 2>err &&
-	test_grep "PASS Vex-FS stock-Git clone/fetch" out
+	test_grep "PASS Vex (FS metadata, fs blobs) stock-Git clone/fetch" out
 '
 
 test_done

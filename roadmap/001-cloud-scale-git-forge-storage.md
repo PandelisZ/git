@@ -369,7 +369,7 @@ push-stress harness against this endpoint.
 
 ### Stage 4: MySQL + S3 via local Docker Compose (L2)
 
-**Status:** Active — Compose foundation plus live native driver probes
+**Status:** Active — Compose foundation plus FS-metadata/S3-byte vertical slice
 **Owned Paths:** `meta-mysql.c`, `blob-s3.c`, `vex/docker/compose.yaml`, `scripts/vex/*`, `t/vex/integration-mysql-minio.sh`
 
 - [x] Compose: mysql + minio + git-http (ports on 127.0.0.1)
@@ -377,15 +377,19 @@ push-stress harness against this endpoint.
 - [x] TLS stock-Git bootstrap clone/fetch/push smoke
 - [x] Native MySQL metadata probe (metadata rows only; no raw Git bytes)
 - [x] Signed S3/MinIO blob probe (stage, promote, read, Git hash verification)
-- [ ] Integrate the MySQL and S3 drivers into `vex_store` and the Vex-aware git-http command
+- [x] Select signed S3 canonical bytes from `vex_store` with `GIT_VEX_BLOB_BACKEND=s3` while retaining FS metadata
+- [ ] Integrate the MySQL metadata driver into `vex_store`
+- [ ] Wire a Vex-aware Compose git-http command to the MySQL+S3 store
 - [ ] Protocol tests against a Vex `https://localhost…` endpoint
 - [ ] CI: Compose → Vex seed → Vex smoke → down -v (no AWS)
 
 The current git-http image exposes an explicit classic-bare bootstrap and
 reports `vex_storage_active:false`. Its successful stock-Git smoke proves
-TLS/transport plumbing, not a Vex data-plane path or L2. The live drivers
-exercise real MySQL and MinIO protocols independently; `vex_store` remains
-FS-backed until their shared-store integration lands.
+TLS/transport plumbing, not a Vex data-plane path or L2. The loopback Vex
+HTTP harness does exercise real MinIO bytes: `t1494` proves the exact final
+object key and fresh read, `t1495` proves stock clone/fetch/push, and `t1496`
+proves rejected-receive S3 staging compensation. Metadata is still FS-backed,
+not MySQL-backed.
 
 Acceptance remains pending: Stage 3 tests must pass on **local** MySQL+MinIO
 through a Vex-aware server; Valkey off; second machine can reproduce from

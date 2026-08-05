@@ -291,6 +291,162 @@ static int object_is_visible(const struct vex_meta_state *state,
 			  (epoch && epoch_has_object(state, epoch->id, &object->oid)));
 }
 
+struct vex_epoch_blob_list {
+	struct object_id *oids;
+	size_t nr;
+};
+
+static int blob_s3_result(int ret)
+{
+	switch (ret) {
+	case VEX_BLOB_S3_OK:
+		return VEX_STORE_OK;
+	case VEX_BLOB_S3_ERR_NOT_FOUND:
+		return VEX_STORE_ERR_NOT_FOUND;
+	case VEX_BLOB_S3_ERR_INVALID:
+		return VEX_STORE_ERR_INVALID;
+	default:
+		return VEX_STORE_ERR;
+	}
+}
+
+static int blob_backend_put_staging(struct vex_store *store, uint64_t epoch,
+				    const struct object_id *oid,
+				    const void *data, unsigned long size)
+{
+	switch (store->backend) {
+	case VEX_STORE_BACKEND_FS:
+		return vex_blob_fs_put_staging(store->blob_fs, epoch, oid, data,
+					       size);
+	case VEX_STORE_BACKEND_FS_S3:
+		return blob_s3_result(vex_blob_s3_put_staging(store->blob_s3, epoch,
+							 oid, data, size));
+	default:
+		return VEX_STORE_ERR_INVALID;
+	}
+}
+
+static int blob_backend_has_final(struct vex_store *store,
+				  const struct object_id *oid)
+{
+	int ret;
+
+	switch (store->backend) {
+	case VEX_STORE_BACKEND_FS:
+		return vex_blob_fs_has_final(store->blob_fs, oid);
+	case VEX_STORE_BACKEND_FS_S3:
+		ret = vex_blob_s3_has_final(store->blob_s3, oid);
+		return ret < 0 ? blob_s3_result(ret) : ret;
+	default:
+		return VEX_STORE_ERR_INVALID;
+	}
+}
+
+static int blob_backend_read_final(struct vex_store *store,
+				   const struct object_id *oid,
+				   void **data, unsigned long *size)
+{
+	switch (store->backend) {
+	case VEX_STORE_BACKEND_FS:
+		return vex_blob_fs_read_final(store->blob_fs, oid, data, size);
+	case VEX_STORE_BACKEND_FS_S3:
+		return blob_s3_result(vex_blob_s3_read_final(store->blob_s3, oid,
+							      data, size));
+	default:
+		return VEX_STORE_ERR_INVALID;
+	}
+}
+
+static int blob_backend_read_staging(struct vex_store *store, uint64_t epoch,
+				     const struct object_id *oid,
+				     void **data, unsigned long *size)
+{
+	switch (store->backend) {
+	case VEX_STORE_BACKEND_FS:
+		return vex_blob_fs_read_staging(store->blob_fs, epoch, oid, data,
+						size);
+	case VEX_STORE_BACKEND_FS_S3:
+		return blob_s3_result(vex_blob_s3_read_staging(store->blob_s3, epoch,
+							       oid, data, size));
+	default:
+		return VEX_STORE_ERR_INVALID;
+	}
+}
+
+static int blob_backend_promote_epoch(struct vex_store *store,
+				      const struct vex_meta_state *state,
+				      uint64_t epoch)
+{
+	size_t i;
+
+	if (store->backend == VEX_STORE_BACKEND_FS)
+		return vex_blob_fs_promote_epoch(store->blob_fs, state, epoch);
+	if (store->backend != VEX_STORE_BACKEND_FS_S3)
+		return VEX_STORE_ERR_INVALID;
+	for (i = 0; i < state->epoch_objects_nr; i++) {
+		const struct vex_meta_epoch_object *entry = &state->epoch_objects[i];
+		int ret;
+
+		if (entry->epoch != epoch)
+			continue;
+		ret = blob_s3_result(vex_blob_s3_promote_object(store->blob_s3,
+								epoch, &entry->oid));
+		if (ret)
+			return ret;
+	}
+	return VEX_STORE_OK;
+}
+
+static void snapshot_epoch_objects(const struct vex_meta_state *state,
+				   uint64_t epoch,
+				   struct vex_epoch_blob_list *objects)
+{
+	size_t i;
+	size_t at = 0;
+
+	for (i = 0; i < state->epoch_objects_nr; i++)
+		if (state->epoch_objects[i].epoch == epoch)
+			objects->nr++;
+	if (!objects->nr)
+		return;
+	CALLOC_ARRAY(objects->oids, objects->nr);
+	for (i = 0; i < state->epoch_objects_nr; i++) {
+		if (state->epoch_objects[i].epoch != epoch)
+			continue;
+		oidcpy(&objects->oids[at++], &state->epoch_objects[i].oid);
+	}
+}
+
+static void release_epoch_objects(struct vex_epoch_blob_list *objects)
+{
+	free(objects->oids);
+	objects->oids = NULL;
+	objects->nr = 0;
+}
+
+static int blob_backend_compensate_epoch(
+		struct vex_store *store, uint64_t epoch,
+		const struct vex_epoch_blob_list *objects)
+{
+	size_t i;
+	int ret = VEX_STORE_OK;
+
+	if (store->backend == VEX_STORE_BACKEND_FS)
+		return vex_blob_fs_compensate_epoch(store->blob_fs, epoch);
+	if (store->backend != VEX_STORE_BACKEND_FS_S3)
+		return VEX_STORE_ERR_INVALID;
+	for (i = 0; i < objects->nr; i++) {
+		int cleanup = blob_s3_result(vex_blob_s3_delete_staging(
+				store->blob_s3, epoch, &objects->oids[i]));
+
+		if (cleanup == VEX_STORE_ERR_NOT_FOUND)
+			cleanup = VEX_STORE_OK;
+		if (!ret && cleanup)
+			ret = cleanup;
+	}
+	return ret;
+}
+
 static int ref_expected_matches(const struct vex_meta_ref *ref,
 				const struct vex_ref_update *update)
 {
@@ -370,7 +526,7 @@ static int verify_ref_target_object(struct vex_store *store,
 	if (!object_is_visible_to_epoch(state, object, epoch))
 		return VEX_STORE_ERR_NOT_FOUND;
 	if (object->state == VEX_OBJECT_PUBLISHED) {
-		exists = vex_blob_fs_has_final(store->blob, &object->oid);
+		exists = blob_backend_has_final(store, &object->oid);
 		if (exists < 0)
 			return exists;
 		if (!exists)
@@ -394,7 +550,7 @@ static int publish_epoch(struct vex_store *store, struct vex_meta_state *state,
 		object = find_object(state, &entry->oid);
 		if (!object)
 			return VEX_STORE_ERR_CORRUPT;
-		exists = vex_blob_fs_has_final(store->blob, &entry->oid);
+		exists = blob_backend_has_final(store, &entry->oid);
 		if (exists < 0)
 			return exists;
 		if (!exists)
@@ -436,12 +592,12 @@ static int blob_available_for_epoch(struct vex_store *store, uint64_t epoch,
 	unsigned long size;
 	int ret;
 
-	ret = vex_blob_fs_has_final(store->blob, oid);
+	ret = blob_backend_has_final(store, oid);
 	if (ret < 0)
 		return ret;
 	if (ret)
 		return VEX_STORE_OK;
-	ret = vex_blob_fs_read_staging(store->blob, epoch, oid, &data, &size);
+	ret = blob_backend_read_staging(store, epoch, oid, &data, &size);
 	free(data);
 	return ret;
 }
@@ -526,7 +682,9 @@ int vex_store_open(struct vex_store **store_out,
 	struct strbuf repo_id = STRBUF_INIT;
 	int ret;
 
-	if (!store_out || !opts || opts->backend != VEX_STORE_BACKEND_FS ||
+	if (!store_out || !opts ||
+	    (opts->backend != VEX_STORE_BACKEND_FS &&
+	     opts->backend != VEX_STORE_BACKEND_FS_S3) ||
 	    !opts->root || !*opts->root || !opts->hash_algo ||
 	    !opts->hash_algo->rawsz || !opts->hash_algo->hexsz) {
 		ret = VEX_STORE_ERR_INVALID;
@@ -540,9 +698,27 @@ int vex_store_open(struct vex_store **store_out,
 	store->repo_id = strbuf_detach(&repo_id, NULL);
 	store->hash_algo = opts->hash_algo;
 	if ((ret = vex_meta_fs_open(&store->meta, store->root, store->repo_id,
-				    store->hash_algo)) ||
-	    (ret = vex_blob_fs_open(&store->blob, store->root, store->repo_id,
 				    store->hash_algo))) {
+		vex_store_close(store);
+		goto done;
+	}
+	if (store->backend == VEX_STORE_BACKEND_FS) {
+		ret = vex_blob_fs_open(&store->blob_fs, store->root, store->repo_id,
+				       store->hash_algo);
+	} else {
+		struct vex_blob_s3_options blob_s3;
+
+		if (!opts->blob_s3) {
+			ret = VEX_STORE_ERR_INVALID;
+		} else {
+			blob_s3 = *opts->blob_s3;
+			blob_s3.repo_id = store->repo_id;
+			blob_s3.hash_algo = store->hash_algo;
+			ret = blob_s3_result(vex_blob_s3_open(&store->blob_s3,
+							      &blob_s3));
+		}
+	}
+	if (ret) {
 		vex_store_close(store);
 		goto done;
 	}
@@ -558,7 +734,8 @@ void vex_store_close(struct vex_store *store)
 	if (!store)
 		return;
 	vex_meta_fs_close(store->meta);
-	vex_blob_fs_close(store->blob);
+	vex_blob_fs_close(store->blob_fs);
+	vex_blob_s3_close(store->blob_s3);
 	free(store->root);
 	free(store->repo_id);
 	free(store);
@@ -572,7 +749,17 @@ int vex_repo_ensure(struct vex_store *store)
 		return VEX_STORE_ERR_INVALID;
 	if ((ret = vex_meta_fs_ensure(store->meta)))
 		return ret;
-	return vex_blob_fs_ensure(store->blob);
+	if (store->backend == VEX_STORE_BACKEND_FS)
+		return vex_blob_fs_ensure(store->blob_fs);
+	if (store->backend != VEX_STORE_BACKEND_FS_S3)
+		return VEX_STORE_ERR_INVALID;
+	if (!store->blob_s3_checked) {
+		ret = blob_s3_result(vex_blob_s3_check_bucket(store->blob_s3));
+		if (ret)
+			return ret;
+		store->blob_s3_checked = 1;
+	}
+	return VEX_STORE_OK;
 }
 
 const char *vex_store_repo_id(const struct vex_store *store)
@@ -721,6 +908,7 @@ int vex_epoch_compensate(struct vex_epoch *epoch)
 	struct vex_meta_fs_lock lock;
 	struct vex_meta_state state;
 	struct vex_meta_epoch *meta_epoch;
+	struct vex_epoch_blob_list blobs = { 0 };
 	int ret;
 	int blob_ret;
 
@@ -734,6 +922,7 @@ int vex_epoch_compensate(struct vex_epoch *epoch)
 		ret = VEX_STORE_ERR_STATE;
 		goto out;
 	}
+	snapshot_epoch_objects(&state, epoch->id, &blobs);
 	abort_epoch_state(&state, epoch->id);
 	ret = vex_meta_fs_save_locked(store->meta, &lock, &state);
 	if (!ret)
@@ -742,9 +931,12 @@ out:
 	if (lock.held)
 		vex_meta_fs_unlock(&lock);
 	vex_meta_state_release(&state);
-	if (ret)
+	if (ret) {
+		release_epoch_objects(&blobs);
 		return ret;
-	blob_ret = vex_blob_fs_compensate_epoch(store->blob, epoch->id);
+	}
+	blob_ret = blob_backend_compensate_epoch(store, epoch->id, &blobs);
+	release_epoch_objects(&blobs);
 	return blob_ret;
 }
 
@@ -776,7 +968,7 @@ int vex_blob_put_staging(struct vex_store *store, struct vex_epoch *epoch,
 		goto out;
 	}
 	vex_meta_fs_unlock(&lock);
-	ret = vex_blob_fs_put_staging(store->blob, epoch->id, oid, data, size);
+	ret = blob_backend_put_staging(store, epoch->id, oid, data, size);
 	vex_meta_state_release(&state);
 	return ret;
 out:
@@ -798,7 +990,7 @@ int vex_blob_promote(struct vex_store *store, struct vex_epoch *epoch)
 	if (!epoch_is_open(&state, epoch->id))
 		ret = VEX_STORE_ERR_STATE;
 	else
-		ret = vex_blob_fs_promote_epoch(store->blob, &state, epoch->id);
+		ret = blob_backend_promote_epoch(store, &state, epoch->id);
 	vex_meta_fs_unlock(&lock);
 	vex_meta_state_release(&state);
 	return ret;
@@ -806,11 +998,19 @@ int vex_blob_promote(struct vex_store *store, struct vex_epoch *epoch)
 
 int vex_blob_compensate(struct vex_store *store, struct vex_epoch *epoch)
 {
+	struct vex_meta_state state;
+	struct vex_epoch_blob_list blobs = { 0 };
 	int ret = check_epoch(store, epoch);
 
 	if (ret)
 		return ret;
-	return vex_blob_fs_compensate_epoch(store->blob, epoch->id);
+	if ((ret = vex_meta_fs_load(store->meta, &state)))
+		return ret;
+	snapshot_epoch_objects(&state, epoch->id, &blobs);
+	vex_meta_state_release(&state);
+	ret = blob_backend_compensate_epoch(store, epoch->id, &blobs);
+	release_epoch_objects(&blobs);
+	return ret;
 }
 
 int vex_object_index_put_quarantine(struct vex_store *store,
@@ -932,7 +1132,7 @@ int vex_store_has_object(struct vex_store *store, const struct object_id *oid)
 	if (!object || object->state != VEX_OBJECT_PUBLISHED) {
 		ret = 0;
 	} else {
-		ret = vex_blob_fs_has_final(store->blob, oid);
+		ret = blob_backend_has_final(store, oid);
 		if (!ret)
 			ret = VEX_STORE_ERR_CORRUPT;
 	}
@@ -962,10 +1162,10 @@ static int read_object(struct vex_store *store, const struct vex_epoch *epoch,
 		goto out;
 	}
 	if (object->state == VEX_OBJECT_PUBLISHED) {
-		ret = vex_blob_fs_read_final(store->blob, oid, &contents, &contents_size);
+		ret = blob_backend_read_final(store, oid, &contents, &contents_size);
 	} else {
-		ret = vex_blob_fs_read_staging(store->blob, epoch->id, oid,
-					  &contents, &contents_size);
+		ret = blob_backend_read_staging(store, epoch->id, oid,
+						 &contents, &contents_size);
 	}
 	if (ret)
 		goto out;
@@ -1253,6 +1453,7 @@ int vex_ref_transaction_commit(struct vex_ref_transaction *transaction)
 	struct vex_meta_fs_lock lock;
 	struct vex_meta_state state;
 	struct vex_meta_epoch *meta_epoch;
+	struct vex_epoch_blob_list blobs = { 0 };
 	size_t i;
 	int ret;
 
@@ -1280,10 +1481,11 @@ int vex_ref_transaction_commit(struct vex_ref_transaction *transaction)
 						    &transaction->updates[i])))
 			goto out;
 	}
-	ret = vex_blob_fs_promote_epoch(store->blob, &state, epoch->id);
+	ret = blob_backend_promote_epoch(store, &state, epoch->id);
 	if (ret) {
 		int save_ret;
 
+		snapshot_epoch_objects(&state, epoch->id, &blobs);
 		abort_epoch_state(&state, epoch->id);
 		save_ret = vex_meta_fs_save_locked(store->meta, &lock, &state);
 		if (!save_ret)
@@ -1292,7 +1494,8 @@ int vex_ref_transaction_commit(struct vex_ref_transaction *transaction)
 			vex_meta_fs_unlock(&lock);
 		vex_meta_state_release(&state);
 		if (!save_ret)
-			vex_blob_fs_compensate_epoch(store->blob, epoch->id);
+			blob_backend_compensate_epoch(store, epoch->id, &blobs);
+		release_epoch_objects(&blobs);
 		return ret;
 	}
 	if ((ret = publish_epoch(store, &state, epoch->id)))

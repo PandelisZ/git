@@ -104,3 +104,50 @@ still FS-backed, and the Compose `git-http` service reports
 `mode:"bootstrap-classic-bare"` with `vex_storage_active:false`.
 The next integration slice is a shared store backend that makes the same
 stock-Git protocol path use the MySQL metadata and S3 blob drivers.
+
+## 2026-08-05 — Vex FS-metadata + S3-byte central-store slice
+
+Shipped the first shared-store vertical slice that selects signed MinIO bytes
+without moving raw Git payloads into MySQL:
+
+- `GIT_VEX_BLOB_BACKEND=s3` selects `VEX_STORE_BACKEND_FS_S3`; the existing
+  FS backend continues to hold refs, object metadata, and epoch state.
+- Blob stage/read/promote/compensate calls dispatch through the selected
+  backend. S3 promotion uses the canonical
+  `git/v1/<repo-id>/objects/<oid>` key; compensation deletes staged keys only
+  and never deletes a potentially shared content-addressed final key.
+- The loopback smart-HTTP harness attests both `metadata_backend=fs` and the
+  selected blob backend, so its stock-client proof cannot be mislabeled as
+  all-FS storage.
+- `scripts/vex/print-env.sh` emits the active S3-byte selector and region,
+  while documenting that `GIT_VEX_BACKEND=mysql+s3` remains a topology label.
+
+Verified locally:
+
+```sh
+env -u CARGO_TARGET_DIR make -j4 git
+env -u CARGO_TARGET_DIR make -C t unit-tests
+# PASS: 262/262
+
+make -C t T='t1490-vex-storage.sh t1491-vex-fs-http.sh \
+  t1492-vex-receive-pack.sh t1493-vex-receive-epoch.sh \
+  t9905-vex-fs-first-write.sh'
+# PASS: 6/6
+
+VEX_TEST_S3=true make -C t T='t1494-vex-s3-store.sh \
+  t1495-vex-s3-http.sh'
+# PASS: 2/2
+
+VEX_TEST_S3=true make -C t T=t1496-vex-s3-receive-epoch.sh
+# PASS: 1/1
+```
+
+The S3 gate proves: exact MinIO final-key placement plus a fresh Vex reader;
+unmodified `/usr/bin/git` clone/fetch/push through the loopback Vex HTTP
+server; and rejected non-fast-forward receive compensation with no final key,
+no staged key, no rejected metadata, no open epoch, and no tip movement.
+
+This is intentionally not L2 or L4: metadata remains FS-backed and the
+bundled Compose `git-http` service remains an explicit classic-bare bootstrap.
+The next required slice is MySQL metadata in the central store, followed by a
+Vex-aware Compose server and the staged push-stress/chaos gates.

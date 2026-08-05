@@ -240,17 +240,20 @@ Acceptance:
 
 **Implementation snapshot (2026-08-05):** the local MySQL/MinIO/TLS topology,
 schema/bucket initialization, stock-Git bootstrap smoke, native MySQL metadata
-probe, and signed MinIO blob probe are green. The bootstrap health response
-explicitly says `vex_storage_active:false` and `vex_store` is still
-FS-backed, so this is not yet a Vex MySQL/S3 data plane or an L2 result.
+probe, and signed MinIO blob probe are green. `GIT_VEX_BLOB_BACKEND=s3` now
+selects MinIO canonical bytes in the central store while metadata remains FS;
+the direct-store, stock-HTTP, and receive-compensation proofs are `t1494`,
+`t1495`, and `t1496`. The bundled bootstrap health response still explicitly
+says `vex_storage_active:false` and MySQL is not yet active metadata, so this
+is not a Vex MySQL/S3 data plane or an L2 result.
 
 Tasks:
 
 1. Land `vex/docker/compose.yaml` (mysql + minio + minio-init + git-http).
 2. Land `scripts/vex/{up,down,reset,seed-small,print-env}.sh`.
 3. meta-mysql migrations applied by mysql init or migrate job.
-4. blob-s3 against MinIO (`path-style`, custom endpoint).
-5. Wire git-http container to `GIT_VEX_BACKEND=mysql+s3`.
+4. [x] blob-s3 against MinIO (`path-style`, custom endpoint) for canonical bytes; FS metadata remains for this slice.
+5. Wire git-http container to the active MySQL+S3 store. `GIT_VEX_BACKEND=mysql+s3` remains a planned topology label, not an activation switch.
 6. pooling notes for short-lived git processes.
 7. `t/vex/integration-mysql-minio.sh` + stock clone smoke.
 8. Finalize push-stress on Compose ([009](009-incremental-push-stress-harness.md)): smoke + **ramp** + **chaos** + **fault_inject**.

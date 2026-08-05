@@ -19,10 +19,13 @@
 struct vex_store;
 struct vex_epoch;
 struct vex_ref_transaction;
+struct vex_blob_s3_options;
 struct strbuf;
 
 enum vex_store_backend {
 	VEX_STORE_BACKEND_FS = 1,
+	/* Filesystem metadata with canonical object bytes in S3-compatible storage. */
+	VEX_STORE_BACKEND_FS_S3,
 };
 
 enum vex_store_result {
@@ -55,6 +58,8 @@ struct vex_store_options {
 	/* A canonical, lower-case 32-digit hexadecimal repository UUID. */
 	const char *repo_id;
 	const struct git_hash_algo *hash_algo;
+	/* Required only for VEX_STORE_BACKEND_FS_S3. Repo/hash are derived here. */
+	const struct vex_blob_s3_options *blob_s3;
 };
 
 struct vex_object_info {

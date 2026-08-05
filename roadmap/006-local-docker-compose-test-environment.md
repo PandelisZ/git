@@ -1,7 +1,7 @@
 # Vex Local Docker Compose Test Environment PRD
 
 **Status:** Active
-**Current Stage:** Foundation + live backend driver probes; Vex data plane pending
+**Current Stage:** FS metadata + live S3 byte-store slice; MySQL data plane pending
 **Owner:** Codex
 **Created:** 2026-08-05
 **Updated:** 2026-08-05
@@ -28,8 +28,10 @@ in that process, so no Stage 3/L1 or Stage 4/L2 claim follows from it.
 
 The native `meta-mysql` probe and signed `blob-s3` probe also run
 against these Compose services and are green. They use real MySQL and MinIO
-protocols, keep raw Git payloads out of MySQL, and do not yet make the
-central `vex_store` or bundled `git-http` process MySQL/S3-backed.
+protocols and keep raw Git payloads out of MySQL. The central `vex_store` can
+now select MinIO canonical bytes with `GIT_VEX_BLOB_BACKEND=s3`, while FS
+remains the metadata store for that vertical slice. The bundled `git-http`
+process is still not MySQL/S3-backed.
 
 ### Goals
 
@@ -185,6 +187,7 @@ GIT_VEX_ORIGIN=https://localhost:8443/git/git.git
 
 ```env
 GIT_VEX_BACKEND=mysql+s3
+GIT_VEX_BLOB_BACKEND=s3       # implemented: FS metadata + S3 canonical bytes
 GIT_VEX_MYSQL_DSN=mysql://vex:vex-local-mysql@mysql:3306/vex
 GIT_VEX_S3_ENDPOINT=http://minio:9000
 GIT_VEX_S3_BUCKET=git-objects
@@ -195,7 +198,11 @@ GIT_VEX_VALKEY_URL=redis://valkey:6379/0   # optional
 GIT_VEX_SCRATCH=/var/git-scratch
 ```
 
-Host-run binary (optional): same vars with `127.0.0.1` ports from published mappings.
+`GIT_VEX_BACKEND=mysql+s3` names the intended full topology; it does not
+activate it yet. The current activation switch is
+`GIT_VEX_BLOB_BACKEND=s3`, which preserves FS metadata and directs canonical
+object bytes to MinIO. Host-run binary (optional): use the same S3 vars with
+`127.0.0.1` ports from published mappings.
 
 ### TLS
 

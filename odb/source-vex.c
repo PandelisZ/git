@@ -1,6 +1,7 @@
 #include "git-compat-util.h"
 #include "config.h"
 #include "hex.h"
+#include "vex/blob-s3.h"
 #include "vex/store.h"
 #include "gettext.h"
 #include "object-file.h"
@@ -68,6 +69,14 @@ static char *vex_canonical_repo_id(const char *payload)
 	return repo_id;
 }
 
+static int vex_env_true(const char *name)
+{
+	const char *value = getenv(name);
+
+	return value && (!strcmp(value, "1") || !strcmp(value, "true") ||
+			 !strcmp(value, "yes"));
+}
+
 int vex_store_open_for_repository(struct repository *repo, const char *gitdir,
 					    struct vex_store **out)
 {
@@ -78,6 +87,17 @@ int vex_store_open_for_repository(struct repository *repo, const char *gitdir,
 		.hash_algo = repo->hash_algo,
 	};
 	const char *configured_root = NULL;
+	const char *blob_backend = getenv("GIT_VEX_BLOB_BACKEND");
+	const char *s3_region = getenv("GIT_VEX_S3_REGION");
+	struct vex_blob_s3_options blob_s3 = {
+		.endpoint = getenv("GIT_VEX_S3_ENDPOINT"),
+		.bucket = getenv("GIT_VEX_S3_BUCKET"),
+		.region = s3_region && *s3_region ? s3_region : "us-east-1",
+		.access_key = getenv("GIT_VEX_S3_ACCESS_KEY"),
+		.secret_key = getenv("GIT_VEX_S3_SECRET_KEY"),
+		.ca_file = getenv("GIT_VEX_S3_CA_FILE"),
+		.insecure_tls = vex_env_true("GIT_VEX_S3_INSECURE_TLS"),
+	};
 	char *root = NULL;
 	char *repo_id = vex_canonical_repo_id(repo->ref_storage_payload);
 	int ret;
@@ -85,6 +105,17 @@ int vex_store_open_for_repository(struct repository *repo, const char *gitdir,
 	*out = NULL;
 	if (!repo_id)
 		return VEX_STORE_ERR_INVALID;
+	if (blob_backend && *blob_backend) {
+		if (!strcmp(blob_backend, "fs")) {
+			/* The default, retained for explicitly-configured test fixtures. */
+		} else if (!strcmp(blob_backend, "s3")) {
+			opts.backend = VEX_STORE_BACKEND_FS_S3;
+			opts.blob_s3 = &blob_s3;
+		} else {
+			free(repo_id);
+			return VEX_STORE_ERR_INVALID;
+		}
+	}
 
 	if ((!opts.root || !*opts.root) &&
 	    !repo_config_get_value(repo, "vex.storeroot", &configured_root) &&

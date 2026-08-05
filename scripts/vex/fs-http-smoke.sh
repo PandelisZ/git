@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 
-# Run a stock-Git smart-HTTP client against a Vex-FS server.  This is a local
-# protocol gate, intentionally separate from the Docker classic-bare bootstrap
-# and from the future MySQL/MinIO deployment.
+# Run a stock-Git smart-HTTP client against a Vex server with FS metadata.
+# Its blob backend is selected by GIT_VEX_BLOB_BACKEND (FS by default, or an
+# external S3-compatible store). This local protocol gate is intentionally
+# separate from the Docker classic-bare bootstrap and future MySQL metadata.
 set -euo pipefail
 
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
@@ -48,6 +49,15 @@ done
 [ -x "$stock_git_bin" ] || { printf 'vex fs-http smoke: stock Git executable not found: %s\n' "$stock_git_bin" >&2; exit 2; }
 command -v python3 >/dev/null || { printf '%s\n' 'vex fs-http smoke: python3 is required' >&2; exit 2; }
 command -v curl >/dev/null || { printf '%s\n' 'vex fs-http smoke: curl is required' >&2; exit 2; }
+
+blob_backend=${GIT_VEX_BLOB_BACKEND:-fs}
+case "$blob_backend" in
+fs|s3) ;;
+*)
+	printf 'vex fs-http smoke: GIT_VEX_BLOB_BACKEND must be fs or s3, got: %s\n' "$blob_backend" >&2
+	exit 2
+	;;
+esac
 
 # The in-tree test harness exports its build directory as GIT_EXEC_PATH.  A
 # stock client must discover its own remote helpers rather than accidentally
@@ -166,11 +176,18 @@ case "$health" in
 	;;
 esac
 case "$health" in
-*'"storage_backend": "fs"'*) ;;
+*'"metadata_backend": "fs"'*) ;;
 *)
-	printf 'vex fs-http smoke: endpoint did not report the FS storage backend: %s\n' "$health" >&2
+	printf 'vex fs-http smoke: endpoint did not report FS metadata: %s\n' "$health" >&2
 	exit 1
 	;;
+esac
+case "$health" in
+*"\"blob_backend\": \"$blob_backend\""*) ;;
+*)
+	printf 'vex fs-http smoke: endpoint did not report the selected %s blob backend: %s\n' "$blob_backend" "$health" >&2
+	exit 1
+;;
 esac
 
 stock_git clone -q "$origin" "$work/client"
@@ -186,7 +203,7 @@ stock_git -C "$work/client" fsck --no-progress >/dev/null
 assert_no_classic_bytes
 
 if [ "$read_only" -eq 1 ]; then
-	printf 'vex fs-http smoke: PASS Vex-FS stock-Git clone/fetch (%s)\n' "$origin"
+	printf 'vex fs-http smoke: PASS Vex (FS metadata, %s blobs) stock-Git clone/fetch (%s)\n' "$blob_backend" "$origin"
 	exit 0
 fi
 
@@ -205,4 +222,4 @@ actual_push=$(vex_git rev-parse refs/heads/stock-client)
 vex_git cat-file -e "$actual_push^{commit}"
 vex_git cat-file -e "$actual_push^{tree}"
 assert_no_classic_bytes
-printf 'vex fs-http smoke: PASS Vex-FS stock-Git clone/fetch/push (%s)\n' "$origin"
+printf 'vex fs-http smoke: PASS Vex (FS metadata, %s blobs) stock-Git clone/fetch/push (%s)\n' "$blob_backend" "$origin"

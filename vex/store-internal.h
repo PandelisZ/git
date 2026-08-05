@@ -3,6 +3,7 @@
 
 #include "vex/store.h"
 #include "vex/blob-fs.h"
+#include "vex/blob-s3.h"
 #include "vex/meta-fs.h"
 #include "lockfile.h"
 
@@ -87,7 +88,9 @@ struct vex_store {
 	char *repo_id;
 	const struct git_hash_algo *hash_algo;
 	struct vex_meta_fs *meta;
-	struct vex_blob_fs *blob;
+	struct vex_blob_fs *blob_fs;
+	struct vex_blob_s3 *blob_s3;
+	unsigned int blob_s3_checked:1;
 };
 
 struct vex_epoch {
