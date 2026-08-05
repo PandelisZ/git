@@ -350,9 +350,14 @@ static int run_curl_parallel(struct vex_blob_s3 *blob,
 		goto out;
 
 	xsnprintf(parallel, sizeof(parallel), "%u", VEX_S3_BATCH_PARALLEL);
-	strvec_pushl(&curl.args, "curl", "--config", config_file->filename.buf,
-		     "--silent", "--show-error", "--fail", "--parallel",
-		     "--parallel-max", parallel, NULL);
+	/*
+	 * Put global output controls before the config's `next` sections.  curl
+	 * otherwise restores its progress meter for later transfers and leaks
+	 * transport progress into receive-pack's smart-HTTP sideband.
+	 */
+	strvec_pushl(&curl.args, "curl", "--silent", "--show-error", "--fail",
+		     "--parallel", "--parallel-max", parallel, "--config",
+		     config_file->filename.buf, NULL);
 	if (blob->ca_file)
 		strvec_pushl(&curl.args, "--cacert", blob->ca_file, NULL);
 	if (blob->insecure_tls)

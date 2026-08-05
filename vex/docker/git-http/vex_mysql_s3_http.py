@@ -57,6 +57,13 @@ MAX_CGI_HEADER_BYTES = int(os.environ.get("VEX_HTTP_MAX_CGI_HEADER_BYTES", "6553
 MAX_CHUNK_LINE_BYTES = int(os.environ.get("VEX_HTTP_MAX_CHUNK_LINE_BYTES", "8192"))
 MAX_CHUNK_TRAILER_BYTES = int(os.environ.get("VEX_HTTP_MAX_CHUNK_TRAILER_BYTES", "65536"))
 STREAM_CHUNK_BYTES = int(os.environ.get("VEX_HTTP_STREAM_CHUNK_BYTES", "65536"))
+# A receive-pack result is control/status data, never a clone pack. Buffer it
+# until CGI exits so a killed receive worker becomes a prompt HTTP failure
+# instead of a syntactically incomplete smart-HTTP result that can leave a
+# stock client waiting for report-status forever.
+MAX_RECEIVE_RESPONSE_BYTES = int(
+    os.environ.get("VEX_HTTP_MAX_RECEIVE_RESPONSE_BYTES", str(8 * 1024 * 1024))
+)
 CGI_TIMEOUT_SECONDS = int(os.environ.get("VEX_HTTP_CGI_TIMEOUT_SECONDS", "300"))
 IO_TIMEOUT_SECONDS = int(os.environ.get("VEX_HTTP_IO_TIMEOUT_SECONDS", "300"))
 CERT = os.environ.get("VEX_HTTP_TLS_CERT", "/certs/localhost.pem")
@@ -999,6 +1006,7 @@ class VexMySQLS3HTTPRequestHandler(BaseHTTPRequestHandler):
         timeout.start()
 
         response_started = False
+        buffer_receive_response = environ.get("PATH_INFO", "").endswith("/git-receive-pack")
         try:
             try:
                 status, headers, body_prefix = read_cgi_response_headers(process.stdout)
@@ -1018,6 +1026,46 @@ class VexMySQLS3HTTPRequestHandler(BaseHTTPRequestHandler):
             if pump.done.is_set() and isinstance(pump.error, RequestBodyError):
                 self._stop_backend(process)
                 self._send_backend_error(400, "truncated request body")
+                return
+
+            if buffer_receive_response:
+                response_body = bytearray(body_prefix)
+                if len(response_body) > MAX_RECEIVE_RESPONSE_BYTES:
+                    self._stop_backend(process)
+                    self._send_backend_error(502, "git-receive-pack response exceeds Vex limit")
+                    return
+                while True:
+                    chunk = process.stdout.read(STREAM_CHUNK_BYTES)
+                    if not chunk:
+                        break
+                    if len(response_body) + len(chunk) > MAX_RECEIVE_RESPONSE_BYTES:
+                        self._stop_backend(process)
+                        self._send_backend_error(502, "git-receive-pack response exceeds Vex limit")
+                        return
+                    response_body.extend(chunk)
+                process.wait()
+                if process.returncode:
+                    sys.stderr.write(
+                        "vex mysql-s3-http: git-http-backend exited with "
+                        f"status {process.returncode}\n"
+                    )
+                    self._send_backend_error(
+                        504 if timed_out.is_set() else 502,
+                        "git-receive-pack timed out" if timed_out.is_set()
+                        else "git-receive-pack failed",
+                    )
+                    return
+
+                self.send_response(status)
+                for name, value in headers:
+                    self.send_header(name, value)
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.close_connection = True
+                response_started = True
+                if self.command != "HEAD" and response_body:
+                    self.wfile.write(response_body)
+                self.wfile.flush()
                 return
 
             self.send_response(status)
@@ -1143,6 +1191,7 @@ def require_configuration() -> None:
         "VEX_HTTP_MAX_CHUNK_LINE_BYTES": MAX_CHUNK_LINE_BYTES,
         "VEX_HTTP_MAX_CHUNK_TRAILER_BYTES": MAX_CHUNK_TRAILER_BYTES,
         "VEX_HTTP_STREAM_CHUNK_BYTES": STREAM_CHUNK_BYTES,
+        "VEX_HTTP_MAX_RECEIVE_RESPONSE_BYTES": MAX_RECEIVE_RESPONSE_BYTES,
         "VEX_HTTP_CGI_TIMEOUT_SECONDS": CGI_TIMEOUT_SECONDS,
         "VEX_HTTP_IO_TIMEOUT_SECONDS": IO_TIMEOUT_SECONDS,
     }
