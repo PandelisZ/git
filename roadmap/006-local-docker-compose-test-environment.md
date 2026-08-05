@@ -302,7 +302,7 @@ scripts/vex/bench-clone.sh \
   --runs 5 --warmups 1 \
   --output roadmap/evidence/perf-git-git-local-control.json
 
-# Once a classic disk control is exposed through the same HTTPS frontend:
+# L4 route only: https://same-host:port/__vex_bench_disk__/git-git-disk.git
 BENCH_INCLUDE_GITHUB=1 scripts/vex/bench-clone.sh \
   --origin "$GIT_VEX_ORIGIN" \
   --disk-origin "$GIT_VEX_DISK_ORIGIN" \
@@ -354,8 +354,11 @@ being timed.
 
 `scripts/vex/bench-clone.sh` currently:
 
-1. Takes a Vex HTTPS origin, branch, output path, and either
-   `--disk-origin HTTPS_URL` or a legacy local `--baseline` bare repository.
+1. Takes a Vex HTTPS origin, branch, output path, and either the fixed
+   same-frontend `--disk-origin`
+   `https://<same-host-and-port>/__vex_bench_disk__/git-git-disk.git` or a
+   legacy local `--baseline` bare repository. Credentials, query strings,
+   fragments, alternate paths, and alternate frontends are rejected.
 2. Records a deterministic source identity (Git commit/dirty bit), Compose
    file SHA-256/project, environment, optional seed-manifest SHA-256, exact
    branch OID, and every raw warmup/measured trial.

@@ -17,8 +17,10 @@ usage: scripts/vex/bench-clone.sh --origin HTTPS_URL \
        --branch BRANCH --output RESULT.json [options]
 
 Run fresh stock-Git --no-checkout clones from a Vex HTTPS repository and a
-matched disk control. --disk-origin is the L4-shaped same-HTTPS-front-end
-control; --baseline is retained for small local measurement smoke tests.
+matched disk control. --disk-origin is reserved for the L4-shaped control:
+it must be exactly
+https://<same-host-and-port>/__vex_bench_disk__/git-git-disk.git. --baseline
+is retained for small local measurement smoke tests.
 
 Core options:
   --runs N                         measured clones per source (default: 5)
@@ -30,7 +32,7 @@ Core options:
   --fixture NAME                   fixture identity, e.g. git-git
 
 Gate options:
-  --require-disk-gate              require an HTTPS disk control and Vex p50 <= 1.5x
+  --require-disk-gate              require fixed same-frontend HTTPS disk and Vex p50 <= 1.5x
   --max-disk-ratio R               disk threshold (default: 1.5)
   --require-stable                 fail if fewer than five trials or CV > 15%
   --max-cv-percent P               CV threshold (default: 15)
@@ -485,6 +487,76 @@ refname = "refs/heads/{}".format(branch)
 
 class BenchmarkError(RuntimeError):
 	pass
+
+
+DISK_CONTROL_PATH = "/__vex_bench_disk__/git-git-disk.git"
+DISK_CONTROL_TEMPLATE = "https://<same-host-and-port>{}".format(DISK_CONTROL_PATH)
+
+
+def parse_https_endpoint(value: str, option: str) -> dict[str, object]:
+	"""Reject URL forms that can hide a different frontend or credential."""
+	try:
+		parsed = urlsplit(value)
+	except ValueError as error:
+		raise BenchmarkError("{} must be a valid HTTPS URL: {}".format(option, error))
+	if parsed.scheme != "https" or not parsed.netloc or not parsed.hostname:
+		raise BenchmarkError("{} must be a valid HTTPS URL".format(option))
+	if parsed.username is not None or parsed.password is not None:
+		raise BenchmarkError("{} must not include credentials".format(option))
+	if parsed.query:
+		raise BenchmarkError("{} must not include a query string".format(option))
+	if parsed.fragment:
+		raise BenchmarkError("{} must not include a fragment".format(option))
+	try:
+		explicit_port = parsed.port
+	except ValueError as error:
+		raise BenchmarkError("{} has an invalid port: {}".format(option, error))
+	# urlsplit accepts an empty `host:` port and reports it as None. Do not
+	# silently normalize that malformed authority to port 443.
+	hostport = parsed.netloc.rsplit("@", 1)[-1]
+	if hostport.endswith(":"):
+		raise BenchmarkError("{} has an empty port".format(option))
+	return {
+		"host": parsed.hostname.lower(),
+		"port": explicit_port if explicit_port is not None else 443,
+		"path": parsed.path,
+	}
+
+
+def format_frontend(endpoint: dict[str, object]) -> str:
+	host = str(endpoint["host"])
+	if ":" in host:
+		host = "[{}]".format(host)
+	return "{}:{}".format(host, endpoint["port"])
+
+
+try:
+	origin_endpoint = parse_https_endpoint(origin, "--origin")
+	if disk_kind == "https":
+		disk_endpoint = parse_https_endpoint(disk_source, "--disk-origin")
+		if disk_endpoint["path"] != DISK_CONTROL_PATH:
+			raise BenchmarkError(
+				"--disk-origin must be exactly {}"
+				.format(DISK_CONTROL_TEMPLATE)
+			)
+		if (
+			disk_endpoint["host"] != origin_endpoint["host"]
+			or disk_endpoint["port"] != origin_endpoint["port"]
+		):
+			raise BenchmarkError(
+				"--disk-origin must use the same HTTPS frontend as --origin "
+				"(expected {}, got {})".format(
+					format_frontend(origin_endpoint),
+					format_frontend(disk_endpoint),
+				)
+			)
+		disk_control_is_l4_shape = True
+	else:
+		disk_endpoint = None
+		disk_control_is_l4_shape = False
+except BenchmarkError as error:
+	print("vex clone benchmark: {}".format(error), file=sys.stderr)
+	raise SystemExit(2)
 
 
 def now_utc() -> str:
@@ -1117,7 +1189,8 @@ payload: dict[str, object] = {
 		"disk_control": {
 			"source": disk_display,
 			"transport": "https" if disk_kind == "https" else "local_path",
-			"same_https_frontend": disk_kind == "https",
+			"same_https_frontend": disk_control_is_l4_shape,
+			"fixed_l4_path": disk_control_is_l4_shape,
 		},
 		"github": {
 			"included": include_github,
@@ -1277,15 +1350,16 @@ try:
 		"required": require_disk_gate,
 		"evaluated": True,
 		"threshold_ratio": max_disk_ratio,
-	"observed_ratio_p50": disk_ratio,
-	"disk_transport": "https" if disk_kind == "https" else "local_path",
-	"same_https_frontend": disk_kind == "https",
-	"threshold_pass": disk_ratio <= max_disk_ratio,
-	# A local-path comparison remains useful for smoke measurements, but the
-	# PRD's structural acceptance control is the same HTTPS frontend.
-	"l4_eligible_control": disk_kind == "https",
-	"pass": disk_ratio <= max_disk_ratio and disk_kind == "https",
-}
+		"observed_ratio_p50": disk_ratio,
+		"disk_transport": "https" if disk_kind == "https" else "local_path",
+		"same_https_frontend": disk_control_is_l4_shape,
+		"fixed_l4_path": disk_control_is_l4_shape,
+		"threshold_pass": disk_ratio <= max_disk_ratio,
+		# A local-path comparison remains useful for smoke measurements, but the
+		# PRD's structural acceptance control is the fixed same-frontend route.
+		"l4_eligible_control": disk_control_is_l4_shape,
+		"pass": disk_ratio <= max_disk_ratio and disk_control_is_l4_shape,
+	}
 	if include_github:
 		github_ratio = float(payload["ratio_vex_to_github"]["p50"])
 		payload["gates"]["github"] = {

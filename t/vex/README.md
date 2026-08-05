@@ -75,9 +75,13 @@ scripts/vex/bench-clone.sh \
   --output roadmap/evidence/perf-git-git-local-control.json
 ```
 
-Once a classic disk control is exposed through the same HTTPS gateway, use
-`--disk-origin` plus `--require-disk-gate`; the runner then requires p50 Vex
-clone time ≤1.5× disk p50 and at least five trials with CV≤15%. Add
+The L4 disk origin is deliberately not configurable to an arbitrary repository:
+for `--origin https://HOST:PORT/git/git.git`, it must be exactly
+`https://HOST:PORT/__vex_bench_disk__/git-git-disk.git`. The runner rejects a
+different host/port/path and any credentials, query string, or fragment before
+it contacts either endpoint. Use that `--disk-origin` plus
+`--require-disk-gate`; the runner then requires p50 Vex clone time ≤1.5× disk
+p50 and at least five trials with CV≤15%. Add
 `BENCH_INCLUDE_GITHUB=1 --require-github` for the exact-ref GitHub gate, and
 `--fetch-after-push --require-fetch-after-push-gate` for the ≤2× disk fetch
 gate. Fetch measurement briefly moves the chosen branch and restores it with

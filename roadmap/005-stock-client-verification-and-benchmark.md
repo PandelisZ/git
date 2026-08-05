@@ -414,11 +414,13 @@ stack it is timing.
 
 1. Seed `git/git` with `scripts/vex/seed-git-git.sh`; it writes the redacted
    `t/vex/out/seed-manifest.json` used to bind a result to the imported graph.
-2. Supply a Vex HTTPS origin and, for the L4-shaped structural gate, a classic
-   disk control exposed through the **same HTTPS frontend** using
-   `--disk-origin`. The temporary `--baseline` local-path mode is useful for
-   fixture/smoke measurement only and deliberately cannot pass
-   `--require-disk-gate`.
+2. Supply a Vex HTTPS origin and, for the L4-shaped structural gate, the
+   reserved classic disk control on the **same HTTPS frontend**:
+   `https://<same-host-and-port>/__vex_bench_disk__/git-git-disk.git`.
+   `--disk-origin` rejects a different authority/path and all credentials,
+   query strings, and fragments before any timed request. The temporary
+   `--baseline` local-path mode is useful for fixture/smoke measurement only
+   and deliberately cannot pass `--require-disk-gate`.
 3. The runner discards only explicitly recorded warmups, then takes N fresh
    cold-client clones in rotating source order. It records every warmup,
    measured clone, push, fetch, and restoration command in `trials[]`; there
@@ -443,6 +445,7 @@ stack it is timing.
 Example acceptance-shaped invocation (not a statement that it has been run):
 
 ```sh
+# GIT_VEX_DISK_ORIGIN=https://same-host:port/__vex_bench_disk__/git-git-disk.git
 BENCH_INCLUDE_GITHUB=1 scripts/vex/bench-clone.sh \
   --origin "$GIT_VEX_ORIGIN" \
   --disk-origin "$GIT_VEX_DISK_ORIGIN" \
