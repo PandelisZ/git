@@ -136,6 +136,14 @@ sealed:[1-9]*:git/v1/"$repo_id"/packs/*.pack:git/v1/"$repo_id"/packs/*.idx) ;;
 esac
 covering_generation=${pack_state#sealed:}
 covering_generation=${covering_generation%%:*}
+initial_rebuild_requests=$(mysql_query "
+	SELECT COUNT(*) FROM pack_rebuild_requests
+	 WHERE repo_id = UNHEX('$repo_id');")
+[ "$initial_rebuild_requests" = 0 ] || {
+	printf 'vex pack artifact E2E: successful initial build left %s queued rebuild request(s)\n' \
+		"$initial_rebuild_requests" >&2
+	exit 1
+}
 registered_before=$(mysql_query "
 	SELECT COUNT(*) FROM pack_objects WHERE repo_id = UNHEX('$repo_id');")
 [ "$registered_before" = "$object_count" ] || {
@@ -184,6 +192,116 @@ if [ "$post_push_state" != obsolete ] ||
 	exit 1
 fi
 
+# A receive only queues work.  It must not synchronously replace the obsolete
+# pack, and the work item must begin in a nonzero server-side debounce window.
+first_rebuild_request=$(mysql_query "
+	SELECT CONCAT(target_generation, '|',
+			  DATE_FORMAT(not_before, '%Y%m%d%H%i%s.%f'), '|',
+			  TIMESTAMPDIFF(MICROSECOND, requested_at, not_before))
+	  FROM pack_rebuild_requests
+	 WHERE repo_id = UNHEX('$repo_id');")
+post_push_latest_generation=$(mysql_query "
+	SELECT COALESCE(MAX(generation), 0) FROM generations
+	 WHERE repo_id = UNHEX('$repo_id') AND state = 'sealed';")
+case "$first_rebuild_request" in
+"$post_push_latest_generation"'|'*'|'*) ;;
+*)
+	printf 'vex pack artifact E2E: stale pack invalidation did not queue the latest generation (%s, expected %s)\n' \
+		"$first_rebuild_request" "$post_push_latest_generation" >&2
+	exit 1
+	;;
+esac
+first_request_not_before=${first_rebuild_request#*|}
+first_request_not_before=${first_request_not_before%%|*}
+first_request_delay=${first_rebuild_request##*|}
+case "$first_request_delay" in
+''|*[!0-9]*|0)
+	printf 'vex pack artifact E2E: rebuild request has no positive debounce: %s\n' \
+		"$first_rebuild_request" >&2
+	exit 1
+	;;
+esac
+deferred_output=$(VEX_COMPOSE_NO_BUILD=1 VEX_COMPOSE_ALREADY_UP=1 \
+	"$root/scripts/vex/rebuild-pack.sh" "$repo_name")
+case "$deferred_output" in
+"vex build-pack: NOOP repository=$repo_name reason=debounced-or-not-requested") ;;
+*)
+	printf 'vex pack artifact E2E: due-only builder ignored debounce: %s\n' \
+		"$deferred_output" >&2
+	exit 1
+	;;
+esac
+
+# A second push joins the existing request.  It advances the target without
+# resetting not_before, so a sustained push stream batches rather than runs a
+# full repack per receive or starves the eventual operator job.
+printf 'post-pack coalesced receive\n' >>"$client/history"
+"$stock_git" -C "$client" add history
+"$stock_git" -C "$client" -c commit.gpgSign=false commit -q \
+	-m 'post-pack coalesced receive'
+tip=$("$stock_git" -C "$client" rev-parse HEAD)
+git_https -C "$client" push -q origin HEAD:refs/heads/main
+coalesced_rebuild_request=$(mysql_query "
+	SELECT CONCAT(target_generation, '|',
+			  DATE_FORMAT(not_before, '%Y%m%d%H%i%s.%f'))
+	  FROM pack_rebuild_requests
+	 WHERE repo_id = UNHEX('$repo_id');")
+coalesced_latest_generation=$(mysql_query "
+	SELECT COALESCE(MAX(generation), 0) FROM generations
+	 WHERE repo_id = UNHEX('$repo_id') AND state = 'sealed';")
+case "$coalesced_rebuild_request" in
+"$coalesced_latest_generation"'|'*) ;;
+*)
+	printf 'vex pack artifact E2E: coalesced rebuild target is not current: %s (expected %s)\n' \
+		"$coalesced_rebuild_request" "$coalesced_latest_generation" >&2
+	exit 1
+	;;
+esac
+coalesced_not_before=${coalesced_rebuild_request#*|}
+[ "$coalesced_not_before" = "$first_request_not_before" ] || {
+	printf 'vex pack artifact E2E: coalesced push reset debounce (%s -> %s)\n' \
+		"$first_request_not_before" "$coalesced_not_before" >&2
+	exit 1
+}
+
+# This disposable test repository may advance its server-side due time without
+# waiting for the production-sized debounce.  The due-only operator command
+# then builds the newest generation and clears only the request it covered.
+mysql_query "
+	UPDATE pack_rebuild_requests
+	   SET not_before = CURRENT_TIMESTAMP(6)
+	 WHERE repo_id = UNHEX('$repo_id');" >/dev/null
+rebuild_output=$(VEX_COMPOSE_NO_BUILD=1 VEX_COMPOSE_ALREADY_UP=1 \
+	"$root/scripts/vex/rebuild-pack.sh" "$repo_name")
+case "$rebuild_output" in
+*"vex build-pack: PASS repository=$repo_name"*' rebuild_request=cleared') ;;
+*)
+	printf 'vex pack artifact E2E: due-only builder did not rebuild/clear current work: %s\n' \
+		"$rebuild_output" >&2
+	exit 1
+	;;
+esac
+current_pack_count=$(mysql_query "
+	SELECT COUNT(*) FROM pack_envelopes AS p
+	 WHERE p.repo_id = UNHEX('$repo_id')
+	   AND p.state = 'sealed'
+	   AND p.covering_generation = (
+		SELECT MAX(g.generation) FROM generations AS g
+		 WHERE g.repo_id = UNHEX('$repo_id') AND g.state = 'sealed');")
+[ "$current_pack_count" = 1 ] || {
+	printf 'vex pack artifact E2E: due-only builder did not seal one current pack: %s\n' \
+		"$current_pack_count" >&2
+	exit 1
+}
+pending_rebuild_requests=$(mysql_query "
+	SELECT COUNT(*) FROM pack_rebuild_requests
+	 WHERE repo_id = UNHEX('$repo_id');")
+[ "$pending_rebuild_requests" = 0 ] || {
+	printf 'vex pack artifact E2E: current rebuild left %s queued request(s)\n' \
+		"$pending_rebuild_requests" >&2
+	exit 1
+}
+
 fresh="$scratch/fresh"
 "$stock_git" -c http.sslCAInfo="$ca_file" clone -q "$origin" "$fresh"
 fresh_tip=$("$stock_git" -C "$fresh" rev-parse refs/heads/main)
@@ -203,5 +321,5 @@ case "$scrub_output" in
 	;;
 esac
 
-printf 'vex pack artifact E2E: PASS custom-Git pack/index lives in S3, MySQL retains %s object(s) in an obsolete envelope after a later stock-Git push/clone/fsck/scrub for %s\n' \
-	"$object_count" "$origin"
+printf 'vex pack artifact E2E: PASS custom-Git pack/index lives in S3; stale envelopes become ineligible, two receives coalesce one debounced MySQL rebuild request, and the due-only operator builder seals the current generation before stock clone/fsck/scrub for %s\n' \
+	"$origin"

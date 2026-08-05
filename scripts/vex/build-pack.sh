@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 
 # Build one immutable, derived pack artifact from a live Vex MySQL+S3
-# repository.  This is deliberately an operator-side pack-builder spike: it
-# records only pack metadata in MySQL and stores pack/index bytes in MinIO/S3.
-# It does not make a pack eligible for the upload-pack serving path.
+# repository.  This is deliberately an operator-side builder: it records only
+# pack metadata in MySQL and stores pack/index bytes in MinIO/S3.  A normal
+# invocation builds the current generation immediately; --due consumes only a
+# durable, debounced rebuild request created by a prior receive.
 set -euo pipefail
 
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
@@ -12,15 +13,27 @@ docker_dir="$repo_root/vex/docker"
 env_file="$docker_dir/.env"
 
 usage() {
-	printf '%s\n' 'usage: scripts/vex/build-pack.sh <repository.git>'
+	printf '%s\n' 'usage: scripts/vex/build-pack.sh [--due] <repository.git>'
 }
 
-if [ "$#" -ne 1 ]; then
+due_only=0
+case "$#" in
+1) repo_name=$1 ;;
+2)
+	if [ "$1" = --due ]; then
+		due_only=1
+		repo_name=$2
+	else
+		usage >&2
+		exit 2
+	fi
+	;;
+*)
 	usage >&2
 	exit 2
-fi
+	;;
+esac
 
-repo_name=$1
 case "$repo_name" in
 ''|/*|*..*|*'//'*|*$'\n'*|*$'\r'*)
 	printf 'vex build-pack: invalid repository name: %s\n' "$repo_name" >&2
@@ -105,6 +118,31 @@ case "$covering_generation" in
 	exit 1
 	;;
 esac
+
+if [ "$due_only" -eq 1 ]; then
+	due_generation=$(mysql_query "
+		SELECT target_generation
+		  FROM pack_rebuild_requests
+		 WHERE repo_id = UNHEX('$repo_id')
+		   AND not_before <= CURRENT_TIMESTAMP(6);")
+	case "$due_generation" in
+	'')
+		printf 'vex build-pack: NOOP repository=%s reason=debounced-or-not-requested\n' \
+			"$repo_name"
+		exit 0
+		;;
+	*[!0-9]*)
+		printf 'vex build-pack: invalid queued generation for %s: %s\n' \
+			"$repo_name" "$due_generation" >&2
+		exit 1
+		;;
+	esac
+	if [ "$due_generation" -gt "$covering_generation" ]; then
+		printf 'vex build-pack: queued generation %s exceeds current sealed generation %s for %s\n' \
+			"$due_generation" "$covering_generation" "$repo_name" >&2
+		exit 1
+	fi
+fi
 
 run_id="$(date +%s)-$$"
 remote_work="/var/git-scratch/vex-pack-${run_id}"
@@ -262,6 +300,9 @@ registered_count=$(mysql_admin_query "
 	INSERT INTO pack_objects (repo_id, pack_id, oid)
 		SELECT UNHEX('$repo_id'), UNHEX('$pack_id_padded'), $oid_sql
 		  FROM vex_pack_input;
+	DELETE FROM pack_rebuild_requests
+	 WHERE repo_id = UNHEX('$repo_id')
+	   AND target_generation <= $covering_generation;
 	SELECT COUNT(*)
 	  FROM pack_objects
 	 WHERE repo_id = UNHEX('$repo_id')
@@ -277,6 +318,20 @@ case "$registered_count" in
 esac
 pack_registered=1
 
-printf 'vex build-pack: PASS repository=%s pack=%s objects=%s generation=%s pack_key=%s idx_key=%s pack_bytes=%s idx_bytes=%s\n' \
+pending_rebuild_generation=$(mysql_query "
+	SELECT target_generation
+	  FROM pack_rebuild_requests
+	 WHERE repo_id = UNHEX('$repo_id');")
+case "$pending_rebuild_generation" in
+'') rebuild_request=cleared ;;
+*[!0-9]*)
+	printf 'vex build-pack: invalid pending generation for %s: %s\n' \
+		"$repo_name" "$pending_rebuild_generation" >&2
+	exit 1
+	;;
+*) rebuild_request="pending:$pending_rebuild_generation" ;;
+esac
+
+printf 'vex build-pack: PASS repository=%s pack=%s objects=%s generation=%s pack_key=%s idx_key=%s pack_bytes=%s idx_bytes=%s rebuild_request=%s\n' \
 	"$repo_name" "$pack_id" "$object_count" "$covering_generation" \
-	"$pack_key" "$idx_key" "$pack_bytes" "$idx_bytes"
+	"$pack_key" "$idx_key" "$pack_bytes" "$idx_bytes" "$rebuild_request"

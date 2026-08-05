@@ -129,7 +129,7 @@ const char *vex_meta_mysql_error(const struct vex_meta_mysql *db);
 
 int vex_meta_mysql_ping(struct vex_meta_mysql *db);
 
-/* Verify the twelve Vex metadata tables and objects.blob_key's metadata type. */
+/* Verify the thirteen Vex metadata tables and objects.blob_key's metadata type. */
 int vex_meta_mysql_schema_check(struct vex_meta_mysql *db,
 				unsigned int *table_count);
 

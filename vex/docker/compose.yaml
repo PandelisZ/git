@@ -121,6 +121,9 @@ services:
       # The normal recovery grace defaults to 900 seconds.  Tests lower it
       # only on an idle restart; they never enable it during a receive.
       GIT_VEX_EPOCH_RECOVERY_SECONDS: ${GIT_VEX_EPOCH_RECOVERY_SECONDS:-}
+      # A receiver records one MySQL rebuild request instead of repacking under
+      # its publish lock. Blank uses the source default of 60 seconds.
+      GIT_VEX_PACK_REBUILD_DELAY_SECONDS: ${GIT_VEX_PACK_REBUILD_DELAY_SECONDS:-}
       # Test-only receive-worker crash injection.
       GIT_VEX_TEST_KILL_AT: ${GIT_VEX_TEST_KILL_AT:-}
       GIT_VEX_TEST_EPOCH_RECOVERY_SECONDS: ${GIT_VEX_TEST_EPOCH_RECOVERY_SECONDS:-}

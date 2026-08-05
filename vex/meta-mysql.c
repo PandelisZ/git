@@ -506,6 +506,8 @@ int vex_meta_mysql_state_save_locked(struct vex_meta_mysql *db,
 
 #define VEX_META_MYSQL_ERROR_SIZE 512
 #define VEX_META_MYSQL_SWEEP_MAX_SECONDS (365U * 24U * 60U * 60U)
+#define VEX_META_MYSQL_PACK_REBUILD_DEFAULT_DELAY_SECONDS 60U
+#define VEX_META_MYSQL_PACK_REBUILD_MAX_DELAY_SECONDS 86400U
 
 struct vex_meta_mysql {
 	MYSQL *mysql;
@@ -1065,6 +1067,30 @@ static int ensure_clone_leases_table(struct vex_meta_mysql *db)
 }
 
 /*
+ * A repository may have at most one outstanding pack rebuild request.  It
+ * holds no Git bytes and deliberately has no pack-row foreign key: a receive
+ * can invalidate an immutable envelope before an operator-side builder has
+ * materialized the replacement.
+ */
+static int ensure_pack_rebuild_requests_table(struct vex_meta_mysql *db)
+{
+	static const char create_sql[] =
+		"CREATE TABLE IF NOT EXISTS pack_rebuild_requests ("
+		"repo_id BINARY(16) NOT NULL, "
+		"target_generation BIGINT UNSIGNED NOT NULL, "
+		"requested_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6), "
+		"last_requested_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6), "
+		"not_before DATETIME(6) NOT NULL, "
+		"PRIMARY KEY (repo_id), "
+		"KEY pack_rebuild_requests_due (not_before, repo_id), "
+		"CONSTRAINT pack_rebuild_requests_repo_fk FOREIGN KEY (repo_id) "
+		"REFERENCES repositories (repo_id)"
+		") ENGINE=InnoDB";
+
+	return mysql_exec(db, create_sql);
+}
+
+/*
  * Existing Compose volumes predate destructive sweeping.  Keep this additive
  * migration alongside schema.sql so an operator can restart into a safe
  * tombstone protocol without resetting otherwise durable Vex metadata.
@@ -1099,7 +1125,7 @@ int vex_meta_mysql_schema_check(struct vex_meta_mysql *db,
 		"('repositories','generations','objects','generation_objects',"
 		"'commit_parents','refs','ref_updates','object_pins',"
 		"'pack_envelopes','pack_objects','clone_leases',"
-		"'object_sweep_tombstones')";
+		"'pack_rebuild_requests','object_sweep_tombstones')";
 	static const char blob_key_sql[] =
 		"SELECT COUNT(*) FROM information_schema.columns "
 		"WHERE table_schema = DATABASE() AND table_name = 'objects' "
@@ -1114,17 +1140,20 @@ int vex_meta_mysql_schema_check(struct vex_meta_mysql *db,
 	ret = ensure_clone_leases_table(db);
 	if (ret)
 		return ret;
+	ret = ensure_pack_rebuild_requests_table(db);
+	if (ret)
+		return ret;
 	ret = ensure_sweep_tombstones_table(db);
 	if (ret)
 		return ret;
 	ret = query_one_u64(db, table_sql, &tables, &found);
 	if (ret)
 		return ret;
-	if (!found || tables != 12) {
+	if (!found || tables != 13) {
 		if (table_count)
 			*table_count = found && tables <= UINT_MAX ? tables : 0;
 		return set_error(db, VEX_META_MYSQL_ERR_SCHEMA,
-				 "expected 12 Vex metadata tables, found %" PRIu64,
+				 "expected 13 Vex metadata tables, found %" PRIu64,
 				 found ? tables : 0);
 	}
 	ret = query_one_u64(db, blob_key_sql, &blob_key, &found);
@@ -4100,6 +4129,96 @@ static int state_saved_pack_is_incomplete(
 	return 0;
 }
 
+static unsigned int pack_rebuild_debounce_seconds(void)
+{
+	const char *value = getenv("GIT_VEX_PACK_REBUILD_DELAY_SECONDS");
+	char *end;
+	unsigned long seconds;
+
+	if (!value || !*value)
+		return VEX_META_MYSQL_PACK_REBUILD_DEFAULT_DELAY_SECONDS;
+	errno = 0;
+	seconds = strtoul(value, &end, 10);
+	if (errno || *end || !seconds ||
+	    seconds > VEX_META_MYSQL_PACK_REBUILD_MAX_DELAY_SECONDS)
+		return VEX_META_MYSQL_PACK_REBUILD_DEFAULT_DELAY_SECONDS;
+	return (unsigned int)seconds;
+}
+
+static int state_has_current_complete_pack(
+		const struct vex_meta_mysql_saved_packs *packs,
+		uint64_t sealed_generation,
+		const struct vex_meta_state *state_snapshot,
+		const struct git_hash_algo *hash_algo)
+{
+	size_t i;
+
+	for (i = 0; i < packs->nr; i++) {
+		const struct vex_meta_mysql_saved_pack *pack = &packs->items[i];
+
+		if (strcmp(pack->state, "sealed") ||
+		    pack->covering_generation != sealed_generation ||
+		    !pack->idx_key || !pack->idx_key_len)
+			continue;
+		if (!state_saved_pack_is_incomplete(packs, pack, state_snapshot,
+						   hash_algo))
+			return 1;
+	}
+	return 0;
+}
+
+/*
+ * A receive never runs pack-objects while its repository state lock is held.
+ * Instead it records a single target generation.  Later receives coalesce
+ * into the same request but retain the first not_before value, giving a busy
+ * repository a bounded batching window rather than indefinitely postponing
+ * its builder.
+ */
+static int state_update_pack_rebuild_request(
+		struct vex_meta_mysql *db, const char *repo,
+		uint64_t sealed_generation, int has_current_pack)
+{
+	char *sql;
+	int ret;
+
+	if (!sealed_generation)
+		return VEX_META_MYSQL_OK;
+	if (has_current_pack) {
+		sql = vex_format("DELETE FROM pack_rebuild_requests "
+				 "WHERE repo_id = %s AND target_generation <= %" PRIu64,
+				 repo, sealed_generation);
+		if (!sql)
+			return set_error(db, VEX_META_MYSQL_ERR_NOMEM,
+					 "could not allocate Vex pack rebuild clear query");
+		ret = mysql_exec(db, sql);
+		free(sql);
+		return ret;
+	} else {
+		unsigned int delay = pack_rebuild_debounce_seconds();
+
+		sql = vex_format("INSERT INTO pack_rebuild_requests "
+				 "(repo_id, target_generation, requested_at, "
+				 "last_requested_at, not_before) VALUES "
+				 "(%s, %" PRIu64 ", CURRENT_TIMESTAMP(6), "
+				 "CURRENT_TIMESTAMP(6), DATE_ADD(CURRENT_TIMESTAMP(6), "
+				 "INTERVAL %u SECOND)) ON DUPLICATE KEY UPDATE "
+				 "target_generation = GREATEST(target_generation, %" PRIu64 "), "
+				 "last_requested_at = CURRENT_TIMESTAMP(6), "
+				 "not_before = LEAST(not_before, "
+				 "DATE_ADD(CURRENT_TIMESTAMP(6), INTERVAL %u SECOND))",
+				 repo, sealed_generation, delay, sealed_generation, delay);
+		if (!sql)
+			return set_error(db, VEX_META_MYSQL_ERR_NOMEM,
+					 "could not allocate Vex pack rebuild queue query");
+		ret = mysql_exec(db, sql);
+		free(sql);
+		if (!ret)
+			trace_printf("vex: queued derived-pack rebuild target=%" PRIu64
+				     " debounce=%us", sealed_generation, delay);
+		return ret;
+	}
+}
+
 static int state_insert_packs(struct vex_meta_mysql *db, const char *repo,
 				      const struct vex_meta_mysql_saved_packs *packs,
 				      uint64_t sealed_generation,
@@ -4605,6 +4724,8 @@ int vex_meta_mysql_state_save_locked(struct vex_meta_mysql *db,
 	char *repo;
 	struct vex_meta_mysql_saved_pins pins = { 0 };
 	struct vex_meta_mysql_saved_packs packs = { 0 };
+	uint64_t sealed_generation;
+	int has_current_pack;
 	int ret;
 
 	if (!db || !db->mysql || !db->state_transaction || !repo_id || !hash_algo ||
@@ -4615,8 +4736,12 @@ int vex_meta_mysql_state_save_locked(struct vex_meta_mysql *db,
 		return set_error(db, VEX_META_MYSQL_ERR_INVALID,
 				 "invalid Vex repository UUID");
 	if ((ret = state_load_pins(db, repo, &pins)) ||
-	    (ret = state_load_packs(db, repo, &packs)) ||
-	    (ret = state_delete_rows(db, repo)) ||
+	    (ret = state_load_packs(db, repo, &packs)))
+		goto out;
+	sealed_generation = state_latest_sealed_generation(state);
+	has_current_pack = state_has_current_complete_pack(&packs,
+			sealed_generation, state, hash_algo);
+	if ((ret = state_delete_rows(db, repo)) ||
 	    (ret = state_insert_epochs(db, repo, state)) ||
 	    (ret = state_insert_objects(db, repo, repo_id, hash_algo, state)) ||
 	    (ret = state_insert_generation_objects(db, repo, hash_algo, state)) ||
@@ -4625,8 +4750,9 @@ int vex_meta_mysql_state_save_locked(struct vex_meta_mysql *db,
 	    (ret = state_insert_ref_updates(db, repo, hash_algo, state)) ||
 	    (ret = state_insert_pins(db, repo, &pins)) ||
 	    (ret = state_insert_packs(db, repo, &packs,
-				      state_latest_sealed_generation(state), state,
-				      hash_algo)))
+			      sealed_generation, state, hash_algo)) ||
+	    (ret = state_update_pack_rebuild_request(db, repo,
+					       sealed_generation, has_current_pack)))
 		goto out;
 	ret = vex_mysql_commit(db);
 	if (!ret)

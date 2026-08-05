@@ -25,8 +25,21 @@ MinIO/S3 bucket.  The gateway initializes `vex-health.git` at startup and its
 `t/vex/mysql-s3-stock-http.sh` creates an empty Vex repository and proves an
 unmodified host Git client can push, clone, fetch, and fsck over local HTTPS.
 It is the Compose data-plane E2E gate, not a clone-SLO benchmark: the server
-still invokes `git-http-backend` per request and has no sealed-pack/bitmap
-read path yet.
+still invokes `git-http-backend` per request and has no p50/bitmap-class SLO
+evidence yet.
+
+Derived packs are immutable S3 artifacts, never the canonical object-byte
+store. Once a receive seals a newer generation, the old pack envelope becomes
+`obsolete` and cannot be selected for serving. The same MySQL transaction
+records one `pack_rebuild_requests` row with the newest target generation.
+Later receives coalesce into that row without moving its original
+`not_before`, so normal pushes never synchronously repack or starve a busy
+repository's builder. The default batching window is 60 seconds; set
+`GIT_VEX_PACK_REBUILD_DELAY_SECONDS` to a bounded nonzero value when starting
+the gateway. An operator or scheduler runs
+`scripts/vex/rebuild-pack.sh group/repository.git` to consume due work.
+`scripts/vex/build-pack.sh group/repository.git` remains the explicit
+immediate rebuild command.
 
 The image keeps the explicitly labelled classic-bare listener as a direct
 image fallback when `VEX_GIT_HTTP_COMMAND` is absent. Compose deliberately

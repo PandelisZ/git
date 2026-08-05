@@ -168,6 +168,23 @@ CREATE TABLE IF NOT EXISTS clone_leases (
 		REFERENCES repositories (repo_id)
 ) ENGINE=InnoDB;
 
+-- A compact, durable work signal for the asynchronous derived-pack builder.
+-- A receive only advances target_generation; it never builds a pack while
+-- holding the repository publish boundary.  not_before starts one bounded
+-- debounce window for a batch and is intentionally not pushed forward by
+-- every later receive, so a busy repository cannot starve its builder.
+CREATE TABLE IF NOT EXISTS pack_rebuild_requests (
+	repo_id BINARY(16) NOT NULL,
+	target_generation BIGINT UNSIGNED NOT NULL,
+	requested_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+	last_requested_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+	not_before DATETIME(6) NOT NULL,
+	PRIMARY KEY (repo_id),
+	KEY pack_rebuild_requests_due (not_before, repo_id),
+	CONSTRAINT pack_rebuild_requests_repo_fk FOREIGN KEY (repo_id)
+		REFERENCES repositories (repo_id)
+) ENGINE=InnoDB;
+
 -- A durable, metadata-only record of the destructive sweep protocol.  An
 -- object remains readable while metadata_deleted_at is NULL.  Once metadata
 -- is removed, the row makes an interrupted S3 delete retryable without ever
