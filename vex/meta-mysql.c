@@ -163,6 +163,105 @@ int vex_meta_mysql_state_for_each_expired_open_locked(
 	return mysql_unavailable();
 }
 
+int vex_meta_mysql_state_for_each_expired_sealed_locked(
+		struct vex_meta_mysql *db, const char *repo_id,
+		unsigned int min_age_seconds,
+		vex_meta_mysql_generation_iter_fn fn, void *cb_data)
+{
+	(void)db;
+	(void)repo_id;
+	(void)min_age_seconds;
+	(void)fn;
+	(void)cb_data;
+	return mysql_unavailable();
+}
+
+int vex_meta_mysql_state_for_each_sweep_tombstone_locked(
+		struct vex_meta_mysql *db, const char *repo_id,
+		vex_meta_mysql_sweep_tombstone_iter_fn fn, void *cb_data)
+{
+	(void)db;
+	(void)repo_id;
+	(void)fn;
+	(void)cb_data;
+	return mysql_unavailable();
+}
+
+int vex_meta_mysql_state_for_each_pending_sweep_blob_locked(
+		struct vex_meta_mysql *db, const char *repo_id,
+		vex_meta_mysql_oid_iter_fn fn, void *cb_data)
+{
+	(void)db;
+	(void)repo_id;
+	(void)fn;
+	(void)cb_data;
+	return mysql_unavailable();
+}
+
+int vex_meta_mysql_state_mark_sweep_tombstone_locked(
+		struct vex_meta_mysql *db, const char *repo_id,
+		const unsigned char *oid, size_t oid_len, uint64_t generation,
+		unsigned int tombstone_seconds, int *marked)
+{
+	(void)db;
+	(void)repo_id;
+	(void)oid;
+	(void)oid_len;
+	(void)generation;
+	(void)tombstone_seconds;
+	if (marked)
+		*marked = 0;
+	return mysql_unavailable();
+}
+
+int vex_meta_mysql_state_cancel_sweep_tombstone_locked(
+		struct vex_meta_mysql *db, const char *repo_id,
+		const unsigned char *oid, size_t oid_len, int *cancelled)
+{
+	(void)db;
+	(void)repo_id;
+	(void)oid;
+	(void)oid_len;
+	if (cancelled)
+		*cancelled = 0;
+	return mysql_unavailable();
+}
+
+int vex_meta_mysql_state_mark_sweep_metadata_deleted_locked(
+		struct vex_meta_mysql *db, const char *repo_id,
+		const unsigned char *oid, size_t oid_len)
+{
+	(void)db;
+	(void)repo_id;
+	(void)oid;
+	(void)oid_len;
+	return mysql_unavailable();
+}
+
+int vex_meta_mysql_state_prepare_sweep_blob_delete_locked(
+		struct vex_meta_mysql *db, const char *repo_id,
+		const unsigned char *oid, size_t oid_len, int *ready)
+{
+	(void)db;
+	(void)repo_id;
+	(void)oid;
+	(void)oid_len;
+	if (ready)
+		*ready = 0;
+	return mysql_unavailable();
+}
+
+int vex_meta_mysql_state_mark_sweep_blob_deleted_locked(
+		struct vex_meta_mysql *db, const char *repo_id,
+		const unsigned char *oid, size_t oid_len)
+{
+	(void)db;
+	(void)repo_id;
+	(void)oid;
+	(void)oid_len;
+	return mysql_unavailable();
+}
+
 int vex_meta_mysql_stage_object(struct vex_meta_mysql *db,
 			 const char *repo_id, uint64_t generation,
 			 const unsigned char *oid, size_t oid_len,
@@ -369,6 +468,12 @@ void vex_meta_mysql_state_unlock(struct vex_meta_mysql *db)
 	(void)db;
 }
 
+int vex_meta_mysql_state_commit_locked(struct vex_meta_mysql *db)
+{
+	(void)db;
+	return mysql_unavailable();
+}
+
 int vex_meta_mysql_state_load(struct vex_meta_mysql *db, const char *repo_id,
 			       const struct git_hash_algo *hash_algo,
 			       struct vex_meta_state *state)
@@ -400,6 +505,7 @@ int vex_meta_mysql_state_save_locked(struct vex_meta_mysql *db,
 #undef list_add
 
 #define VEX_META_MYSQL_ERROR_SIZE 512
+#define VEX_META_MYSQL_SWEEP_MAX_SECONDS (365U * 24U * 60U * 60U)
 
 struct vex_meta_mysql {
 	MYSQL *mysql;
@@ -958,6 +1064,32 @@ static int ensure_clone_leases_table(struct vex_meta_mysql *db)
 	return mysql_exec(db, create_sql);
 }
 
+/*
+ * Existing Compose volumes predate destructive sweeping.  Keep this additive
+ * migration alongside schema.sql so an operator can restart into a safe
+ * tombstone protocol without resetting otherwise durable Vex metadata.
+ */
+static int ensure_sweep_tombstones_table(struct vex_meta_mysql *db)
+{
+	static const char create_sql[] =
+		"CREATE TABLE IF NOT EXISTS object_sweep_tombstones ("
+		"repo_id BINARY(16) NOT NULL, "
+		"oid BINARY(32) NOT NULL, "
+		"generation BIGINT UNSIGNED NOT NULL, "
+		"marked_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6), "
+		"delete_after DATETIME(6) NOT NULL, "
+		"metadata_deleted_at DATETIME(6) NULL, "
+		"blob_deleted_at DATETIME(6) NULL, "
+		"PRIMARY KEY (repo_id, oid), "
+		"KEY object_sweep_tombstones_pending "
+		"(repo_id, metadata_deleted_at, blob_deleted_at, delete_after), "
+		"CONSTRAINT object_sweep_tombstones_repo_fk FOREIGN KEY (repo_id) "
+		"REFERENCES repositories (repo_id)"
+		") ENGINE=InnoDB";
+
+	return mysql_exec(db, create_sql);
+}
+
 int vex_meta_mysql_schema_check(struct vex_meta_mysql *db,
 				unsigned int *table_count)
 {
@@ -966,7 +1098,8 @@ int vex_meta_mysql_schema_check(struct vex_meta_mysql *db,
 		"WHERE table_schema = DATABASE() AND table_name IN "
 		"('repositories','generations','objects','generation_objects',"
 		"'commit_parents','refs','ref_updates','object_pins',"
-		"'pack_envelopes','pack_objects','clone_leases')";
+		"'pack_envelopes','pack_objects','clone_leases',"
+		"'object_sweep_tombstones')";
 	static const char blob_key_sql[] =
 		"SELECT COUNT(*) FROM information_schema.columns "
 		"WHERE table_schema = DATABASE() AND table_name = 'objects' "
@@ -981,14 +1114,17 @@ int vex_meta_mysql_schema_check(struct vex_meta_mysql *db,
 	ret = ensure_clone_leases_table(db);
 	if (ret)
 		return ret;
+	ret = ensure_sweep_tombstones_table(db);
+	if (ret)
+		return ret;
 	ret = query_one_u64(db, table_sql, &tables, &found);
 	if (ret)
 		return ret;
-	if (!found || tables != 11) {
+	if (!found || tables != 12) {
 		if (table_count)
 			*table_count = found && tables <= UINT_MAX ? tables : 0;
 		return set_error(db, VEX_META_MYSQL_ERR_SCHEMA,
-				 "expected 11 Vex metadata tables, found %" PRIu64,
+				 "expected 12 Vex metadata tables, found %" PRIu64,
 				 found ? tables : 0);
 	}
 	ret = query_one_u64(db, blob_key_sql, &blob_key, &found);
@@ -1443,6 +1579,556 @@ out:
 		mysql_free_result(res);
 	free(generations);
 	free(sql);
+	free(repo);
+	return ret;
+}
+
+int vex_meta_mysql_state_for_each_expired_sealed_locked(
+		struct vex_meta_mysql *db, const char *repo_id,
+		unsigned int min_age_seconds,
+		vex_meta_mysql_generation_iter_fn fn, void *cb_data)
+{
+	char *repo = NULL;
+	char *sql = NULL;
+	MYSQL_RES *res = NULL;
+	MYSQL_ROW row;
+	unsigned long *lengths;
+	uint64_t *generations = NULL;
+	size_t generations_nr = 0;
+	size_t generations_alloc = 0;
+	size_t i;
+	int ret = VEX_META_MYSQL_OK;
+
+	if (!db || !db->mysql || !db->state_transaction || !fn ||
+	    !min_age_seconds || min_age_seconds > VEX_META_MYSQL_SWEEP_MAX_SECONDS)
+		return VEX_META_MYSQL_ERR_INVALID;
+	repo = sql_repo_literal(repo_id, NULL);
+	if (!repo) {
+		ret = set_error(db, VEX_META_MYSQL_ERR_INVALID,
+				"invalid Vex repository UUID");
+		goto out;
+	}
+	/*
+	 * Do not trust a client timestamp for retention.  The seal timestamp is
+	 * durable state and this comparison is evaluated by the MySQL server while
+	 * the repository row remains locked.
+	 */
+	sql = vex_format("SELECT generation FROM generations WHERE repo_id = %s "
+			 "AND state = 'sealed' AND sealed_at IS NOT NULL "
+			 "AND sealed_at <= DATE_SUB(CURRENT_TIMESTAMP(6), INTERVAL %u SECOND) "
+			 "ORDER BY generation FOR UPDATE", repo, min_age_seconds);
+	if (!sql) {
+		ret = set_error(db, VEX_META_MYSQL_ERR_NOMEM,
+				"could not allocate expired sealed-generation query");
+		goto out;
+	}
+	if (mysql_query(db->mysql, sql)) {
+		ret = set_mysql_error(db, "MySQL expired sealed-generation read failed");
+		goto out;
+	}
+	res = mysql_store_result(db->mysql);
+	if (!res) {
+		ret = set_mysql_error(db,
+				"MySQL expired sealed-generation result retrieval failed");
+		goto out;
+	}
+	if (mysql_num_fields(res) != 1) {
+		ret = set_error(db, VEX_META_MYSQL_ERR,
+				"MySQL returned invalid expired sealed-generation metadata");
+		goto out;
+	}
+	while ((row = mysql_fetch_row(res))) {
+		char *end;
+		uintmax_t parsed;
+
+		lengths = mysql_fetch_lengths(res);
+		if (!row[0] || !lengths || !lengths[0]) {
+			ret = set_error(db, VEX_META_MYSQL_ERR,
+					"MySQL returned an invalid expired sealed generation");
+			goto out;
+		}
+		errno = 0;
+		parsed = strtoumax(row[0], &end, 10);
+		if (errno || !*row[0] || *end || !parsed ||
+		    parsed > UINT64_MAX) {
+			ret = set_error(db, VEX_META_MYSQL_ERR,
+					"MySQL returned an invalid expired sealed generation");
+			goto out;
+		}
+		ALLOC_GROW(generations, generations_nr + 1, generations_alloc);
+		generations[generations_nr++] = parsed;
+	}
+	mysql_free_result(res);
+	res = NULL;
+	for (i = 0; i < generations_nr; i++) {
+		ret = fn(generations[i], cb_data);
+		if (ret)
+			goto out;
+	}
+
+out:
+	if (res)
+		mysql_free_result(res);
+	free(generations);
+	free(sql);
+	free(repo);
+	return ret;
+}
+
+int vex_meta_mysql_state_for_each_sweep_tombstone_locked(
+		struct vex_meta_mysql *db, const char *repo_id,
+		vex_meta_mysql_sweep_tombstone_iter_fn fn, void *cb_data)
+{
+	char *repo = NULL;
+	char *sql = NULL;
+	MYSQL_RES *res = NULL;
+	MYSQL_ROW row;
+	unsigned long *lengths;
+	struct vex_meta_mysql_sweep_tombstone *items = NULL;
+	size_t items_nr = 0;
+	size_t items_alloc = 0;
+	size_t i;
+	int ret = VEX_META_MYSQL_OK;
+
+	if (!db || !db->mysql || !db->state_transaction || !fn)
+		return VEX_META_MYSQL_ERR_INVALID;
+	repo = sql_repo_literal(repo_id, NULL);
+	if (!repo) {
+		ret = set_error(db, VEX_META_MYSQL_ERR_INVALID,
+				"invalid Vex repository UUID");
+		goto out;
+	}
+	sql = vex_format("SELECT oid, generation, "
+			 "delete_after <= CURRENT_TIMESTAMP(6) "
+			 "FROM object_sweep_tombstones WHERE repo_id = %s "
+			 "AND metadata_deleted_at IS NULL ORDER BY oid FOR UPDATE", repo);
+	if (!sql) {
+		ret = set_error(db, VEX_META_MYSQL_ERR_NOMEM,
+				"could not allocate Vex sweep-tombstone query");
+		goto out;
+	}
+	if (mysql_query(db->mysql, sql)) {
+		ret = set_mysql_error(db, "MySQL Vex sweep-tombstone read failed");
+		goto out;
+	}
+	res = mysql_store_result(db->mysql);
+	if (!res) {
+		ret = set_mysql_error(db,
+				"MySQL Vex sweep-tombstone result retrieval failed");
+		goto out;
+	}
+	if (mysql_num_fields(res) != 3) {
+		ret = set_error(db, VEX_META_MYSQL_ERR,
+				"MySQL returned invalid Vex sweep-tombstone metadata");
+		goto out;
+	}
+	while ((row = mysql_fetch_row(res))) {
+		struct vex_meta_mysql_sweep_tombstone *item;
+		char *end;
+		uintmax_t generation;
+		uintmax_t due;
+
+		lengths = mysql_fetch_lengths(res);
+		if (!row[0] || !row[1] || !row[2] || !lengths ||
+		    lengths[0] != VEX_META_MYSQL_OID_BYTES) {
+			ret = set_error(db, VEX_META_MYSQL_ERR,
+					"MySQL returned invalid Vex sweep-tombstone row");
+			goto out;
+		}
+		errno = 0;
+		generation = strtoumax(row[1], &end, 10);
+		if (errno || !*row[1] || *end || !generation ||
+		    generation > UINT64_MAX) {
+			ret = set_error(db, VEX_META_MYSQL_ERR,
+					"MySQL returned invalid Vex sweep-tombstone generation");
+			goto out;
+		}
+		errno = 0;
+		due = strtoumax(row[2], &end, 10);
+		if (errno || !*row[2] || *end || due > 1) {
+			ret = set_error(db, VEX_META_MYSQL_ERR,
+					"MySQL returned invalid Vex sweep-tombstone deadline");
+			goto out;
+		}
+		ALLOC_GROW(items, items_nr + 1, items_alloc);
+		item = &items[items_nr++];
+		memset(item, 0, sizeof(*item));
+		memcpy(item->oid, row[0], sizeof(item->oid));
+		item->generation = generation;
+		item->due = due;
+	}
+	mysql_free_result(res);
+	res = NULL;
+	for (i = 0; i < items_nr; i++) {
+		ret = fn(&items[i], cb_data);
+		if (ret)
+			goto out;
+	}
+
+out:
+	if (res)
+		mysql_free_result(res);
+	free(items);
+	free(sql);
+	free(repo);
+	return ret;
+}
+
+int vex_meta_mysql_state_for_each_pending_sweep_blob_locked(
+		struct vex_meta_mysql *db, const char *repo_id,
+		vex_meta_mysql_oid_iter_fn fn, void *cb_data)
+{
+	char *repo = NULL;
+	char *sql = NULL;
+	MYSQL_RES *res = NULL;
+	MYSQL_ROW row;
+	unsigned long *lengths;
+	unsigned char (*oids)[VEX_META_MYSQL_OID_BYTES] = NULL;
+	size_t oids_nr = 0;
+	size_t oids_alloc = 0;
+	size_t i;
+	int ret = VEX_META_MYSQL_OK;
+
+	if (!db || !db->mysql || !db->state_transaction || !fn)
+		return VEX_META_MYSQL_ERR_INVALID;
+	repo = sql_repo_literal(repo_id, NULL);
+	if (!repo) {
+		ret = set_error(db, VEX_META_MYSQL_ERR_INVALID,
+				"invalid Vex repository UUID");
+		goto out;
+	}
+	sql = vex_format("SELECT oid FROM object_sweep_tombstones "
+			 "WHERE repo_id = %s AND metadata_deleted_at IS NOT NULL "
+			 "AND blob_deleted_at IS NULL ORDER BY oid FOR UPDATE", repo);
+	if (!sql) {
+		ret = set_error(db, VEX_META_MYSQL_ERR_NOMEM,
+				"could not allocate pending Vex sweep-blob query");
+		goto out;
+	}
+	if (mysql_query(db->mysql, sql)) {
+		ret = set_mysql_error(db, "MySQL pending Vex sweep-blob read failed");
+		goto out;
+	}
+	res = mysql_store_result(db->mysql);
+	if (!res) {
+		ret = set_mysql_error(db,
+				"MySQL pending Vex sweep-blob result retrieval failed");
+		goto out;
+	}
+	if (mysql_num_fields(res) != 1) {
+		ret = set_error(db, VEX_META_MYSQL_ERR,
+				"MySQL returned invalid pending Vex sweep-blob metadata");
+		goto out;
+	}
+	while ((row = mysql_fetch_row(res))) {
+		lengths = mysql_fetch_lengths(res);
+		if (!row[0] || !lengths ||
+		    lengths[0] != VEX_META_MYSQL_OID_BYTES) {
+			ret = set_error(db, VEX_META_MYSQL_ERR,
+					"MySQL returned invalid pending Vex sweep-blob id");
+			goto out;
+		}
+		ALLOC_GROW(oids, oids_nr + 1, oids_alloc);
+		memcpy(oids[oids_nr++], row[0], VEX_META_MYSQL_OID_BYTES);
+	}
+	mysql_free_result(res);
+	res = NULL;
+	for (i = 0; i < oids_nr; i++) {
+		ret = fn(oids[i], cb_data);
+		if (ret)
+			goto out;
+	}
+
+out:
+	if (res)
+		mysql_free_result(res);
+	free(oids);
+	free(sql);
+	free(repo);
+	return ret;
+}
+
+int vex_meta_mysql_state_mark_sweep_tombstone_locked(
+		struct vex_meta_mysql *db, const char *repo_id,
+		const unsigned char *oid, size_t oid_len, uint64_t generation,
+		unsigned int tombstone_seconds, int *marked)
+{
+	char *repo = NULL;
+	char *object = NULL;
+	char *sql = NULL;
+	int ret;
+
+	if (marked)
+		*marked = 0;
+	if (!db || !db->mysql || !db->state_transaction || !generation ||
+	    !tombstone_seconds ||
+	    tombstone_seconds > VEX_META_MYSQL_SWEEP_MAX_SECONDS)
+		return VEX_META_MYSQL_ERR_INVALID;
+	repo = sql_repo_literal(repo_id, NULL);
+	object = sql_oid_literal(oid, oid_len);
+	if (!repo || !object) {
+		ret = set_error(db, VEX_META_MYSQL_ERR_INVALID,
+				"invalid Vex sweep-tombstone metadata");
+		goto out;
+	}
+	/*
+	 * An OID can be republished after an older completed sweep.  Reset that
+	 * historic tombstone only when its metadata was already deleted, so the
+	 * newly published copy receives a full second grace period if it later
+	 * becomes unreachable again.
+	 */
+	sql = vex_format("INSERT INTO object_sweep_tombstones "
+			 "(repo_id, oid, generation, delete_after) VALUES "
+			 "(%s, %s, %" PRIu64 ", DATE_ADD(CURRENT_TIMESTAMP(6), "
+			 "INTERVAL %u SECOND)) ON DUPLICATE KEY UPDATE "
+			 "generation = IF(metadata_deleted_at IS NOT NULL, %" PRIu64 ", generation), "
+			 "marked_at = IF(metadata_deleted_at IS NOT NULL, CURRENT_TIMESTAMP(6), marked_at), "
+			 "delete_after = IF(metadata_deleted_at IS NOT NULL, "
+			 "DATE_ADD(CURRENT_TIMESTAMP(6), INTERVAL %u SECOND), delete_after), "
+			 "blob_deleted_at = IF(metadata_deleted_at IS NOT NULL, NULL, blob_deleted_at), "
+			 "metadata_deleted_at = IF(metadata_deleted_at IS NOT NULL, NULL, metadata_deleted_at)",
+			 repo, object, generation, tombstone_seconds, generation,
+			 tombstone_seconds);
+	if (!sql) {
+		ret = set_error(db, VEX_META_MYSQL_ERR_NOMEM,
+				"could not allocate Vex sweep-tombstone insert");
+		goto out;
+	}
+	ret = mysql_exec(db, sql);
+	if (!ret && marked)
+		*marked = mysql_affected_rows(db->mysql) != 0;
+
+out:
+	free(sql);
+	free(object);
+	free(repo);
+	return ret;
+}
+
+int vex_meta_mysql_state_cancel_sweep_tombstone_locked(
+		struct vex_meta_mysql *db, const char *repo_id,
+		const unsigned char *oid, size_t oid_len, int *cancelled)
+{
+	char *repo = NULL;
+	char *object = NULL;
+	char *sql = NULL;
+	int ret;
+
+	if (cancelled)
+		*cancelled = 0;
+	if (!db || !db->mysql || !db->state_transaction)
+		return VEX_META_MYSQL_ERR_INVALID;
+	repo = sql_repo_literal(repo_id, NULL);
+	object = sql_oid_literal(oid, oid_len);
+	if (!repo || !object) {
+		ret = set_error(db, VEX_META_MYSQL_ERR_INVALID,
+				"invalid Vex sweep-tombstone cancellation");
+		goto out;
+	}
+	sql = vex_format("DELETE FROM object_sweep_tombstones WHERE repo_id = %s "
+			 "AND oid = %s AND metadata_deleted_at IS NULL", repo, object);
+	if (!sql) {
+		ret = set_error(db, VEX_META_MYSQL_ERR_NOMEM,
+				"could not allocate Vex sweep-tombstone cancellation");
+		goto out;
+	}
+	ret = mysql_exec(db, sql);
+	if (!ret && cancelled)
+		*cancelled = mysql_affected_rows(db->mysql) == 1;
+
+out:
+	free(sql);
+	free(object);
+	free(repo);
+	return ret;
+}
+
+int vex_meta_mysql_state_mark_sweep_metadata_deleted_locked(
+		struct vex_meta_mysql *db, const char *repo_id,
+		const unsigned char *oid, size_t oid_len)
+{
+	char *repo = NULL;
+	char *object = NULL;
+	char *sql = NULL;
+	int ret;
+
+	if (!db || !db->mysql || !db->state_transaction)
+		return VEX_META_MYSQL_ERR_INVALID;
+	repo = sql_repo_literal(repo_id, NULL);
+	object = sql_oid_literal(oid, oid_len);
+	if (!repo || !object) {
+		ret = set_error(db, VEX_META_MYSQL_ERR_INVALID,
+				"invalid Vex sweep metadata deletion");
+		goto out;
+	}
+	sql = vex_format("UPDATE object_sweep_tombstones "
+			 "SET metadata_deleted_at = CURRENT_TIMESTAMP(6) "
+			 "WHERE repo_id = %s AND oid = %s "
+			 "AND metadata_deleted_at IS NULL", repo, object);
+	if (!sql) {
+		ret = set_error(db, VEX_META_MYSQL_ERR_NOMEM,
+				"could not allocate Vex sweep metadata deletion");
+		goto out;
+	}
+	ret = mysql_exec(db, sql);
+	if (!ret && mysql_affected_rows(db->mysql) != 1)
+		ret = set_error(db, VEX_META_MYSQL_ERR_STATE,
+				"Vex sweep tombstone changed while deleting metadata");
+
+out:
+	free(sql);
+	free(object);
+	free(repo);
+	return ret;
+}
+
+int vex_meta_mysql_state_prepare_sweep_blob_delete_locked(
+		struct vex_meta_mysql *db, const char *repo_id,
+		const unsigned char *oid, size_t oid_len, int *ready)
+{
+	char *repo = NULL;
+	char *object = NULL;
+	char *sql = NULL;
+	MYSQL_RES *res = NULL;
+	MYSQL_ROW row;
+	unsigned long *lengths;
+	uint64_t object_count;
+	int found;
+	int ret;
+
+	if (ready)
+		*ready = 0;
+	if (!db || !db->mysql || !db->state_transaction || !ready)
+		return VEX_META_MYSQL_ERR_INVALID;
+	repo = sql_repo_literal(repo_id, NULL);
+	object = sql_oid_literal(oid, oid_len);
+	if (!repo || !object) {
+		ret = set_error(db, VEX_META_MYSQL_ERR_INVALID,
+				"invalid Vex sweep blob-deletion recheck");
+		goto out;
+	}
+	/* Lock the pending row before the caller performs its S3 DELETE. */
+	sql = vex_format("SELECT oid FROM object_sweep_tombstones "
+			 "WHERE repo_id = %s AND oid = %s "
+			 "AND metadata_deleted_at IS NOT NULL AND blob_deleted_at IS NULL "
+			 "FOR UPDATE", repo, object);
+	if (!sql) {
+		ret = set_error(db, VEX_META_MYSQL_ERR_NOMEM,
+				"could not allocate Vex sweep blob-deletion recheck");
+		goto out;
+	}
+	if (mysql_query(db->mysql, sql)) {
+		ret = set_mysql_error(db, "MySQL Vex sweep blob-deletion recheck failed");
+		goto out;
+	}
+	res = mysql_store_result(db->mysql);
+	if (!res) {
+		ret = set_mysql_error(db,
+				"MySQL Vex sweep blob-deletion result retrieval failed");
+		goto out;
+	}
+	if (mysql_num_fields(res) != 1) {
+		ret = set_error(db, VEX_META_MYSQL_ERR,
+				"MySQL returned invalid Vex sweep blob-deletion metadata");
+		goto out;
+	}
+	row = mysql_fetch_row(res);
+	if (!row) {
+		ret = VEX_META_MYSQL_OK;
+		goto out;
+	}
+	lengths = mysql_fetch_lengths(res);
+	if (!row[0] || !lengths || lengths[0] != VEX_META_MYSQL_OID_BYTES) {
+		ret = set_error(db, VEX_META_MYSQL_ERR,
+				"MySQL returned an invalid pending Vex sweep blob id");
+		goto out;
+	}
+	mysql_free_result(res);
+	res = NULL;
+	free(sql);
+	sql = NULL;
+	sql = vex_format("SELECT COUNT(*) FROM objects WHERE repo_id = %s "
+			 "AND oid = %s", repo, object);
+	if (!sql) {
+		ret = set_error(db, VEX_META_MYSQL_ERR_NOMEM,
+				"could not allocate Vex sweep object recheck");
+		goto out;
+	}
+	ret = query_one_u64(db, sql, &object_count, &found);
+	free(sql);
+	sql = NULL;
+	if (ret)
+		goto out;
+	if (!found) {
+		ret = set_error(db, VEX_META_MYSQL_ERR,
+				"MySQL did not return Vex sweep object recheck metadata");
+		goto out;
+	}
+	if (!object_count) {
+		*ready = 1;
+		ret = VEX_META_MYSQL_OK;
+		goto out;
+	}
+	/* A republished immutable OID supersedes this historic cleanup record. */
+	sql = vex_format("DELETE FROM object_sweep_tombstones "
+			 "WHERE repo_id = %s AND oid = %s "
+			 "AND metadata_deleted_at IS NOT NULL AND blob_deleted_at IS NULL",
+			 repo, object);
+	if (!sql) {
+		ret = set_error(db, VEX_META_MYSQL_ERR_NOMEM,
+				"could not allocate rescued Vex sweep tombstone deletion");
+		goto out;
+	}
+	ret = mysql_exec(db, sql);
+	if (!ret && mysql_affected_rows(db->mysql) != 1)
+		ret = set_error(db, VEX_META_MYSQL_ERR_STATE,
+				"Vex sweep tombstone changed while preserving a republished object");
+
+out:
+	if (res)
+		mysql_free_result(res);
+	free(sql);
+	free(object);
+	free(repo);
+	return ret;
+}
+
+int vex_meta_mysql_state_mark_sweep_blob_deleted_locked(
+		struct vex_meta_mysql *db, const char *repo_id,
+		const unsigned char *oid, size_t oid_len)
+{
+	char *repo = NULL;
+	char *object = NULL;
+	char *sql = NULL;
+	int ret;
+
+	if (!db || !db->mysql || !db->state_transaction)
+		return VEX_META_MYSQL_ERR_INVALID;
+	repo = sql_repo_literal(repo_id, NULL);
+	object = sql_oid_literal(oid, oid_len);
+	if (!repo || !object) {
+		ret = set_error(db, VEX_META_MYSQL_ERR_INVALID,
+				"invalid Vex sweep blob-deletion metadata");
+		goto out;
+	}
+	sql = vex_format("UPDATE object_sweep_tombstones "
+			 "SET blob_deleted_at = CURRENT_TIMESTAMP(6) "
+			 "WHERE repo_id = %s AND oid = %s "
+			 "AND metadata_deleted_at IS NOT NULL AND blob_deleted_at IS NULL",
+			 repo, object);
+	if (!sql) {
+		ret = set_error(db, VEX_META_MYSQL_ERR_NOMEM,
+				"could not allocate Vex sweep blob-deletion update");
+		goto out;
+	}
+	ret = mysql_exec(db, sql);
+	if (!ret && mysql_affected_rows(db->mysql) != 1)
+		ret = set_error(db, VEX_META_MYSQL_ERR_STATE,
+				"Vex sweep tombstone changed while recording blob deletion");
+
+out:
+	free(sql);
+	free(object);
 	free(repo);
 	return ret;
 }
@@ -2615,6 +3301,18 @@ void vex_meta_mysql_state_unlock(struct vex_meta_mysql *db)
 	db->state_transaction = 0;
 }
 
+int vex_meta_mysql_state_commit_locked(struct vex_meta_mysql *db)
+{
+	int ret;
+
+	if (!db || !db->mysql || !db->state_transaction)
+		return VEX_META_MYSQL_ERR_STATE;
+	ret = vex_mysql_commit(db);
+	if (!ret)
+		db->state_transaction = 0;
+	return ret;
+}
+
 static int state_load_epochs(struct vex_meta_mysql *db, const char *repo,
 			     struct vex_meta_state *state)
 {
@@ -2625,7 +3323,8 @@ static int state_load_epochs(struct vex_meta_mysql *db, const char *repo,
 	int ret;
 
 	sql = vex_format("SELECT generation, state, push_id, "
-			 "DATE_FORMAT(created_at, '%%Y-%%m-%%d %%H:%%i:%%s.%%f') "
+			 "DATE_FORMAT(created_at, '%%Y-%%m-%%d %%H:%%i:%%s.%%f'), "
+			 "DATE_FORMAT(sealed_at, '%%Y-%%m-%%d %%H:%%i:%%s.%%f') "
 			 "FROM generations "
 			 "WHERE repo_id = %s ORDER BY generation", repo);
 	if (!sql)
@@ -2645,7 +3344,8 @@ static int state_load_epochs(struct vex_meta_mysql *db, const char *repo,
 		    parse_u64(row[0], &id) || !id ||
 		    parse_epoch_state(row[1], &epoch_state) ||
 		    (row[2] && lengths[2] != 16) || !lengths[3] ||
-		    lengths[3] > 32 || id == UINT64_MAX) {
+		    lengths[3] > 32 || (row[4] && lengths[4] > 32) ||
+		    id == UINT64_MAX) {
 			ret = set_error(db, VEX_META_MYSQL_ERR,
 					"MySQL returned invalid Vex generation metadata");
 			goto out;
@@ -2656,9 +3356,15 @@ static int state_load_epochs(struct vex_meta_mysql *db, const char *repo,
 		epoch->state = (enum vex_epoch_state)epoch_state;
 		epoch->push_id = state_row_uuid(row[2], row[2] ? lengths[2] : 0);
 		epoch->created_at = state_row_text(row[3], lengths[3]);
+		epoch->sealed_at = row[4] ? state_row_text(row[4], lengths[4]) : NULL;
 		if ((row[2] && !epoch->push_id) || !epoch->created_at) {
 			ret = set_error(db, VEX_META_MYSQL_ERR_NOMEM,
 					"could not allocate Vex generation push id");
+			goto out;
+		}
+		if (row[4] && !epoch->sealed_at) {
+			ret = set_error(db, VEX_META_MYSQL_ERR_NOMEM,
+					"could not allocate Vex generation seal timestamp");
 			goto out;
 		}
 		if (id >= state->next_epoch)
@@ -3155,10 +3861,13 @@ static int state_load_pins(struct vex_meta_mysql *db, const char *repo,
 	unsigned long *lengths;
 	int ret;
 
+	/* Expired pins are not sweep roots and must not recreate a dangling FK. */
 	sql = vex_format("SELECT oid, reason, "
 			 "DATE_FORMAT(created_at, '%%Y-%%m-%%d %%H:%%i:%%s.%%f'), "
 			 "DATE_FORMAT(expires_at, '%%Y-%%m-%%d %%H:%%i:%%s.%%f') "
-			 "FROM object_pins WHERE repo_id = %s ORDER BY oid, reason", repo);
+			 "FROM object_pins WHERE repo_id = %s "
+			 "AND (expires_at IS NULL OR expires_at > CURRENT_TIMESTAMP(6)) "
+			 "ORDER BY oid, reason", repo);
 	if (!sql)
 		return set_error(db, VEX_META_MYSQL_ERR_NOMEM,
 				 "could not allocate Vex pin preservation query");
@@ -3359,9 +4068,43 @@ static uint64_t state_latest_sealed_generation(const struct vex_meta_state *stat
 	return generation;
 }
 
+static int state_has_saved_object(const struct vex_meta_state *state,
+				  const unsigned char oid[VEX_META_MYSQL_OID_BYTES],
+				  const struct git_hash_algo *hash_algo)
+{
+	size_t i;
+
+	for (i = 0; i < state->objects_nr; i++)
+		if (!memcmp(state->objects[i].oid.hash, oid, hash_algo->rawsz))
+			return 1;
+	return 0;
+}
+
+static int state_saved_pack_is_incomplete(
+		const struct vex_meta_mysql_saved_packs *packs,
+		const struct vex_meta_mysql_saved_pack *pack,
+		const struct vex_meta_state *state,
+		const struct git_hash_algo *hash_algo)
+{
+	size_t i;
+
+	for (i = 0; i < packs->objects_nr; i++) {
+		const struct vex_meta_mysql_saved_pack_object *object =
+			&packs->objects[i];
+
+		if (memcmp(object->pack_id, pack->pack_id, sizeof(pack->pack_id)))
+			continue;
+		if (!state_has_saved_object(state, object->oid, hash_algo))
+			return 1;
+	}
+	return 0;
+}
+
 static int state_insert_packs(struct vex_meta_mysql *db, const char *repo,
 				      const struct vex_meta_mysql_saved_packs *packs,
-				      uint64_t sealed_generation)
+				      uint64_t sealed_generation,
+				      const struct vex_meta_state *state_snapshot,
+				      const struct git_hash_algo *hash_algo)
 {
 	size_t i;
 
@@ -3370,22 +4113,45 @@ static int state_insert_packs(struct vex_meta_mysql *db, const char *repo,
 		/* Never restore a stale sealed artifact as selectable/current. */
 		int obsolete = !strcmp(pack->state, "sealed") &&
 			pack->covering_generation < sealed_generation;
-		char *pack_id = sql_hex_literal(pack->pack_id, sizeof(pack->pack_id));
-		char *pack_key = pack->pack_key ?
-			sql_hex_literal(pack->pack_key, pack->pack_key_len) : NULL;
-		char *idx_key = pack->idx_key ?
-			sql_hex_literal(pack->idx_key, pack->idx_key_len) : vex_strdup("NULL");
-		char *bitmap_key = pack->bitmap_key ?
-			sql_hex_literal(pack->bitmap_key, pack->bitmap_key_len) : vex_strdup("NULL");
-		char *state = sql_quote(db, obsolete ? "obsolete" : pack->state);
-		char *created_at = sql_quote(db, pack->created_at);
-		char *sealed_at = pack->sealed_at ? sql_quote(db, pack->sealed_at) :
-			vex_strdup("NULL");
-		char *obsolete_at = obsolete ? vex_strdup("CURRENT_TIMESTAMP(6)") :
-			(pack->obsolete_at ? sql_quote(db, pack->obsolete_at) :
-			 vex_strdup("NULL"));
+		int incomplete = state_saved_pack_is_incomplete(packs, pack,
+							state_snapshot, hash_algo);
+		const char *target_state;
+		char *pack_id;
+		char *pack_key;
+		char *idx_key;
+		char *bitmap_key;
+		char *state;
+		char *created_at;
+		char *sealed_at;
+		char *obsolete_at;
 		char *sql;
 		int ret;
+
+		/*
+		 * Every sealed pack is a sweep root.  Losing any of its members is
+		 * therefore a state corruption, not an excuse to revive a pack whose
+		 * immutable bytes can no longer satisfy its advertised membership.
+		 */
+		if (incomplete && !strcmp(pack->state, "sealed"))
+			return set_error(db, VEX_META_MYSQL_ERR_STATE,
+					 "a sealed Vex pack would lose a swept object");
+		target_state = incomplete ? "deleted" :
+			(obsolete ? "obsolete" : pack->state);
+		pack_id = sql_hex_literal(pack->pack_id, sizeof(pack->pack_id));
+		pack_key = pack->pack_key ?
+			sql_hex_literal(pack->pack_key, pack->pack_key_len) : NULL;
+		idx_key = pack->idx_key ?
+			sql_hex_literal(pack->idx_key, pack->idx_key_len) : vex_strdup("NULL");
+		bitmap_key = pack->bitmap_key ?
+			sql_hex_literal(pack->bitmap_key, pack->bitmap_key_len) : vex_strdup("NULL");
+		state = sql_quote(db, target_state);
+		created_at = sql_quote(db, pack->created_at);
+		sealed_at = pack->sealed_at ? sql_quote(db, pack->sealed_at) :
+			vex_strdup("NULL");
+		obsolete_at = incomplete || obsolete ?
+			vex_strdup("CURRENT_TIMESTAMP(6)") :
+			(pack->obsolete_at ? sql_quote(db, pack->obsolete_at) :
+			 vex_strdup("NULL"));
 
 		if (!pack_id || !pack_key || !idx_key || !bitmap_key || !state ||
 		    !created_at || !sealed_at || !obsolete_at) {
@@ -3430,6 +4196,10 @@ static int state_insert_packs(struct vex_meta_mysql *db, const char *repo,
 		char *oid = sql_hex_literal(object->oid, sizeof(object->oid));
 		char *sql;
 		int ret;
+
+		/* The enclosing obsolete/deleted pack can retain no dangling FK. */
+		if (!state_has_saved_object(state_snapshot, object->oid, hash_algo))
+			continue;
 
 		if (!pack_id || !oid) {
 			free(oid);
@@ -3519,10 +4289,15 @@ static int state_insert_epochs(struct vex_meta_mysql *db, const char *repo,
 		char *created_at = epoch->created_at ?
 			sql_quote(db, epoch->created_at) :
 			vex_strdup("CURRENT_TIMESTAMP(6)");
+		char *sealed_at = epoch->state == VEX_EPOCH_OPEN ?
+			vex_strdup("NULL") :
+			(epoch->sealed_at ? sql_quote(db, epoch->sealed_at) :
+			 vex_strdup("CURRENT_TIMESTAMP(6)"));
 		char *sql;
 		int ret;
 
-		if (!epoch->id || !name || !push || !created_at) {
+		if (!epoch->id || !name || !push || !created_at || !sealed_at) {
+			free(sealed_at);
 			free(created_at);
 			free(push);
 			return set_error(db, VEX_META_MYSQL_ERR_INVALID,
@@ -3532,8 +4307,8 @@ static int state_insert_epochs(struct vex_meta_mysql *db, const char *repo,
 				 "(repo_id, generation, state, push_id, created_at, sealed_at) VALUES "
 				 "(%s, %" PRIu64 ", '%s', %s, %s, %s)",
 				 repo, epoch->id, name, push,
-				 created_at,
-				 epoch->state == VEX_EPOCH_OPEN ? "NULL" : "CURRENT_TIMESTAMP(6)");
+				 created_at, sealed_at);
+		free(sealed_at);
 		free(created_at);
 		free(push);
 		if (!sql)
@@ -3850,7 +4625,8 @@ int vex_meta_mysql_state_save_locked(struct vex_meta_mysql *db,
 	    (ret = state_insert_ref_updates(db, repo, hash_algo, state)) ||
 	    (ret = state_insert_pins(db, repo, &pins)) ||
 	    (ret = state_insert_packs(db, repo, &packs,
-				      state_latest_sealed_generation(state))))
+				      state_latest_sealed_generation(state), state,
+				      hash_algo)))
 		goto out;
 	ret = vex_mysql_commit(db);
 	if (!ret)

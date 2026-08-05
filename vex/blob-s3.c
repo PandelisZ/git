@@ -33,6 +33,8 @@ struct vex_blob_s3 {
 	int test_fail_promote_once;
 	/* Test-only fault for proving a derived-pack cache serves object bytes. */
 	int test_fail_reads;
+	/* Test-only fault for proving metadata deletion never depends on S3 success. */
+	int test_fail_final_delete;
 };
 
 static int contains_control(const char *value)
@@ -464,6 +466,12 @@ int vex_blob_s3_open(struct vex_blob_s3 **blob_out,
 	 */
 	blob->test_fail_reads =
 		git_env_bool("GIT_VEX_TEST_S3_FAIL_READS", 0) == 1;
+	/*
+	 * Used only by the destructive-sweep integration gate.  A failed delete
+	 * leaves its durable metadata tombstone pending for the next invocation.
+	 */
+	blob->test_fail_final_delete =
+		git_env_bool("GIT_VEX_TEST_S3_FAIL_FINAL_DELETE", 0) == 1;
 	*blob_out = blob;
 	return VEX_BLOB_S3_OK;
 }
@@ -548,6 +556,8 @@ int vex_blob_s3_delete_final(struct vex_blob_s3 *blob,
 	struct strbuf key = STRBUF_INIT;
 	int ret;
 
+	if (blob->test_fail_final_delete)
+		return VEX_BLOB_S3_ERR;
 	ret = vex_blob_s3_final_key(blob, oid, &key);
 	if (!ret)
 		ret = delete_key(blob, key.buf);

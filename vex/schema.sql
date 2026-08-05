@@ -167,3 +167,21 @@ CREATE TABLE IF NOT EXISTS clone_leases (
 	CONSTRAINT clone_leases_repo_fk FOREIGN KEY (repo_id)
 		REFERENCES repositories (repo_id)
 ) ENGINE=InnoDB;
+
+-- A durable, metadata-only record of the destructive sweep protocol.  An
+-- object remains readable while metadata_deleted_at is NULL.  Once metadata
+-- is removed, the row makes an interrupted S3 delete retryable without ever
+-- restoring a dangling metadata pointer to missing canonical bytes.
+CREATE TABLE IF NOT EXISTS object_sweep_tombstones (
+	repo_id BINARY(16) NOT NULL,
+	oid BINARY(32) NOT NULL,
+	generation BIGINT UNSIGNED NOT NULL,
+	marked_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+	delete_after DATETIME(6) NOT NULL,
+	metadata_deleted_at DATETIME(6) NULL,
+	blob_deleted_at DATETIME(6) NULL,
+	PRIMARY KEY (repo_id, oid),
+	KEY object_sweep_tombstones_pending (repo_id, metadata_deleted_at, blob_deleted_at, delete_after),
+	CONSTRAINT object_sweep_tombstones_repo_fk FOREIGN KEY (repo_id)
+		REFERENCES repositories (repo_id)
+) ENGINE=InnoDB;

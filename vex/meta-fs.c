@@ -256,6 +256,8 @@ void vex_meta_state_release(struct vex_meta_state *state)
 		free(state->epochs[i].push_id);
 	for (i = 0; i < state->epochs_nr; i++)
 		free(state->epochs[i].created_at);
+	for (i = 0; i < state->epochs_nr; i++)
+		free(state->epochs[i].sealed_at);
 	for (i = 0; i < state->refs_nr; i++) {
 		free(state->refs[i].name);
 		vex_ref_target_release(&state->refs[i].target);
@@ -324,6 +326,7 @@ static int add_epoch(struct vex_meta_state *state, uint64_t id,
 	epoch->state = epoch_state;
 	epoch->push_id = NULL;
 	epoch->created_at = NULL;
+	epoch->sealed_at = NULL;
 	if (decode_string(push_id, &epoch->push_id))
 		return VEX_STORE_ERR_CORRUPT;
 	return VEX_STORE_OK;

@@ -350,6 +350,22 @@ static int meta_save_locked(struct vex_store *store,
 	return ret;
 }
 
+/* Commit a metadata-only MySQL mutation without rewriting the state snapshot. */
+static int meta_commit_locked(struct vex_store *store, struct vex_meta_lock *lock)
+{
+	int ret;
+
+	if (!lock->held || store->backend != VEX_STORE_BACKEND_MYSQL_S3)
+		return VEX_STORE_ERR_STATE;
+	ret = meta_mysql_result(
+		vex_meta_mysql_state_commit_locked(store->meta_mysql));
+	if (!ret)
+		lock->held = 0;
+	else
+		meta_unlock(store, lock);
+	return ret;
+}
+
 static int meta_ensure(struct vex_store *store)
 {
 	int ret;
@@ -1143,6 +1159,7 @@ int vex_epoch_allocate(struct vex_store *store, const char *push_id,
 	meta_epoch->state = VEX_EPOCH_OPEN;
 	meta_epoch->push_id = push_id ? xstrdup(push_id) : NULL;
 	meta_epoch->created_at = NULL;
+	meta_epoch->sealed_at = NULL;
 	ret = meta_save_locked(store, &lock, &state);
 	if (ret) {
 		vex_meta_state_release(&state);
@@ -1793,6 +1810,7 @@ struct vex_sweep_walk {
 	struct oidset pin_roots;
 	struct oidset pack_roots;
 	struct oidset lease_roots;
+	struct oidset open_epoch_roots;
 	struct oid_array pending;
 	int result;
 };
@@ -1984,6 +2002,140 @@ static int sweep_collect_root(
 	return VEX_META_MYSQL_OK;
 }
 
+static int sweep_collect_open_epoch_roots(struct vex_sweep_walk *walk)
+{
+	size_t i;
+
+	for (i = 0; i < walk->state->epoch_objects_nr; i++) {
+		const struct vex_meta_epoch_object *entry =
+			&walk->state->epoch_objects[i];
+		const struct vex_meta_epoch *epoch =
+			find_epoch((struct vex_meta_state *)walk->state, entry->epoch);
+		const struct vex_meta_object *object;
+
+		if (!epoch)
+			return VEX_STORE_ERR_CORRUPT;
+		if (epoch->state != VEX_EPOCH_OPEN)
+			continue;
+		object = find_object((struct vex_meta_state *)walk->state, &entry->oid);
+		if (!object)
+			return VEX_STORE_ERR_CORRUPT;
+		if (!oidset_insert(&walk->open_epoch_roots, &entry->oid)) {
+			/*
+			 * A receive can be between staging and promotion.  Its quarantine
+			 * row has no final canonical bytes to parse, but it is still a
+			 * reachability root for deletion safety.  Published open-epoch
+			 * objects do have canonical bytes, so walk their graph as usual.
+			 */
+			if (!oidset_insert(&walk->reachable, &entry->oid) &&
+			    object->state == VEX_OBJECT_PUBLISHED)
+				oid_array_append(&walk->pending, &entry->oid);
+		}
+	}
+	return VEX_STORE_OK;
+}
+
+static int sweep_walk_mark_locked(struct vex_store *store,
+				 const struct vex_meta_state *state,
+				 struct vex_sweep_walk *walk)
+{
+	struct vex_sweep_root_collect pin_collect;
+	struct vex_sweep_root_collect pack_collect;
+	struct vex_sweep_root_collect lease_collect;
+	size_t at = 0;
+	size_t i;
+	int ret;
+
+	memset(walk, 0, sizeof(*walk));
+	walk->store = store;
+	walk->state = state;
+	oidset_init(&walk->reachable, state->objects_nr);
+	oidset_init(&walk->ref_roots, state->refs_nr);
+	oidset_init(&walk->pin_roots, state->objects_nr);
+	oidset_init(&walk->pack_roots, state->objects_nr);
+	oidset_init(&walk->lease_roots, state->objects_nr);
+	oidset_init(&walk->open_epoch_roots, state->epoch_objects_nr);
+	pin_collect.walk = walk;
+	pin_collect.roots = &walk->pin_roots;
+	pack_collect.walk = walk;
+	pack_collect.roots = &walk->pack_roots;
+	lease_collect.walk = walk;
+	lease_collect.roots = &walk->lease_roots;
+	for (i = 0; i < state->refs_nr; i++) {
+		const struct vex_meta_ref *ref = &state->refs[i];
+
+		if (ref->target.type != VEX_REF_TARGET_OID)
+			continue;
+		if (!oidset_insert(&walk->ref_roots, &ref->target.oid))
+			sweep_enqueue(walk, &ref->target.oid);
+	}
+	if ((ret = sweep_collect_open_epoch_roots(walk)))
+		return ret;
+	ret = vex_meta_mysql_for_each_active_pack_object(
+		store->meta_mysql, store->repo_id, sweep_collect_root, &pack_collect);
+	if (walk->result)
+		return walk->result;
+	if (ret)
+		return meta_mysql_result(ret);
+	ret = vex_meta_mysql_for_each_active_clone_lease_object(
+		store->meta_mysql, store->repo_id, sweep_collect_root, &lease_collect);
+	if (walk->result)
+		return walk->result;
+	if (ret)
+		return meta_mysql_result(ret);
+	ret = vex_meta_mysql_for_each_active_pin(store->meta_mysql, store->repo_id,
+						   sweep_collect_root, &pin_collect);
+	if (walk->result)
+		return walk->result;
+	if (ret)
+		return meta_mysql_result(ret);
+	while (at < walk->pending.nr) {
+		ret = sweep_walk_one(walk, &walk->pending.oid[at++]);
+		if (ret)
+			return ret;
+	}
+	return VEX_STORE_OK;
+}
+
+static void sweep_walk_release(struct vex_sweep_walk *walk)
+{
+	oid_array_clear(&walk->pending);
+	oidset_clear(&walk->open_epoch_roots);
+	oidset_clear(&walk->lease_roots);
+	oidset_clear(&walk->pack_roots);
+	oidset_clear(&walk->pin_roots);
+	oidset_clear(&walk->ref_roots);
+	oidset_clear(&walk->reachable);
+}
+
+static void sweep_plan_from_walk(const struct vex_meta_state *state,
+				 const struct vex_sweep_walk *walk,
+				 struct vex_sweep_plan *plan)
+{
+	size_t i;
+
+	memset(plan, 0, sizeof(*plan));
+	for (i = 0; i < state->objects_nr; i++) {
+		const struct vex_meta_object *object = &state->objects[i];
+		const struct vex_meta_epoch *epoch;
+
+		if (object->state != VEX_OBJECT_PUBLISHED)
+			continue;
+		plan->published_objects++;
+		if (oidset_contains(&walk->reachable, &object->oid))
+			continue;
+		epoch = find_epoch((struct vex_meta_state *)state, object->epoch);
+		if (epoch && epoch->state == VEX_EPOCH_SEALED)
+			plan->sealed_candidates++;
+	}
+	plan->ref_roots = oidset_size(&walk->ref_roots);
+	plan->pin_roots = oidset_size(&walk->pin_roots);
+	plan->pack_roots = oidset_size(&walk->pack_roots);
+	plan->lease_roots = oidset_size(&walk->lease_roots);
+	plan->open_epoch_roots = oidset_size(&walk->open_epoch_roots);
+	plan->reachable_objects = oidset_size(&walk->reachable);
+}
+
 int vex_store_pin_object(struct vex_store *store, const struct object_id *oid,
 			 const char *reason)
 {
@@ -2011,104 +2163,378 @@ int vex_store_sweep_plan(struct vex_store *store, struct vex_sweep_plan *plan)
 	struct vex_meta_lock lock;
 	struct vex_meta_state state;
 	struct vex_sweep_walk walk = { 0 };
-	struct vex_sweep_root_collect pin_collect;
-	struct vex_sweep_root_collect pack_collect;
-	struct vex_sweep_root_collect lease_collect;
-	size_t at = 0;
-	size_t i;
 	int ret;
 
 	if (!store || !plan || store->backend != VEX_STORE_BACKEND_MYSQL_S3)
 		return VEX_STORE_ERR_INVALID;
-	memset(plan, 0, sizeof(*plan));
 	memset(&state, 0, sizeof(state));
 	if ((ret = load_locked(store, &lock, &state)))
 		return ret;
-	walk.store = store;
-	walk.state = &state;
-	oidset_init(&walk.reachable, state.objects_nr);
-	oidset_init(&walk.ref_roots, state.refs_nr);
-	oidset_init(&walk.pin_roots, state.objects_nr);
-	oidset_init(&walk.pack_roots, state.objects_nr);
-	oidset_init(&walk.lease_roots, state.objects_nr);
-	pin_collect.walk = &walk;
-	pin_collect.roots = &walk.pin_roots;
-	pack_collect.walk = &walk;
-	pack_collect.roots = &walk.pack_roots;
-	lease_collect.walk = &walk;
-	lease_collect.roots = &walk.lease_roots;
-	for (i = 0; i < state.refs_nr; i++) {
-		const struct vex_meta_ref *ref = &state.refs[i];
-
-		if (ref->target.type != VEX_REF_TARGET_OID)
-			continue;
-		if (!oidset_insert(&walk.ref_roots, &ref->target.oid))
-			sweep_enqueue(&walk, &ref->target.oid);
-	}
-	ret = vex_meta_mysql_for_each_active_pack_object(
-		store->meta_mysql, store->repo_id, sweep_collect_root, &pack_collect);
-	if (walk.result) {
-		ret = walk.result;
-		goto out;
-	}
-	if (ret) {
-		ret = meta_mysql_result(ret);
-		goto out;
-	}
-	ret = vex_meta_mysql_for_each_active_clone_lease_object(
-		store->meta_mysql, store->repo_id, sweep_collect_root, &lease_collect);
-	if (walk.result) {
-		ret = walk.result;
-		goto out;
-	}
-	if (ret) {
-		ret = meta_mysql_result(ret);
-		goto out;
-	}
-	ret = vex_meta_mysql_for_each_active_pin(store->meta_mysql, store->repo_id,
-					   sweep_collect_root, &pin_collect);
-	if (walk.result) {
-		ret = walk.result;
-		goto out;
-	}
-	if (ret) {
-		ret = meta_mysql_result(ret);
-		goto out;
-	}
-	while (at < walk.pending.nr) {
-		ret = sweep_walk_one(&walk, &walk.pending.oid[at++]);
-		if (ret)
-			goto out;
-	}
-	for (i = 0; i < state.objects_nr; i++) {
-		const struct vex_meta_object *object = &state.objects[i];
-		const struct vex_meta_epoch *epoch;
-
-		if (object->state != VEX_OBJECT_PUBLISHED)
-			continue;
-		plan->published_objects++;
-		if (oidset_contains(&walk.reachable, &object->oid))
-			continue;
-		epoch = find_epoch(&state, object->epoch);
-		if (epoch && epoch->state == VEX_EPOCH_SEALED)
-			plan->sealed_candidates++;
-	}
-	plan->ref_roots = oidset_size(&walk.ref_roots);
-	plan->pin_roots = oidset_size(&walk.pin_roots);
-	plan->pack_roots = oidset_size(&walk.pack_roots);
-	plan->lease_roots = oidset_size(&walk.lease_roots);
-	plan->reachable_objects = oidset_size(&walk.reachable);
-	ret = VEX_STORE_OK;
-out:
-	oid_array_clear(&walk.pending);
-	oidset_clear(&walk.lease_roots);
-	oidset_clear(&walk.pack_roots);
-	oidset_clear(&walk.pin_roots);
-	oidset_clear(&walk.ref_roots);
-	oidset_clear(&walk.reachable);
+	ret = sweep_walk_mark_locked(store, &state, &walk);
+	if (!ret)
+		sweep_plan_from_walk(&state, &walk, plan);
+	sweep_walk_release(&walk);
 	if (lock.held)
 		meta_unlock(store, &lock);
 	vex_meta_state_release(&state);
+	return ret;
+}
+
+struct vex_sweep_generation_list {
+	uint64_t *items;
+	size_t nr;
+	size_t alloc;
+};
+
+struct vex_sweep_tombstone {
+	struct object_id oid;
+	uint64_t generation;
+	unsigned int due:1;
+};
+
+struct vex_sweep_tombstone_list {
+	struct vex_sweep_tombstone *items;
+	size_t nr;
+	size_t alloc;
+};
+
+struct vex_sweep_tombstone_collect {
+	struct vex_store *store;
+	struct vex_sweep_tombstone_list *tombstones;
+	int result;
+};
+
+struct vex_sweep_oid_collect {
+	struct vex_store *store;
+	struct oid_array *oids;
+	int result;
+};
+
+static int sweep_oid_from_mysql(const struct vex_store *store,
+				const unsigned char raw_oid[VEX_META_MYSQL_OID_BYTES],
+				struct object_id *oid)
+{
+	unsigned int i;
+
+	for (i = store->hash_algo->rawsz; i < VEX_META_MYSQL_OID_BYTES; i++)
+		if (raw_oid[i])
+			return VEX_STORE_ERR_CORRUPT;
+	oidread(oid, raw_oid, store->hash_algo);
+	return VEX_STORE_OK;
+}
+
+static int sweep_collect_expired_generation(uint64_t generation, void *cb_data)
+{
+	struct vex_sweep_generation_list *list = cb_data;
+
+	if (!generation)
+		return VEX_META_MYSQL_ERR_STATE;
+	ALLOC_GROW(list->items, list->nr + 1, list->alloc);
+	list->items[list->nr++] = generation;
+	return VEX_META_MYSQL_OK;
+}
+
+static int sweep_generation_contains(const struct vex_sweep_generation_list *list,
+				     uint64_t generation)
+{
+	size_t i;
+
+	for (i = 0; i < list->nr; i++)
+		if (list->items[i] == generation)
+			return 1;
+	return 0;
+}
+
+static int sweep_collect_tombstone(
+	const struct vex_meta_mysql_sweep_tombstone *raw, void *cb_data)
+{
+	struct vex_sweep_tombstone_collect *collect = cb_data;
+	struct vex_sweep_tombstone *item;
+	int ret;
+
+	if (!raw || !raw->generation)
+		return VEX_META_MYSQL_ERR_STATE;
+	ALLOC_GROW(collect->tombstones->items, collect->tombstones->nr + 1,
+		   collect->tombstones->alloc);
+	item = &collect->tombstones->items[collect->tombstones->nr++];
+	memset(item, 0, sizeof(*item));
+	ret = sweep_oid_from_mysql(collect->store, raw->oid, &item->oid);
+	if (ret) {
+		collect->result = ret;
+		return VEX_META_MYSQL_ERR_STATE;
+	}
+	item->generation = raw->generation;
+	item->due = raw->due;
+	return VEX_META_MYSQL_OK;
+}
+
+static int sweep_collect_pending_blob(
+	const unsigned char raw_oid[VEX_META_MYSQL_OID_BYTES], void *cb_data)
+{
+	struct vex_sweep_oid_collect *collect = cb_data;
+	struct object_id oid;
+	int ret;
+
+	ret = sweep_oid_from_mysql(collect->store, raw_oid, &oid);
+	if (ret) {
+		collect->result = ret;
+		return VEX_META_MYSQL_ERR_STATE;
+	}
+	oid_array_append(collect->oids, &oid);
+	return VEX_META_MYSQL_OK;
+}
+
+static int sweep_epoch_has_any_object(const struct vex_meta_state *state,
+				      uint64_t epoch_id)
+{
+	size_t i;
+
+	for (i = 0; i < state->epoch_objects_nr; i++)
+		if (state->epoch_objects[i].epoch == epoch_id)
+			return 1;
+	return 0;
+}
+
+static int sweep_remove_object_state(struct vex_meta_state *state,
+				     const struct object_id *oid,
+				     uint64_t *origin_generation)
+{
+	struct vex_meta_object *object;
+	size_t i;
+
+	object = find_object(state, oid);
+	if (!object || object->state != VEX_OBJECT_PUBLISHED)
+		return VEX_STORE_ERR_CORRUPT;
+	if (origin_generation)
+		*origin_generation = object->epoch;
+	for (i = 0; i < state->epoch_objects_nr;) {
+		if (oideq(&state->epoch_objects[i].oid, oid))
+			remove_epoch_object_at(state, i);
+		else
+			i++;
+	}
+	for (i = 0; i < state->objects_nr; i++) {
+		if (oideq(&state->objects[i].oid, oid)) {
+			remove_object_at(state, i);
+			return VEX_STORE_OK;
+		}
+	}
+	return VEX_STORE_ERR_CORRUPT;
+}
+
+static void sweep_mark_empty_removed_epochs(struct vex_meta_state *state,
+					    const struct vex_sweep_generation_list *removed)
+{
+	size_t i;
+
+	for (i = 0; i < removed->nr; i++) {
+		struct vex_meta_epoch *epoch = find_epoch(state, removed->items[i]);
+
+		if (epoch && epoch->state == VEX_EPOCH_SEALED &&
+		    !sweep_epoch_has_any_object(state, epoch->id))
+			epoch->state = VEX_EPOCH_SWEPT;
+	}
+}
+
+static int sweep_is_grace_candidate(const struct vex_meta_state *state,
+				    const struct vex_sweep_walk *walk,
+				    const struct vex_sweep_generation_list *expired,
+				    const struct vex_meta_object *object)
+{
+	const struct vex_meta_epoch *epoch;
+
+	if (!object || object->state != VEX_OBJECT_PUBLISHED ||
+	    oidset_contains(&walk->reachable, &object->oid))
+		return 0;
+	epoch = find_epoch((struct vex_meta_state *)state, object->epoch);
+	return epoch && epoch->state == VEX_EPOCH_SEALED &&
+		sweep_generation_contains(expired, object->epoch);
+}
+
+int vex_store_sweep(struct vex_store *store, unsigned int grace_seconds,
+		    unsigned int tombstone_seconds,
+		    struct vex_sweep_result *result)
+{
+	struct vex_meta_lock lock;
+	struct vex_meta_state state;
+	struct vex_sweep_walk walk = { 0 };
+	struct vex_sweep_generation_list expired = { 0 };
+	struct vex_sweep_generation_list removed = { 0 };
+	struct vex_sweep_tombstone_list tombstones = { 0 };
+	struct oid_array cleanup = OID_ARRAY_INIT;
+	struct vex_sweep_tombstone_collect tombstone_collect;
+	struct vex_sweep_oid_collect cleanup_collect;
+	size_t i;
+	int dirty = 0;
+	int ret;
+	int cleanup_ret = VEX_STORE_OK;
+
+	if (!store || !result || !grace_seconds || !tombstone_seconds ||
+	    grace_seconds > VEX_STORE_SWEEP_MAX_SECONDS ||
+	    tombstone_seconds > VEX_STORE_SWEEP_MAX_SECONDS ||
+	    store->backend != VEX_STORE_BACKEND_MYSQL_S3)
+		return VEX_STORE_ERR_INVALID;
+	memset(result, 0, sizeof(*result));
+	memset(&state, 0, sizeof(state));
+	if ((ret = load_locked(store, &lock, &state)))
+		return ret;
+	ret = sweep_walk_mark_locked(store, &state, &walk);
+	if (ret)
+		goto out;
+	sweep_plan_from_walk(&state, &walk, &result->plan);
+	ret = meta_mysql_result(vex_meta_mysql_state_for_each_expired_sealed_locked(
+		store->meta_mysql, store->repo_id, grace_seconds,
+		sweep_collect_expired_generation, &expired));
+	if (ret)
+		goto out;
+	tombstone_collect.store = store;
+	tombstone_collect.tombstones = &tombstones;
+	tombstone_collect.result = VEX_STORE_OK;
+	ret = meta_mysql_result(vex_meta_mysql_state_for_each_sweep_tombstone_locked(
+		store->meta_mysql, store->repo_id, sweep_collect_tombstone,
+		&tombstone_collect));
+	if (tombstone_collect.result) {
+		ret = tombstone_collect.result;
+		goto out;
+	}
+	if (ret)
+		goto out;
+	cleanup_collect.store = store;
+	cleanup_collect.oids = &cleanup;
+	cleanup_collect.result = VEX_STORE_OK;
+	ret = meta_mysql_result(
+		vex_meta_mysql_state_for_each_pending_sweep_blob_locked(
+			store->meta_mysql, store->repo_id, sweep_collect_pending_blob,
+			&cleanup_collect));
+	if (cleanup_collect.result) {
+		ret = cleanup_collect.result;
+		goto out;
+	}
+	if (ret)
+		goto out;
+
+	/* A new ref, pin, sealed pack, lease, or open receive rescues the row. */
+	for (i = 0; i < tombstones.nr; i++) {
+		const struct vex_sweep_tombstone *tombstone = &tombstones.items[i];
+		struct vex_meta_object *object = find_object(&state, &tombstone->oid);
+		int changed;
+		uint64_t origin_generation;
+
+		if (oidset_contains(&walk.reachable, &tombstone->oid)) {
+			ret = meta_mysql_result(
+				vex_meta_mysql_state_cancel_sweep_tombstone_locked(
+					store->meta_mysql, store->repo_id,
+					tombstone->oid.hash, store->hash_algo->rawsz,
+					&changed));
+			if (ret)
+				goto out;
+			if (changed) {
+				result->tombstones_cancelled++;
+				dirty = 1;
+			}
+			continue;
+		}
+		if (!object || object->state != VEX_OBJECT_PUBLISHED ||
+		    object->epoch != tombstone->generation) {
+			ret = VEX_STORE_ERR_CORRUPT;
+			goto out;
+		}
+		if (!tombstone->due ||
+		    !sweep_is_grace_candidate(&state, &walk, &expired, object))
+			continue;
+		ret = meta_mysql_result(
+			vex_meta_mysql_state_mark_sweep_metadata_deleted_locked(
+				store->meta_mysql, store->repo_id, tombstone->oid.hash,
+				store->hash_algo->rawsz));
+		if (ret)
+			goto out;
+		ret = sweep_remove_object_state(&state, &tombstone->oid,
+						&origin_generation);
+		if (ret)
+			goto out;
+		ALLOC_GROW(removed.items, removed.nr + 1, removed.alloc);
+		removed.items[removed.nr++] = origin_generation;
+		oid_array_append(&cleanup, &tombstone->oid);
+		result->metadata_deleted++;
+		dirty = 1;
+	}
+	for (i = 0; i < state.objects_nr; i++) {
+		const struct vex_meta_object *object = &state.objects[i];
+		int marked;
+
+		if (!sweep_is_grace_candidate(&state, &walk, &expired, object))
+			continue;
+		result->grace_candidates++;
+		ret = meta_mysql_result(
+			vex_meta_mysql_state_mark_sweep_tombstone_locked(
+				store->meta_mysql, store->repo_id, object->oid.hash,
+				store->hash_algo->rawsz, object->epoch,
+				tombstone_seconds, &marked));
+		if (ret)
+			goto out;
+		if (marked) {
+			result->tombstones_marked++;
+			dirty = 1;
+		}
+	}
+	if (removed.nr)
+		sweep_mark_empty_removed_epochs(&state, &removed);
+	if (dirty) {
+		ret = meta_save_locked(store, &lock, &state);
+		if (ret)
+			goto out;
+	} else {
+		meta_unlock(store, &lock);
+	}
+	for (i = 0; i < cleanup.nr; i++) {
+		int ready = 0;
+		int one = meta_lock(store, &lock);
+
+		if (!one)
+			one = meta_mysql_result(
+				vex_meta_mysql_state_prepare_sweep_blob_delete_locked(
+					store->meta_mysql, store->repo_id, cleanup.oid[i].hash,
+					store->hash_algo->rawsz, &ready));
+		if (!one && ready) {
+			/*
+			 * Retain the repository-row lock across DELETE plus the durable
+			 * completion marker.  A concurrent receive therefore cannot
+			 * republish this immutable OID between the recheck and deletion.
+			 */
+			one = blob_s3_result(vex_blob_s3_delete_final(store->blob_s3,
+								       &cleanup.oid[i]));
+			if (one == VEX_STORE_ERR_NOT_FOUND)
+				one = VEX_STORE_OK;
+			if (!one)
+				one = meta_mysql_result(
+					vex_meta_mysql_state_mark_sweep_blob_deleted_locked(
+						store->meta_mysql, store->repo_id,
+						cleanup.oid[i].hash, store->hash_algo->rawsz));
+		}
+		if (!one)
+			one = meta_commit_locked(store, &lock);
+		if (lock.held)
+			meta_unlock(store, &lock);
+		if (one) {
+			result->blobs_pending++;
+			if (!cleanup_ret)
+				cleanup_ret = one;
+			continue;
+		}
+		if (ready)
+			result->blobs_deleted++;
+	}
+	ret = cleanup_ret;
+
+out:
+	if (lock.held)
+		meta_unlock(store, &lock);
+	sweep_walk_release(&walk);
+	vex_meta_state_release(&state);
+	oid_array_clear(&cleanup);
+	free(tombstones.items);
+	free(removed.items);
+	free(expired.items);
 	return ret;
 }
 

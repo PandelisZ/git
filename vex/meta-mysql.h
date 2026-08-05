@@ -105,6 +105,16 @@ typedef int (*vex_meta_mysql_oid_iter_fn)(
 typedef int (*vex_meta_mysql_generation_iter_fn)(uint64_t generation,
 						  void *cb_data);
 
+/* Metadata-only state for an object which has entered destructive sweep. */
+struct vex_meta_mysql_sweep_tombstone {
+	unsigned char oid[VEX_META_MYSQL_OID_BYTES];
+	uint64_t generation;
+	unsigned int due:1;
+};
+
+typedef int (*vex_meta_mysql_sweep_tombstone_iter_fn)(
+	const struct vex_meta_mysql_sweep_tombstone *tombstone, void *cb_data);
+
 /*
  * Decode either 32 lower-case hexadecimal digits or a lower-case hyphenated
  * UUID into the BINARY(16) repository key used by schema.sql.
@@ -119,7 +129,7 @@ const char *vex_meta_mysql_error(const struct vex_meta_mysql *db);
 
 int vex_meta_mysql_ping(struct vex_meta_mysql *db);
 
-/* Verify the eleven Vex metadata tables and objects.blob_key's metadata type. */
+/* Verify the twelve Vex metadata tables and objects.blob_key's metadata type. */
 int vex_meta_mysql_schema_check(struct vex_meta_mysql *db,
 				unsigned int *table_count);
 
@@ -160,6 +170,43 @@ int vex_meta_mysql_state_for_each_expired_open_locked(
 		struct vex_meta_mysql *db, const char *repo_id,
 		unsigned int min_age_seconds,
 		vex_meta_mysql_generation_iter_fn fn, void *cb_data);
+
+/*
+ * These destructive-sweep methods are valid only while the normal state
+ * transaction owns the repository row.  MySQL server time is the authority
+ * for both generation age and the tombstone delay.
+ */
+int vex_meta_mysql_state_for_each_expired_sealed_locked(
+		struct vex_meta_mysql *db, const char *repo_id,
+		unsigned int min_age_seconds,
+		vex_meta_mysql_generation_iter_fn fn, void *cb_data);
+int vex_meta_mysql_state_for_each_sweep_tombstone_locked(
+		struct vex_meta_mysql *db, const char *repo_id,
+		vex_meta_mysql_sweep_tombstone_iter_fn fn, void *cb_data);
+int vex_meta_mysql_state_for_each_pending_sweep_blob_locked(
+		struct vex_meta_mysql *db, const char *repo_id,
+		vex_meta_mysql_oid_iter_fn fn, void *cb_data);
+int vex_meta_mysql_state_mark_sweep_tombstone_locked(
+		struct vex_meta_mysql *db, const char *repo_id,
+		const unsigned char *oid, size_t oid_len, uint64_t generation,
+		unsigned int tombstone_seconds, int *marked);
+int vex_meta_mysql_state_cancel_sweep_tombstone_locked(
+		struct vex_meta_mysql *db, const char *repo_id,
+		const unsigned char *oid, size_t oid_len, int *cancelled);
+int vex_meta_mysql_state_mark_sweep_metadata_deleted_locked(
+		struct vex_meta_mysql *db, const char *repo_id,
+		const unsigned char *oid, size_t oid_len);
+/*
+ * Recheck a post-state-commit S3 deletion while the repository row is locked.
+ * A newly republished object cancels the old completed-metadata tombstone
+ * before callers can delete its canonical immutable bytes.
+ */
+int vex_meta_mysql_state_prepare_sweep_blob_delete_locked(
+		struct vex_meta_mysql *db, const char *repo_id,
+		const unsigned char *oid, size_t oid_len, int *ready);
+int vex_meta_mysql_state_mark_sweep_blob_deleted_locked(
+		struct vex_meta_mysql *db, const char *repo_id,
+		const unsigned char *oid, size_t oid_len);
 
 /*
  * Stage an object metadata row and its generation claim.  oid may be a
@@ -275,6 +322,8 @@ int vex_meta_mysql_for_each_active_clone_lease_object(
  */
 int vex_meta_mysql_state_lock(struct vex_meta_mysql *db, const char *repo_id);
 void vex_meta_mysql_state_unlock(struct vex_meta_mysql *db);
+/* Commit a locked metadata-only mutation without rewriting ordinary state. */
+int vex_meta_mysql_state_commit_locked(struct vex_meta_mysql *db);
 int vex_meta_mysql_state_load(struct vex_meta_mysql *db, const char *repo_id,
 			       const struct git_hash_algo *hash_algo,
 			       struct vex_meta_state *state);

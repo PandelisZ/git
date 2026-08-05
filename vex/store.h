@@ -134,8 +134,30 @@ struct vex_sweep_plan {
 	uint64_t pin_roots;
 	uint64_t pack_roots;
 	uint64_t lease_roots;
+	/* Open receive epochs are an additional, transient safety root. */
+	uint64_t open_epoch_roots;
 	uint64_t reachable_objects;
 	uint64_t sealed_candidates;
+};
+
+/*
+ * A destructive sweep is deliberately two-phase.  The first pass records a
+ * durable tombstone after `grace_seconds`; a later pass may remove metadata
+ * only after `tombstone_seconds` and another complete root mark.  S3 cleanup
+ * happens after the metadata transaction and is retried from that tombstone.
+ */
+#define VEX_STORE_SWEEP_DEFAULT_GRACE_SECONDS (14U * 24U * 60U * 60U)
+#define VEX_STORE_SWEEP_DEFAULT_TOMBSTONE_SECONDS (24U * 60U * 60U)
+#define VEX_STORE_SWEEP_MAX_SECONDS (365U * 24U * 60U * 60U)
+
+struct vex_sweep_result {
+	struct vex_sweep_plan plan;
+	uint64_t grace_candidates;
+	uint64_t tombstones_marked;
+	uint64_t tombstones_cancelled;
+	uint64_t metadata_deleted;
+	uint64_t blobs_deleted;
+	uint64_t blobs_pending;
 };
 
 /*
@@ -297,6 +319,16 @@ int vex_store_unpin_object(struct vex_store *store, const struct object_id *oid,
  * MySQL+S3 Vex backend implements this first safety slice.
  */
 int vex_store_sweep_plan(struct vex_store *store, struct vex_sweep_plan *plan);
+
+/*
+ * Mark and reclaim unreachable, sealed Vex objects.  The grace values are
+ * measured by MySQL server time, never a Git client clock.  The caller may
+ * use small nonzero values only for a controlled test; production callers
+ * normally use the defaults above.
+ */
+int vex_store_sweep(struct vex_store *store, unsigned int grace_seconds,
+		    unsigned int tombstone_seconds,
+		    struct vex_sweep_result *result);
 
 int vex_ref_read(struct vex_store *store, const char *refname,
 		   struct vex_ref *ref);

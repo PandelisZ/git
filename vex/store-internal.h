@@ -25,6 +25,8 @@ struct vex_meta_epoch {
 	char *push_id;
 	/* MySQL state snapshots preserve this so crash TTLs never reset on save. */
 	char *created_at;
+	/* The sealed-generation grace must survive normal state rewrites too. */
+	char *sealed_at;
 };
 
 struct vex_meta_object {
