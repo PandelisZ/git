@@ -1,0 +1,113 @@
+#ifndef VEX_META_MYSQL_H
+#define VEX_META_MYSQL_H
+
+/*
+ * MySQL metadata driver for the Vex storage schema.
+ *
+ * This interface deliberately accepts object identifiers and blob keys, but
+ * never object bytes.  Raw Git object and pack payloads remain the blob-store
+ * responsibility; MySQL only carries the metadata declared in schema.sql.
+ *
+ * It is separate from vex_store for now.  vex_store currently owns an
+ * in-process filesystem metadata representation, while this driver makes the
+ * SQL transaction boundary explicit for the later metadata-backend vtable.
+ */
+
+#include <stddef.h>
+#include <stdint.h>
+
+#define VEX_META_MYSQL_REPO_ID_HEXSZ 32
+#define VEX_META_MYSQL_OID_BYTES 32
+#define VEX_META_MYSQL_VERSION_ABSENT UINT64_MAX
+
+struct vex_meta_mysql;
+
+enum vex_meta_mysql_result {
+	VEX_META_MYSQL_OK = 0,
+	VEX_META_MYSQL_ERR = -1,
+	VEX_META_MYSQL_ERR_INVALID = -2,
+	VEX_META_MYSQL_ERR_NOMEM = -3,
+	VEX_META_MYSQL_ERR_CONNECT = -4,
+	VEX_META_MYSQL_ERR_SCHEMA = -5,
+	VEX_META_MYSQL_ERR_NOT_FOUND = -6,
+	VEX_META_MYSQL_ERR_CONFLICT = -7,
+	VEX_META_MYSQL_ERR_STATE = -8,
+};
+
+struct vex_meta_mysql_options {
+	const char *host;
+	unsigned int port;
+	const char *user;
+	const char *password;
+	const char *database;
+	const char *unix_socket;
+};
+
+/*
+ * Decode either 32 lower-case hexadecimal digits or a lower-case hyphenated
+ * UUID into the BINARY(16) repository key used by schema.sql.
+ */
+int vex_meta_mysql_repo_id_parse(const char *repo_id,
+				 unsigned char out[16]);
+
+int vex_meta_mysql_open(struct vex_meta_mysql **out,
+			const struct vex_meta_mysql_options *opts);
+void vex_meta_mysql_close(struct vex_meta_mysql *db);
+const char *vex_meta_mysql_error(const struct vex_meta_mysql *db);
+
+int vex_meta_mysql_ping(struct vex_meta_mysql *db);
+
+/* Verify the ten Vex metadata tables and objects.blob_key's metadata type. */
+int vex_meta_mysql_schema_check(struct vex_meta_mysql *db,
+				unsigned int *table_count);
+
+/* Ensure the repository identity row exists without storing any Git bytes. */
+int vex_meta_mysql_ensure_repository(struct vex_meta_mysql *db,
+				     const char *repo_id,
+				     const char *hash_algo,
+				     const char *name);
+
+/*
+ * Allocate an open generation.  push_id is an optional lower-case UUID.  The
+ * allocator uses a MySQL advisory lock per repository before inserting.
+ */
+int vex_meta_mysql_epoch_begin(struct vex_meta_mysql *db,
+			       const char *repo_id, const char *push_id,
+			       uint64_t *generation);
+
+/*
+ * Stage an object metadata row and its generation claim.  oid may be a
+ * 20-byte SHA-1 or 32-byte SHA-256 ID; SHA-1 values are zero-padded to the
+ * BINARY(32) schema representation.  blob_key names a blob-store location.
+ */
+int vex_meta_mysql_stage_object(struct vex_meta_mysql *db,
+			 const char *repo_id, uint64_t generation,
+			 const unsigned char *oid, size_t oid_len,
+			 unsigned int object_type, uint64_t size,
+			 const char *blob_key);
+
+/* Store only commit-graph edge metadata; neither object contains Git bytes. */
+int vex_meta_mysql_add_commit_parent(struct vex_meta_mysql *db,
+			     const char *repo_id,
+			     const unsigned char *commit_oid, size_t commit_oid_len,
+			     unsigned int parent_pos,
+			     const unsigned char *parent_oid, size_t parent_oid_len);
+
+/* Make every object claimed by an open generation visible, then seal it. */
+int vex_meta_mysql_epoch_seal(struct vex_meta_mysql *db,
+			      const char *repo_id, uint64_t generation);
+
+/*
+ * Atomically create/update one direct ref and append its immutable audit row.
+ * expected_version is VEX_META_MYSQL_VERSION_ABSENT for a create-only CAS.
+ * Symbolic refs, deletions, and a multi-ref transaction belong in the future
+ * common metadata-backend interface rather than this standalone probe API.
+ */
+int vex_meta_mysql_ref_cas_direct(struct vex_meta_mysql *db,
+				  const char *repo_id, const char *refname,
+				  uint64_t expected_version,
+				  const unsigned char *new_oid, size_t new_oid_len,
+				  const char *reason, const char *message,
+				  uint64_t *new_version);
+
+#endif /* VEX_META_MYSQL_H */

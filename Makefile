@@ -679,6 +679,8 @@ MSGCAT = msgcat
 MSGFMT = msgfmt
 MSGMERGE = msgmerge
 CURL_CONFIG = curl-config
+VEX_MYSQL_PKG_CONFIG = pkg-config
+VEX_MYSQL_CONFIG = mysql_config
 GCOV = gcov
 STRIP = strip
 SPATCH = spatch
@@ -2528,6 +2530,15 @@ endif
 # from the dependency list, that would make each entry appear twice.
 LIBS = $(filter-out %.o, $(GITLIBS)) $(EXTLIBS)
 
+# The Vex MySQL probe is opt-in: production Git builds neither require nor
+# link a MySQL client.  Prefer pkg-config because current Homebrew MySQL's
+# mysql_config includes transitive static-link libraries that are intentionally
+# not globally linked; fall back to mysql_config for common Linux installs.
+VEX_MYSQL_CFLAGS = $(shell if $(VEX_MYSQL_PKG_CONFIG) --exists mysqlclient >/dev/null 2>&1; then $(VEX_MYSQL_PKG_CONFIG) --cflags mysqlclient; elif command -v $(VEX_MYSQL_CONFIG) >/dev/null 2>&1; then $(VEX_MYSQL_CONFIG) --cflags; fi)
+VEX_MYSQL_LIBS = $(shell if $(VEX_MYSQL_PKG_CONFIG) --exists mysqlclient >/dev/null 2>&1; then $(VEX_MYSQL_PKG_CONFIG) --libs mysqlclient; elif command -v $(VEX_MYSQL_CONFIG) >/dev/null 2>&1; then $(VEX_MYSQL_CONFIG) --libs; fi)
+VEX_MYSQL_PROBE_BIN = t/vex/bin/vex-mysql-metadata-probe
+VEX_MYSQL_PROBE_OBJS = vex/meta-mysql-probe.o t/vex/mysql-metadata-probe.o
+
 BASIC_CFLAGS += $(COMPAT_CFLAGS)
 LIB_OBJS += $(COMPAT_OBJS)
 
@@ -3036,6 +3047,30 @@ $(REMOTE_CURL_PRIMARY): remote-curl.o http.o http-walker.o GIT-LDFLAGS $(GITLIBS
 scalar$X: scalar.o GIT-LDFLAGS $(GITLIBS)
 	$(QUIET_LINK)$(CC) $(ALL_CFLAGS) -o $@ $(ALL_LDFLAGS) \
 		$(filter %.o,$^) $(LIBS)
+
+.PHONY: vex-mysql-metadata-probe
+vex-mysql-metadata-probe: $(VEX_MYSQL_PROBE_BIN)
+
+vex/meta-mysql-probe.o: vex/meta-mysql.c vex/meta-mysql.h
+	$(QUIET_CC)if test -z "$(VEX_MYSQL_CFLAGS)" || test -z "$(VEX_MYSQL_LIBS)"; then \
+		echo >&2 "Vex MySQL probe requires pkg-config mysqlclient or mysql_config"; \
+		exit 1; \
+	fi; \
+	$(CC) $(ALL_CFLAGS) $(VEX_MYSQL_CFLAGS) -DVEX_HAVE_MYSQL_CLIENT \
+		-c -o $@ $<
+
+t/vex/mysql-metadata-probe.o: t/vex/mysql-metadata-probe.c vex/meta-mysql.h
+	$(QUIET_CC)if test -z "$(VEX_MYSQL_CFLAGS)" || test -z "$(VEX_MYSQL_LIBS)"; then \
+		echo >&2 "Vex MySQL probe requires pkg-config mysqlclient or mysql_config"; \
+		exit 1; \
+	fi; \
+	$(CC) $(ALL_CFLAGS) $(VEX_MYSQL_CFLAGS) -DVEX_HAVE_MYSQL_CLIENT \
+		-c -o $@ $<
+
+$(VEX_MYSQL_PROBE_BIN): $(VEX_MYSQL_PROBE_OBJS)
+	$(call mkdir_p_parent_template)
+	$(QUIET_LINK)$(CC) $(ALL_CFLAGS) $(ALL_LDFLAGS) -o $@ \
+		$(VEX_MYSQL_PROBE_OBJS) $(VEX_MYSQL_LIBS)
 
 $(LIB_FILE): $(LIB_OBJS)
 	$(QUIET_AR)$(RM) $@ && $(AR) $(ARFLAGS) $@ $^
@@ -3910,6 +3945,7 @@ clean: profile-clean coverage-clean cocciclean
 	$(RM) po/git.pot po/git-core.pot
 	$(RM) git.rc git.res
 	$(RM) $(OBJECTS)
+	$(RM) $(VEX_MYSQL_PROBE_OBJS) $(VEX_MYSQL_PROBE_BIN)
 	$(RM) headless-git.o
 	$(RM) $(LIB_FILE)
 	$(RM) $(ALL_PROGRAMS) $(SCRIPT_LIB) $(BUILT_INS) $(OTHER_PROGRAMS)
