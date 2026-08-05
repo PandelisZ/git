@@ -20,8 +20,11 @@ fresh stock clone and `fsck` still succeed after all S3 byte reads are faulted.
 The read-only sweep plan now marks current sealed-pack members and live
 clone-lease members in addition to tips and pins. This is not direct
 precomputed-pack streaming to the client, destructive sweeping, or an L4
-result. Hard-kill chaos, grace-period deletion, cache lifecycle invalidation,
-and the sealed-pack L4 serve path remain pending.
+result. `t1524` now SIGKILLs a real receive worker before ref commit and after
+S3 promotion, then proves a configured TTL restart reclaims the MySQL epoch,
+removes both staging and newly-promoted final keys, and permits a stock-Git
+retry/clone/`fsck`. Grace-period deletion, cache lifecycle invalidation, and
+the sealed-pack L4 serve path remain pending.
 
 **Implementation identity:** this experiment is the **Vex backend**.  “Cloud
 storage” describes its MySQL + blob-store architecture; code, extension URIs,
@@ -398,6 +401,8 @@ push-stress harness against this endpoint.
 - [x] Deterministic staged-to-final S3 promotion fault compensates its failed receive epoch before a successful retry
 - [x] Concurrent first pushes to two repositories retain independent MySQL ref-audit sequences
 - [x] S3 byte scrub, durable pin/mark plan, and bounded eight-reader stock-Git correctness gate
+- [x] Two receive-worker SIGKILL offsets recover through the MySQL state lock,
+  remove stale staging/final S3 keys, and allow the exact stock-Git retry
 - [ ] CI: Compose → Vex seed → Vex smoke → down -v (no AWS)
 
 The Compose default is now a source-built Vex Git image and a long-lived
@@ -408,9 +413,9 @@ unmodified host Git over HTTPS to verify the basic P0/P1 surface and queries
 MySQL plus MinIO afterward to prove the durable split. The old classic-bare
 bootstrap remains only an explicitly labelled fallback, not the Compose
 default. The serial smoke, 500-commit ramp, deterministic promotion fault,
-byte scrub, pin/mark, and bounded-reader gates are green. This does not claim
-hard-kill chaos, destructive sweeping, sealed-pack clone performance, or an
-L3/L4 readiness level.
+two receive-worker SIGKILL recovery offsets, byte scrub, pin/mark, and
+bounded-reader gates are green. This does not claim destructive sweeping,
+sealed-pack clone performance, or an L3/L4 readiness level.
 
 Acceptance remains pending: Stage 3 tests must pass on **local** MySQL+MinIO
 through a Vex-aware server; Valkey off; second machine can reproduce from
@@ -505,7 +510,7 @@ scripts/vex/bench-clone.sh
 - `make VEX_MYSQL=YesPlease git` builds the Vex store with its MySQL metadata adapter; the normal build retains an explicit unavailable-stub error when MySQL support is omitted.
 - `scripts/vex/up.sh` starts loopback-only Compose services `vex-mysql-1`, `vex-minio-1`, and `vex-git-http-1`. The server is source-built and the health endpoint reports active MySQL metadata plus S3 bytes.
 - `VEX_COMPOSE_NO_BUILD=1 VEX_TEST_COMPOSE_MYSQL_S3=1 make -C t T=t1497-vex-compose-mysql-s3.sh` passed stock Git HTTPS push, clone, fetch, atomic annotated tag plus branch, deletion, depth-one clone, and MySQL/MinIO postconditions.
-- No L4 claim: object reads are still the loose-object correctness path; sealed packs, clone SLO measurements, hard-kill chaos, destructive sweeping, and pack/lease roots remain future gates.
+- No L4 claim: object reads are still the loose-object correctness path; sealed packs, clone SLO measurements, destructive sweeping, and pack/lease roots remain future gates.
 
 ### 2026-08-05 - Stage 4 MySQL + S3 receive safety and smoke stress
 
@@ -541,8 +546,19 @@ scripts/vex/bench-clone.sh
   clones, 246 fetches, 8 final fscks, final-tip agreement, and MySQL/S3
   reconciliation.
 
-These are L3 foundations only. Hard-kill chaos, grace-period deletion,
-sealed-pack serving, `git/git` import, and clone SLOs remain open.
+These are L3 foundations only. Grace-period deletion, sealed-pack serving,
+`git/git` import, and clone SLOs remain open.
+
+### 2026-08-05 - Receive-worker SIGKILL recovery
+
+- `t1524-vex-compose-mysql-s3-hard-kill.sh` uses host `/usr/bin/git` over
+  HTTPS and kills the actual Vex receive worker at `before-ref-commit` and
+  `after-blob-promote`.
+- On a configured one-second grace restart, recovery runs under the same
+  MySQL repository state lock as normal receives, turns the stale generation
+  into `aborted`, preserves no ref/audit/object/claim residue, removes staged
+  bytes and only failed-epoch final S3 keys, then accepts the identical retry
+  followed by clone and `fsck`.
 
 ### 2026-08-05 - Stage 6 pack and clone-lease roots
 

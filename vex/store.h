@@ -194,6 +194,16 @@ int vex_epoch_compensate(struct vex_epoch *epoch);
 void vex_epoch_free(struct vex_epoch *epoch);
 
 /*
+ * Reclaim stale open MySQL+S3 epochs left by an abruptly terminated receive
+ * worker.  `min_age_seconds` is a safety grace period; zero is reserved for
+ * controlled test recovery.  The normal Vex backend calls this during store
+ * initialization with its configured bounded grace period.
+ */
+int vex_store_recover_expired_epochs(struct vex_store *store,
+				      unsigned int min_age_seconds,
+				      unsigned int *recovered);
+
+/*
  * Stage raw Git object content.  The implementation verifies that oid is the
  * hash of type, size, and data before it writes the staging blob.
  */

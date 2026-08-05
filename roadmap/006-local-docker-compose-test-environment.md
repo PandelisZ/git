@@ -37,6 +37,15 @@ MySQL/S3 state; and `t1500` pushes two fresh repositories concurrently. The
 last gate caught and fixed a per-repository audit-sequence race, including an
 idempotent migration of the old globally-unique index.
 
+`t1524-vex-compose-mysql-s3-hard-kill.sh` is the restart-safety gate: it
+SIGKILLs the real receive worker before ref commit and after staged bytes have
+been promoted to final S3 keys. A fresh gateway with a bounded one-second
+recovery configuration locks the repository state, aborts the stale epoch,
+removes only keys introduced by that failed epoch, and leaves refs, audit,
+object rows, claims, staging, and final S3 prefixes at baseline before a
+stock-Git retry/clone/`fsck` succeeds. The production default grace remains
+900 seconds.
+
 ### Goals
 
 1. **All tests and verification are local-first** via Docker Compose.
@@ -193,6 +202,7 @@ GIT_VEX_ORIGIN=https://localhost:8443/git/git.git
 GIT_VEX_BACKEND=mysql+s3
 GIT_VEX_META_BACKEND=mysql
 GIT_VEX_BLOB_BACKEND=s3
+GIT_VEX_EPOCH_RECOVERY_SECONDS=900  # optional; source default is 900
 GIT_VEX_MYSQL_DSN=mysql://vex:vex-local-mysql@mysql:3306/vex
 GIT_VEX_S3_ENDPOINT=http://minio:9000
 GIT_VEX_S3_BUCKET=git-objects
@@ -437,6 +447,7 @@ Healthchecks + `restart: on-failure`. Exact YAML at implement time.
 - MinIO as S3 stand-in; MySQL 8; optional Valkey; smart HTTP on localhost.
 - Active Stage 4 evidence: `vex-git-http-1`, `vex-mysql-1`, and `vex-minio-1` run under the `vex` Compose project; `t1497` passes stock Git HTTPS P0/P1 basics and verifies MySQL plus MinIO after the wire operation.
 - Active write-boundary evidence: `t1498` passes 20× batch=1 against the active MySQL+S3 server with fresh reconciliation (latest p50 `1622.890ms`, p90 `2332.091ms`, p99 `2556.664ms`); `t1499` passes rejected-receive compensation; and `t1500` passes simultaneous first pushes to two distinct repositories after converting `ref_updates.id` to a repository-scoped audit sequence. These are functional/write-path measurements, not L4 clone results.
+- Restart safety evidence: `t1524` SIGKILLs two real receive-worker offsets and, after a configured bounded recovery restart, verifies MySQL refs/audit/object rows, generation claims, and both MinIO staging/final prefixes return to baseline before the exact retry clones and fscks.
 - Derived-pack cache evidence: `t1521` builds a custom-Git pack/index in per-repository S3 keys and retains its MySQL envelope after a later receive. `t1522` cold-materializes the current sealed artifact under the `vex_git_scratch` volume, faults every S3 byte GET, and passes a new stock-Git clone plus `fsck`. This is a bounded server-side object-cache check, not direct pack streaming to the client or an L4 benchmark.
 
 ## Open Questions

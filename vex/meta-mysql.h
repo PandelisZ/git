@@ -99,6 +99,13 @@ typedef int (*vex_meta_mysql_oid_iter_fn)(
 	const unsigned char oid[VEX_META_MYSQL_OID_BYTES], void *cb_data);
 
 /*
+ * Recovery selects only epoch identifiers while the normal state transaction
+ * is held.  The callback must not issue SQL on db or retain the pointer.
+ */
+typedef int (*vex_meta_mysql_generation_iter_fn)(uint64_t generation,
+						  void *cb_data);
+
+/*
  * Decode either 32 lower-case hexadecimal digits or a lower-case hyphenated
  * UUID into the BINARY(16) repository key used by schema.sql.
  */
@@ -143,6 +150,16 @@ int vex_meta_mysql_epoch_get_state(struct vex_meta_mysql *db,
  */
 int vex_meta_mysql_epoch_abort(struct vex_meta_mysql *db,
 			       const char *repo_id, uint64_t generation);
+
+/*
+ * Enumerate stale open generations while vex_meta_mysql_state_lock() is held.
+ * The normal state adapter rewrites a repository snapshot on save, so callers
+ * must mutate that same in-memory state before committing recovery.
+ */
+int vex_meta_mysql_state_for_each_expired_open_locked(
+		struct vex_meta_mysql *db, const char *repo_id,
+		unsigned int min_age_seconds,
+		vex_meta_mysql_generation_iter_fn fn, void *cb_data);
 
 /*
  * Stage an object metadata row and its generation claim.  oid may be a

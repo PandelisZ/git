@@ -542,6 +542,19 @@ int vex_blob_s3_delete_staging(struct vex_blob_s3 *blob, uint64_t epoch,
 	return ret;
 }
 
+int vex_blob_s3_delete_final(struct vex_blob_s3 *blob,
+			     const struct object_id *oid)
+{
+	struct strbuf key = STRBUF_INIT;
+	int ret;
+
+	ret = vex_blob_s3_final_key(blob, oid, &key);
+	if (!ret)
+		ret = delete_key(blob, key.buf);
+	strbuf_release(&key);
+	return ret;
+}
+
 int vex_blob_s3_promote_object(struct vex_blob_s3 *blob, uint64_t epoch,
 			       const struct object_id *oid)
 {

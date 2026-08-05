@@ -7,6 +7,7 @@
 #include "../refs.h"
 #include "../repository.h"
 #include "../strbuf.h"
+#include "../trace.h"
 #include "../vex/store.h"
 #include "refs-internal.h"
 
@@ -50,6 +51,16 @@ static struct vex_ref_store *vex_downcast(struct ref_store *ref_store)
 	if (ref_store->be != &refs_be_vex)
 		BUG("ref store is type \"%s\", not \"vex\"", ref_store->be->name);
 	return (struct vex_ref_store *)ref_store;
+}
+
+static void vex_test_kill_at(const char *point)
+{
+	const char *value = getenv("GIT_VEX_TEST_KILL_AT");
+
+	if (!value || strcmp(value, point))
+		return;
+	trace_printf("vex: test fault killing receive worker at %s", point);
+	raise(SIGKILL);
 }
 
 static void vex_target_from_ref(struct vex_ref_target *target,
@@ -106,9 +117,13 @@ static struct ref_store *vex_be_init(struct repository *repo,
 
 	base_ref_store_init(&refs->base, repo, gitdir, &refs_be_vex);
 	refs->store_flags = opts->access_flags;
-	if (vex_store_open_for_repository(repo, gitdir, &refs->store))
+	if (vex_store_open_for_repository(repo, gitdir, &refs->store) ||
+	    vex_repo_ensure(refs->store)) {
+		vex_store_close(refs->store);
+		free(refs);
 		die(_("unable to open Vex reference store for '%s'"),
 		    repo->ref_storage_payload ? repo->ref_storage_payload : "");
+	}
 	return &refs->base;
 }
 
@@ -562,6 +577,7 @@ static int vex_be_transaction_finish(struct ref_store *ref_store,
 	struct vex_transaction_data *data = transaction->backend_data;
 	int ret;
 
+	vex_test_kill_at("before-ref-commit");
 	ret = vex_ref_transaction_commit(data->transaction);
 	/* commit retains the transaction allocation; abort releases it after commit. */
 	vex_ref_transaction_abort(data->transaction);

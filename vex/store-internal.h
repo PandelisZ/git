@@ -23,6 +23,8 @@ struct vex_meta_epoch {
 	uint64_t id;
 	enum vex_epoch_state state;
 	char *push_id;
+	/* MySQL state snapshots preserve this so crash TTLs never reset on save. */
+	char *created_at;
 };
 
 struct vex_meta_object {
@@ -104,6 +106,8 @@ struct vex_store {
 	struct vex_blob_fs *blob_fs;
 	struct vex_blob_s3 *blob_s3;
 	unsigned int blob_s3_checked:1;
+	/* Avoid repeating the stale-epoch scan on every operation in one store. */
+	unsigned int epoch_recovery_checked:1;
 };
 
 struct vex_epoch {

@@ -71,8 +71,10 @@ and MySQL/S3 reconciliation (p50 `13706.237ms`, p90 `23252.034ms`, p99
 `28033.833ms`). A deterministic staged-to-final S3 promotion fault proves
 epoch compensation, and the bounded reader gate passes 20 writer pushes with
 8 readers, 8 clones, 246 fetches, and 8 final fscks. These are local write
-path measurements and correctness gates, not a clone SLO. Hard-kill chaos,
-larger concurrency, and soak profiles remain unverified.
+path measurements and correctness gates, not a clone SLO. `t1524` separately
+proves two real receive-worker SIGKILL offsets recover on the same Compose
+MySQL+S3 data plane. Integrating that fault into a long push-stress/soak
+profile, larger concurrency, and soak profiles remain open.
 
 ---
 

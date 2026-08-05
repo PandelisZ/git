@@ -68,6 +68,9 @@ int vex_blob_s3_promote_object(struct vex_blob_s3 *blob, uint64_t epoch,
 /* Idempotent compensation for one staged object. */
 int vex_blob_s3_delete_staging(struct vex_blob_s3 *blob, uint64_t epoch,
 			       const struct object_id *oid);
+/* Idempotent compensation for an uncommitted newly-promoted final object. */
+int vex_blob_s3_delete_final(struct vex_blob_s3 *blob,
+			     const struct object_id *oid);
 
 /* Returns 1 if present, 0 if absent, or a negative VEX_BLOB_S3_ERR_* value. */
 int vex_blob_s3_has_final(struct vex_blob_s3 *blob,

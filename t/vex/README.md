@@ -26,6 +26,7 @@ sealed-pack clone SLO.
 ```sh
 t/vex/mysql-s3-stock-http.sh
 VEX_TEST_COMPOSE_MYSQL_S3=1 make -C t T=t1497-vex-compose-mysql-s3.sh
+VEX_TEST_COMPOSE_MYSQL_S3=1 make -C t T=t1524-vex-compose-mysql-s3-hard-kill.sh
 ```
 
 ## FS smart-HTTP integration gate

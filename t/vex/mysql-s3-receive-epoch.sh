@@ -92,7 +92,7 @@ assert_minio_staging_prefix_empty() {
 		set -eu
 		mc alias set vex "$MINIO_ENDPOINT" "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD" >/dev/null
 		mc stat "vex/$MINIO_BUCKET" >/dev/null
-		objects=$(mc find "vex/$MINIO_BUCKET/$VEX_S3_STAGING_PREFIX" --type f 2>/dev/null || :)
+		objects=$(mc find "vex/$MINIO_BUCKET/$VEX_S3_STAGING_PREFIX" 2>/dev/null || :)
 		if test -n "$objects"
 		then
 			printf "unexpected MinIO staging objects under: %s\\n" "$VEX_S3_STAGING_PREFIX" >&2

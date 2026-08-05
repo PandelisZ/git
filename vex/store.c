@@ -112,6 +112,19 @@ static int object_has_epoch_claim(const struct vex_meta_state *state,
 	return 0;
 }
 
+static int object_has_other_epoch_claim(const struct vex_meta_state *state,
+					uint64_t epoch,
+					const struct object_id *oid)
+{
+	size_t i;
+
+	for (i = 0; i < state->epoch_objects_nr; i++)
+		if (state->epoch_objects[i].epoch != epoch &&
+		    oideq(&state->epoch_objects[i].oid, oid))
+			return 1;
+	return 0;
+}
+
 static void remove_epoch_object_at(struct vex_meta_state *state, size_t at)
 {
 	if (at + 1 < state->epoch_objects_nr)
@@ -387,8 +400,14 @@ static int object_is_visible(const struct vex_meta_state *state,
 			  (epoch && epoch_has_object(state, epoch->id, &object->oid)));
 }
 
+struct vex_epoch_blob {
+	struct object_id oid;
+	/* Delete a final key only when this failed epoch introduced it. */
+	unsigned int remove_final:1;
+};
+
 struct vex_epoch_blob_list {
-	struct object_id *oids;
+	struct vex_epoch_blob *entries;
 	size_t nr;
 };
 
@@ -510,18 +529,32 @@ static void snapshot_epoch_objects(const struct vex_meta_state *state,
 			objects->nr++;
 	if (!objects->nr)
 		return;
-	CALLOC_ARRAY(objects->oids, objects->nr);
+	CALLOC_ARRAY(objects->entries, objects->nr);
 	for (i = 0; i < state->epoch_objects_nr; i++) {
+		const struct vex_meta_object *object;
+		struct vex_epoch_blob *blob;
+
 		if (state->epoch_objects[i].epoch != epoch)
 			continue;
-		oidcpy(&objects->oids[at++], &state->epoch_objects[i].oid);
+		object = find_object((struct vex_meta_state *)state,
+				     &state->epoch_objects[i].oid);
+		blob = &objects->entries[at++];
+		oidcpy(&blob->oid, &state->epoch_objects[i].oid);
+		/*
+		 * A promoted S3 key can outlive a SIGKILL between the copy and
+		 * metadata commit.  Never remove a canonical key that was already
+		 * published or is still claimed by another open epoch.
+		 */
+		blob->remove_final = object &&
+			object->state == VEX_OBJECT_QUARANTINE &&
+			!object_has_other_epoch_claim(state, epoch, &blob->oid);
 	}
 }
 
 static void release_epoch_objects(struct vex_epoch_blob_list *objects)
 {
-	free(objects->oids);
-	objects->oids = NULL;
+	free(objects->entries);
+	objects->entries = NULL;
 	objects->nr = 0;
 }
 
@@ -539,8 +572,16 @@ static int blob_backend_compensate_epoch(
 		return VEX_STORE_ERR_INVALID;
 	for (i = 0; i < objects->nr; i++) {
 		int cleanup = blob_s3_result(vex_blob_s3_delete_staging(
-				store->blob_s3, epoch, &objects->oids[i]));
+				store->blob_s3, epoch, &objects->entries[i].oid));
 
+		if (cleanup == VEX_STORE_ERR_NOT_FOUND)
+			cleanup = VEX_STORE_OK;
+		if (!ret && cleanup)
+			ret = cleanup;
+		if (!objects->entries[i].remove_final)
+			continue;
+		cleanup = blob_s3_result(vex_blob_s3_delete_final(
+				store->blob_s3, &objects->entries[i].oid));
 		if (cleanup == VEX_STORE_ERR_NOT_FOUND)
 			cleanup = VEX_STORE_OK;
 		if (!ret && cleanup)
@@ -685,6 +726,143 @@ static void abort_epoch_state(struct vex_meta_state *state, uint64_t epoch_id)
 	}
 	if (epoch)
 		epoch->state = VEX_EPOCH_ABORTED;
+}
+
+struct vex_expired_epoch {
+	uint64_t id;
+	struct vex_epoch_blob_list blobs;
+};
+
+struct vex_expired_epoch_list {
+	struct vex_expired_epoch *items;
+	size_t nr;
+	size_t alloc;
+};
+
+static int collect_expired_epoch(uint64_t id, void *cb_data)
+{
+	struct vex_expired_epoch_list *epochs = cb_data;
+	struct vex_expired_epoch *epoch;
+
+	ALLOC_GROW(epochs->items, epochs->nr + 1, epochs->alloc);
+	epoch = &epochs->items[epochs->nr++];
+	memset(epoch, 0, sizeof(*epoch));
+	epoch->id = id;
+	return VEX_META_MYSQL_OK;
+}
+
+static void release_expired_epochs(struct vex_expired_epoch_list *epochs)
+{
+	size_t i;
+
+	for (i = 0; i < epochs->nr; i++)
+		release_epoch_objects(&epochs->items[i].blobs);
+	free(epochs->items);
+	epochs->items = NULL;
+	epochs->nr = epochs->alloc = 0;
+}
+
+int vex_store_recover_expired_epochs(struct vex_store *store,
+				      unsigned int min_age_seconds,
+				      unsigned int *recovered)
+{
+	struct vex_meta_lock lock;
+	struct vex_meta_state state;
+	struct vex_expired_epoch_list epochs = { 0 };
+	size_t i;
+	int ret;
+	int cleanup_ret = VEX_STORE_OK;
+
+	if (!store || store->backend != VEX_STORE_BACKEND_MYSQL_S3 ||
+	    min_age_seconds > 86400)
+		return VEX_STORE_ERR_INVALID;
+	if (recovered)
+		*recovered = 0;
+	if ((ret = load_locked(store, &lock, &state)))
+		return ret;
+	ret = meta_mysql_result(vex_meta_mysql_state_for_each_expired_open_locked(
+		store->meta_mysql, store->repo_id, min_age_seconds,
+		collect_expired_epoch, &epochs));
+	if (ret)
+		goto out;
+	for (i = 0; i < epochs.nr; i++) {
+		struct vex_meta_epoch *epoch = find_epoch(&state, epochs.items[i].id);
+
+		if (!epoch || epoch->state != VEX_EPOCH_OPEN) {
+			ret = VEX_STORE_ERR_STATE;
+			goto out;
+		}
+		snapshot_epoch_objects(&state, epoch->id, &epochs.items[i].blobs);
+		abort_epoch_state(&state, epoch->id);
+	}
+	if (epochs.nr) {
+		ret = meta_save_locked(store, &lock, &state);
+		if (ret)
+			goto out;
+		if (recovered)
+			*recovered = epochs.nr;
+		trace_printf("vex: recovered %zu stale receive epoch(s) repo=%s age=%us",
+			     epochs.nr, store->repo_id, min_age_seconds);
+		for (i = 0; i < epochs.nr; i++) {
+			int one = blob_backend_compensate_epoch(store, epochs.items[i].id,
+								&epochs.items[i].blobs);
+
+			if (!cleanup_ret && one)
+				cleanup_ret = one;
+		}
+	} else {
+		meta_unlock(store, &lock);
+	}
+	ret = cleanup_ret;
+out:
+	if (lock.held)
+		meta_unlock(store, &lock);
+	vex_meta_state_release(&state);
+	release_expired_epochs(&epochs);
+	return ret;
+}
+
+#define VEX_EPOCH_RECOVERY_SECONDS 900
+
+static int parse_epoch_recovery_seconds(const char *value,
+					unsigned int *seconds, int allow_zero)
+{
+	char *end;
+	unsigned long parsed;
+
+	if (!value || !*value)
+		return -1;
+	errno = 0;
+	parsed = strtoul(value, &end, 10);
+	if (errno || *end || parsed > 86400 ||
+	    (!allow_zero && !parsed))
+		return -1;
+	*seconds = parsed;
+	return 0;
+}
+
+static unsigned int vex_epoch_recovery_seconds(void)
+{
+	const char *test_value = getenv("GIT_VEX_TEST_EPOCH_RECOVERY_SECONDS");
+	const char *value = getenv("GIT_VEX_EPOCH_RECOVERY_SECONDS");
+	unsigned int seconds;
+
+	if (test_value && *test_value &&
+	    !parse_epoch_recovery_seconds(test_value, &seconds, 1))
+		return seconds;
+	if (value && *value && !parse_epoch_recovery_seconds(value, &seconds, 0))
+		return seconds;
+	return VEX_EPOCH_RECOVERY_SECONDS;
+}
+
+static void vex_test_kill_at(const char *point)
+{
+	const char *value = getenv("GIT_VEX_TEST_KILL_AT");
+
+	if (!value || strcmp(value, point))
+		return;
+	trace_printf("vex: test fault killing receive worker at %s", point);
+	raise(SIGKILL);
 }
 
 static int blob_available_for_epoch(struct vex_store *store, uint64_t epoch,
@@ -882,6 +1060,14 @@ int vex_repo_ensure(struct vex_store *store)
 			return ret;
 		store->blob_s3_checked = 1;
 	}
+	if (store->backend == VEX_STORE_BACKEND_MYSQL_S3 &&
+	    !store->epoch_recovery_checked) {
+		ret = vex_store_recover_expired_epochs(store,
+						vex_epoch_recovery_seconds(), NULL);
+		if (ret)
+			return ret;
+		store->epoch_recovery_checked = 1;
+	}
 	return VEX_STORE_OK;
 }
 
@@ -956,6 +1142,7 @@ int vex_epoch_allocate(struct vex_store *store, const char *push_id,
 	meta_epoch->id = state.next_epoch++;
 	meta_epoch->state = VEX_EPOCH_OPEN;
 	meta_epoch->push_id = push_id ? xstrdup(push_id) : NULL;
+	meta_epoch->created_at = NULL;
 	ret = meta_save_locked(store, &lock, &state);
 	if (ret) {
 		vex_meta_state_release(&state);
@@ -2097,6 +2284,7 @@ int vex_ref_transaction_commit(struct vex_ref_transaction *transaction)
 		release_epoch_objects(&blobs);
 		return ret;
 	}
+	vex_test_kill_at("after-blob-promote");
 	if ((ret = publish_epoch(store, &state, epoch->id)))
 		goto out;
 	for (i = 0; i < transaction->updates_nr; i++) {

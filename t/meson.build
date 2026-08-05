@@ -269,6 +269,7 @@ integration_tests = [
   't1521-vex-compose-mysql-s3-pack-artifact.sh',
   't1522-vex-compose-mysql-s3-pack-cache.sh',
   't1523-vex-compose-mysql-s3-pack-lease.sh',
+  't1524-vex-compose-mysql-s3-hard-kill.sh',
   't1600-index.sh',
   't1601-index-bogus.sh',
   't1700-split-index.sh',

@@ -250,7 +250,11 @@ with fresh reconciliation; `t1499` proves rejected-receive compensation;
 `t1500` covers simultaneous first pushes to separate repositories after the
 MySQL audit-sequence migration; `t1501` forces promotion compensation;
 `t1502` hashes S3 bytes; `t1503` proves pins and the conservative mark plan;
-and `t1518` is a bounded eight-reader stock-Git gate.
+and `t1518` is a bounded eight-reader stock-Git gate. `t1524` then kills the
+real receive worker at `before-ref-commit` and `after-blob-promote`; a
+one-second configured recovery restart proves the stale epoch becomes
+aborted, MySQL ref/audit/object rows and both MinIO namespaces return to their
+baseline, and the identical stock-Git commit retries, clones, and fscks.
 
 Tasks:
 
@@ -263,9 +267,10 @@ Tasks:
 7. [x] `t/vex/integration-mysql-minio.sh` + `t1497` stock-client smoke.
 8. [x] Compose smoke push-stress ([009](009-incremental-push-stress-harness.md)): empty repo, 20× batch=1 with stock Git.
 9. [x] Post-batch fresh-fetch/`fsck` recon asserts and checkpoint/metrics anti-cheat fields.
-10. [~] Compose ramp + **chaos** + **fault_inject** profiles. The 500-commit
-    ramp and deterministic S3-promotion fault are green; hard-kill chaos is
-    still required.
+10. [x] Compose ramp + bounded crash/fault gates. The 500-commit ramp,
+    deterministic S3-promotion fault, and `t1524` two-offset receive-worker
+    SIGKILL recovery are green. Wiring hard-kill into a long/soak stress
+    profile remains separate work.
 11. Compose resource limits for stress profile (W5-10).
 12. CI: up → seed-small → clone smoke → **push-stress smoke** → down -v.
 13. **Sealed packs still optional** at L2 (W5-4).
@@ -277,7 +282,8 @@ Acceptance:
 - Empty repo + 20× batch=1; ramp 500 commits; chaos no split-brain.
 - 500-commit ramp and deterministic promotion fault: tips reconcile; the
   failed epoch is compensated.
-- Hard-kill chaos remains required before a crash-safety claim.
+- [x] Two hard-kill offsets leave no ref/audit advance or durable MySQL/S3
+  residue after bounded restart recovery.
 - Reproducible with Docker + git only.
 
 ---
@@ -317,7 +323,8 @@ conservative roots, but deletion remains required.
 
 ### Stage 6 add-on — push stress soak
 
-- [~] 500-commit ramp green on Compose; hard-kill chaos remains
+- [~] 500-commit ramp and two-offset receive-worker hard-kill recovery green
+  on Compose; an integrated long/soak chaos profile remains
 - [ ] Optional `steady-1.env` 5k batch=1 overnight
 - [ ] Metrics summary checked for error rate = 0
 
@@ -405,7 +412,7 @@ Tasks:
 
 - Playbooks derived from 001 stages + 003 passes 02,05,13,14,16,21,25,26,28,35.
 - receive-pack quarantine/`odb_transaction` integration requirement confirmed in-tree.
-- Compose Stage 4 data plane: source-built Vex Git, MySQL metadata, and MinIO canonical bytes verified by `t1497`; `t1498` is green for the serial 20× smoke plus reconciliation and the 500-commit ramp; `t1499` is green for receive compensation; `t1500` is green for two concurrent repositories; `t1501` forces S3-promotion compensation; `t1502` hashes canonical bytes; `t1503` proves pin/mark protection; `t1518` runs eight readers during twenty writer pushes; `t1519` covers rebase/lease/merge workflows; `t1520` verifies measurement-only p50/p90 benchmark JSON; `t1521` builds/records a per-repository S3 pack artifact that survives a later receive; `t1522` proves a fresh stock clone and `fsck` use the verified current packed cache when every S3 byte read is faulted; and `t1523` proves current pack plus live clone-lease members remain read-only sweep roots across a stock-Git state rewrite and return as candidates only after release. The cache remains a server-side normal-object-read accelerator, not a direct precomputed-pack client stream. Hard-kill chaos, destructive pack/lease-aware sweeping, cache lifecycle invalidation, direct pack serve, and the L4 SLO remain next.
+- Compose Stage 4 data plane: source-built Vex Git, MySQL metadata, and MinIO canonical bytes verified by `t1497`; `t1498` is green for the serial 20× smoke plus reconciliation and the 500-commit ramp; `t1499` is green for receive compensation; `t1500` is green for two concurrent repositories; `t1501` forces S3-promotion compensation; `t1502` hashes canonical bytes; `t1503` proves pin/mark protection; `t1518` runs eight readers during twenty writer pushes; `t1519` covers rebase/lease/merge workflows; `t1520` verifies measurement-only p50/p90 benchmark JSON; `t1521` builds/records a per-repository S3 pack artifact that survives a later receive; `t1522` proves a fresh stock clone and `fsck` use the verified current packed cache when every S3 byte read is faulted; `t1523` proves current pack plus live clone-lease members remain read-only sweep roots across a stock-Git state rewrite and return as candidates only after release; and `t1524` proves two actual `SIGKILL` receive-worker offsets recover through the MySQL state lock, remove stale staging/final S3 keys, retain no tip/audit metadata, and permit the exact commit to retry/clone/`fsck`. The cache remains a server-side normal-object-read accelerator, not a direct precomputed-pack client stream. Destructive pack/lease-aware sweeping, cache lifecycle invalidation, direct pack serve, and the L4 SLO remain next.
 
 ## Open Questions
 

@@ -150,6 +150,19 @@ int vex_meta_mysql_epoch_abort(struct vex_meta_mysql *db,
 	return mysql_unavailable();
 }
 
+int vex_meta_mysql_state_for_each_expired_open_locked(
+		struct vex_meta_mysql *db, const char *repo_id,
+		unsigned int min_age_seconds,
+		vex_meta_mysql_generation_iter_fn fn, void *cb_data)
+{
+	(void)db;
+	(void)repo_id;
+	(void)min_age_seconds;
+	(void)fn;
+	(void)cb_data;
+	return mysql_unavailable();
+}
+
 int vex_meta_mysql_stage_object(struct vex_meta_mysql *db,
 			 const char *repo_id, uint64_t generation,
 			 const unsigned char *oid, size_t oid_len,
@@ -1346,6 +1359,94 @@ out:
 	return ret;
 }
 
+int vex_meta_mysql_state_for_each_expired_open_locked(
+		struct vex_meta_mysql *db, const char *repo_id,
+		unsigned int min_age_seconds,
+		vex_meta_mysql_generation_iter_fn fn, void *cb_data)
+{
+	char *repo = NULL;
+	char *sql = NULL;
+	MYSQL_RES *res = NULL;
+	MYSQL_ROW row;
+	unsigned long *lengths;
+	uint64_t *generations = NULL;
+	size_t generations_nr = 0;
+	size_t generations_alloc = 0;
+	size_t i;
+	int ret = VEX_META_MYSQL_OK;
+
+	if (!db || !db->mysql || !db->state_transaction || !fn ||
+	    min_age_seconds > 86400)
+		return VEX_META_MYSQL_ERR_INVALID;
+	repo = sql_repo_literal(repo_id, NULL);
+	if (!repo) {
+		ret = set_error(db, VEX_META_MYSQL_ERR_INVALID,
+				"invalid Vex repository UUID");
+		goto out;
+	}
+	sql = vex_format("SELECT generation FROM generations WHERE repo_id = %s "
+			 "AND state = 'open' AND created_at <= "
+			 "DATE_SUB(CURRENT_TIMESTAMP(6), INTERVAL %u SECOND) "
+			 "ORDER BY generation FOR UPDATE", repo, min_age_seconds);
+	if (!sql) {
+		ret = set_error(db, VEX_META_MYSQL_ERR_NOMEM,
+				"could not allocate expired Vex epoch query");
+		goto out;
+	}
+	if (mysql_query(db->mysql, sql)) {
+		ret = set_mysql_error(db, "MySQL expired Vex epoch read failed");
+		goto out;
+	}
+	res = mysql_store_result(db->mysql);
+	if (!res) {
+		ret = set_mysql_error(db,
+				"MySQL expired Vex epoch result retrieval failed");
+		goto out;
+	}
+	if (mysql_num_fields(res) != 1) {
+		ret = set_error(db, VEX_META_MYSQL_ERR,
+				"MySQL returned invalid expired Vex epoch metadata");
+		goto out;
+	}
+	while ((row = mysql_fetch_row(res))) {
+		char *end;
+		uintmax_t parsed;
+
+		lengths = mysql_fetch_lengths(res);
+		if (!row[0] || !lengths || !lengths[0]) {
+			ret = set_error(db, VEX_META_MYSQL_ERR,
+					"MySQL returned an invalid expired Vex generation");
+			goto out;
+		}
+		errno = 0;
+		parsed = strtoumax(row[0], &end, 10);
+		if (errno || !*row[0] || *end || !parsed ||
+		    parsed > UINT64_MAX) {
+			ret = set_error(db, VEX_META_MYSQL_ERR,
+					"MySQL returned an invalid expired Vex generation");
+			goto out;
+		}
+		ALLOC_GROW(generations, generations_nr + 1, generations_alloc);
+		generations[generations_nr++] = parsed;
+	}
+	/* The result is buffered before callbacks mutate the loaded state. */
+	mysql_free_result(res);
+	res = NULL;
+	for (i = 0; i < generations_nr; i++) {
+		ret = fn(generations[i], cb_data);
+		if (ret)
+			goto out;
+	}
+
+out:
+	if (res)
+		mysql_free_result(res);
+	free(generations);
+	free(sql);
+	free(repo);
+	return ret;
+}
+
 int vex_meta_mysql_stage_object(struct vex_meta_mysql *db,
 			 const char *repo_id, uint64_t generation,
 			 const unsigned char *oid, size_t oid_len,
@@ -2523,7 +2624,9 @@ static int state_load_epochs(struct vex_meta_mysql *db, const char *repo,
 	unsigned long *lengths;
 	int ret;
 
-	sql = vex_format("SELECT generation, state, push_id FROM generations "
+	sql = vex_format("SELECT generation, state, push_id, "
+			 "DATE_FORMAT(created_at, '%%Y-%%m-%%d %%H:%%i:%%s.%%f') "
+			 "FROM generations "
 			 "WHERE repo_id = %s ORDER BY generation", repo);
 	if (!sql)
 		return set_error(db, VEX_META_MYSQL_ERR_NOMEM,
@@ -2538,10 +2641,11 @@ static int state_load_epochs(struct vex_meta_mysql *db, const char *repo,
 		enum vex_meta_mysql_epoch_state epoch_state;
 
 		lengths = mysql_fetch_lengths(res);
-		if (!row[0] || !row[1] || !lengths ||
+		if (!row[0] || !row[1] || !row[3] || !lengths ||
 		    parse_u64(row[0], &id) || !id ||
 		    parse_epoch_state(row[1], &epoch_state) ||
-		    (row[2] && lengths[2] != 16) || id == UINT64_MAX) {
+		    (row[2] && lengths[2] != 16) || !lengths[3] ||
+		    lengths[3] > 32 || id == UINT64_MAX) {
 			ret = set_error(db, VEX_META_MYSQL_ERR,
 					"MySQL returned invalid Vex generation metadata");
 			goto out;
@@ -2551,7 +2655,8 @@ static int state_load_epochs(struct vex_meta_mysql *db, const char *repo,
 		epoch->id = id;
 		epoch->state = (enum vex_epoch_state)epoch_state;
 		epoch->push_id = state_row_uuid(row[2], row[2] ? lengths[2] : 0);
-		if (row[2] && !epoch->push_id) {
+		epoch->created_at = state_row_text(row[3], lengths[3]);
+		if ((row[2] && !epoch->push_id) || !epoch->created_at) {
 			ret = set_error(db, VEX_META_MYSQL_ERR_NOMEM,
 					"could not allocate Vex generation push id");
 			goto out;
@@ -3411,19 +3516,25 @@ static int state_insert_epochs(struct vex_meta_mysql *db, const char *repo,
 		const struct vex_meta_epoch *epoch = &state->epochs[i];
 		const char *name = state_epoch_name(epoch->state);
 		char *push = state_uuid_literal_or_null(epoch->push_id);
+		char *created_at = epoch->created_at ?
+			sql_quote(db, epoch->created_at) :
+			vex_strdup("CURRENT_TIMESTAMP(6)");
 		char *sql;
 		int ret;
 
-		if (!epoch->id || !name || !push) {
+		if (!epoch->id || !name || !push || !created_at) {
+			free(created_at);
 			free(push);
 			return set_error(db, VEX_META_MYSQL_ERR_INVALID,
 					 "invalid Vex epoch state");
 		}
 		sql = vex_format("INSERT INTO generations "
-				 "(repo_id, generation, state, push_id, sealed_at) VALUES "
-				 "(%s, %" PRIu64 ", '%s', %s, %s)",
+				 "(repo_id, generation, state, push_id, created_at, sealed_at) VALUES "
+				 "(%s, %" PRIu64 ", '%s', %s, %s, %s)",
 				 repo, epoch->id, name, push,
+				 created_at,
 				 epoch->state == VEX_EPOCH_OPEN ? "NULL" : "CURRENT_TIMESTAMP(6)");
+		free(created_at);
 		free(push);
 		if (!sql)
 			return set_error(db, VEX_META_MYSQL_ERR_NOMEM,

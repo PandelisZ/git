@@ -115,6 +115,12 @@ services:
       # Test-only: shorten CGI/cache pack leases without weakening the
       # production 900-second retention window.
       GIT_VEX_TEST_PACK_LEASE_SECONDS: ${GIT_VEX_TEST_PACK_LEASE_SECONDS:-}
+      # The normal recovery grace defaults to 900 seconds.  Tests lower it
+      # only on an idle restart; they never enable it during a receive.
+      GIT_VEX_EPOCH_RECOVERY_SECONDS: ${GIT_VEX_EPOCH_RECOVERY_SECONDS:-}
+      # Test-only receive-worker crash injection.
+      GIT_VEX_TEST_KILL_AT: ${GIT_VEX_TEST_KILL_AT:-}
+      GIT_VEX_TEST_EPOCH_RECOVERY_SECONDS: ${GIT_VEX_TEST_EPOCH_RECOVERY_SECONDS:-}
       GIT_VEX_SCRATCH: /var/git-scratch
       GIT_VEX_REPO_GIT_GIT_UUID: ${GIT_VEX_REPO_GIT_GIT_UUID}
       VEX_GIT_HTTP_COMMAND: ${VEX_GIT_HTTP_COMMAND:-/usr/local/lib/vex-git-http/vex_mysql_s3_http.py}
