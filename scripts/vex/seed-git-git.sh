@@ -212,13 +212,15 @@ wait_for_storage() {
 wait_for_storage ||
 	die 'Compose is not actively serving the Vex MySQL+S3 data plane; run scripts/vex/up.sh first'
 
-# A git/git-scale stock-Git push has a much larger Content-Length and can run
-# longer than the normal small-fixture CGI deadline. Keep both configuration
-# changes entirely in the running gateway: recreate once with the seed bounds,
-# then recreate again with the exact previous values before reporting success
-# or returning an error.
+# A git/git-scale stock-Git push has a much larger Content-Length, can run
+# longer than the normal small-fixture CGI deadline, and must not be mistaken
+# for a hard-killed epoch while its normal receive is still active. Keep these
+# configuration changes entirely in the running gateway: recreate once with
+# the seed bounds, then recreate again with the exact previous values before
+# reporting success or returning an error.
 seed_request_limit=8589934592
 seed_timeout_seconds=3600
+seed_epoch_recovery_seconds=3600
 gateway_restore_limit=$("${compose[@]}" exec -T git-http /bin/sh -c \
 	'printf %s "${VEX_HTTP_MAX_REQUEST_BYTES:-}"')
 # Older already-running gateway containers predate explicit timeout variables.
@@ -228,12 +230,17 @@ gateway_restore_cgi_timeout=$("${compose[@]}" exec -T git-http /bin/sh -c \
 	'printf %s "${VEX_HTTP_CGI_TIMEOUT_SECONDS:-300}"')
 gateway_restore_io_timeout=$("${compose[@]}" exec -T git-http /bin/sh -c \
 	'printf %s "${VEX_HTTP_IO_TIMEOUT_SECONDS:-300}"')
+gateway_restore_epoch_recovery=$("${compose[@]}" exec -T git-http /bin/sh -c \
+	'printf %s "${GIT_VEX_EPOCH_RECOVERY_SECONDS-}"')
+gateway_effective_epoch_recovery=${gateway_restore_epoch_recovery:-900}
 require_uint 'active git-http VEX_HTTP_MAX_REQUEST_BYTES' "$gateway_restore_limit"
 require_uint 'active git-http VEX_HTTP_CGI_TIMEOUT_SECONDS' "$gateway_restore_cgi_timeout"
 require_uint 'active git-http VEX_HTTP_IO_TIMEOUT_SECONDS' "$gateway_restore_io_timeout"
+require_uint 'active git-http GIT_VEX_EPOCH_RECOVERY_SECONDS' "$gateway_effective_epoch_recovery"
 gateway_seed_limit=$gateway_restore_limit
 gateway_seed_cgi_timeout=$gateway_restore_cgi_timeout
 gateway_seed_io_timeout=$gateway_restore_io_timeout
+gateway_seed_epoch_recovery=$gateway_effective_epoch_recovery
 if [ "$gateway_seed_limit" -lt "$seed_request_limit" ]; then
 	gateway_seed_limit=$seed_request_limit
 fi
@@ -243,6 +250,9 @@ fi
 if [ "$gateway_seed_io_timeout" -lt "$seed_timeout_seconds" ]; then
 	gateway_seed_io_timeout=$seed_timeout_seconds
 fi
+if [ "$gateway_seed_epoch_recovery" -lt "$seed_epoch_recovery_seconds" ]; then
+	gateway_seed_epoch_recovery=$seed_epoch_recovery_seconds
+fi
 gateway_override_active=0
 scratch=''
 
@@ -251,6 +261,7 @@ restore_gateway_limits() {
 	if ! env VEX_HTTP_MAX_REQUEST_BYTES="$gateway_restore_limit" \
 		VEX_HTTP_CGI_TIMEOUT_SECONDS="$gateway_restore_cgi_timeout" \
 		VEX_HTTP_IO_TIMEOUT_SECONDS="$gateway_restore_io_timeout" \
+		GIT_VEX_EPOCH_RECOVERY_SECONDS="$gateway_restore_epoch_recovery" \
 		"${compose[@]}" up -d --no-build --no-deps --force-recreate git-http >/dev/null; then
 		printf '%s\n' 'vex seed-git-git: failed to restore the git-http gateway limits' >&2
 		return 1
@@ -263,17 +274,19 @@ restore_gateway_limits() {
 }
 
 raise_gateway_limits_for_seed() {
-	local observed_limit observed_cgi_timeout observed_io_timeout
+	local observed_limit observed_cgi_timeout observed_io_timeout observed_epoch_recovery
 
 	if [ "$gateway_restore_limit" -ge "$seed_request_limit" ] && \
 		[ "$gateway_restore_cgi_timeout" -ge "$seed_timeout_seconds" ] && \
-		[ "$gateway_restore_io_timeout" -ge "$seed_timeout_seconds" ]; then
+		[ "$gateway_restore_io_timeout" -ge "$seed_timeout_seconds" ] && \
+		[ "$gateway_effective_epoch_recovery" -ge "$seed_epoch_recovery_seconds" ]; then
 		return 0
 	fi
 	gateway_override_active=1
 	if ! env VEX_HTTP_MAX_REQUEST_BYTES="$gateway_seed_limit" \
 		VEX_HTTP_CGI_TIMEOUT_SECONDS="$gateway_seed_cgi_timeout" \
 		VEX_HTTP_IO_TIMEOUT_SECONDS="$gateway_seed_io_timeout" \
+		GIT_VEX_EPOCH_RECOVERY_SECONDS="$gateway_seed_epoch_recovery" \
 		"${compose[@]}" up -d --no-build --no-deps --force-recreate git-http >/dev/null; then
 		return 1
 	fi
@@ -286,9 +299,12 @@ raise_gateway_limits_for_seed() {
 		'printf %s "${VEX_HTTP_CGI_TIMEOUT_SECONDS:-}"')
 	observed_io_timeout=$("${compose[@]}" exec -T git-http /bin/sh -c \
 		'printf %s "${VEX_HTTP_IO_TIMEOUT_SECONDS:-}"')
+	observed_epoch_recovery=$("${compose[@]}" exec -T git-http /bin/sh -c \
+		'printf %s "${GIT_VEX_EPOCH_RECOVERY_SECONDS:-900}"')
 	[ "$observed_limit" = "$gateway_seed_limit" ] && \
 		[ "$observed_cgi_timeout" = "$gateway_seed_cgi_timeout" ] && \
-		[ "$observed_io_timeout" = "$gateway_seed_io_timeout" ]
+		[ "$observed_io_timeout" = "$gateway_seed_io_timeout" ] && \
+		[ "$observed_epoch_recovery" = "$gateway_seed_epoch_recovery" ]
 }
 
 cleanup() {
