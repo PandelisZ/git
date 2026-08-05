@@ -13,6 +13,7 @@
 #include "hash.h"
 #include "object.h"
 
+#include <stddef.h>
 #include <stdint.h>
 
 struct vex_store;
@@ -93,6 +94,16 @@ struct vex_ref_update {
 	const char *message;
 };
 
+/*
+ * Object iteration is an index operation: it never reads raw object bytes.
+ * A NULL epoch exposes only published objects.  Passing the current epoch
+ * additionally exposes its quarantined objects, which is needed while Git is
+ * constructing a transaction.  Objects owned by every other open epoch
+ * remain invisible.
+ */
+typedef int (*vex_object_iter_fn)(const struct object_id *oid,
+				  const struct vex_object_info *info,
+				  void *cb_data);
 typedef int (*vex_ref_iter_fn)(const struct vex_ref *ref, void *cb_data);
 typedef int (*vex_ref_update_iter_fn)(const struct vex_ref_update *update,
 					uint64_t id, void *cb_data);
@@ -157,6 +168,23 @@ int vex_store_read_object_in_epoch(struct vex_store *store,
 			     const struct object_id *oid,
 			     enum object_type *type, unsigned long *size,
 			     void **data);
+
+/*
+ * Enumerate visible metadata records in object-id order.  A nonzero callback
+ * return stops iteration and is returned to the caller.  When prefix is set,
+ * only object IDs matching its first prefix_hex_len characters are yielded.
+ */
+int vex_store_for_each_object(struct vex_store *store,
+			      const struct vex_epoch *epoch,
+			      const struct object_id *prefix,
+			      size_t prefix_hex_len,
+			      vex_object_iter_fn fn, void *cb_data);
+int vex_store_count_objects(struct vex_store *store,
+			    const struct vex_epoch *epoch, unsigned long *out);
+int vex_store_find_abbrev_len(struct vex_store *store,
+			     const struct vex_epoch *epoch,
+			     const struct object_id *oid,
+			     unsigned min_length, unsigned *out);
 
 int vex_ref_read(struct vex_store *store, const char *refname,
 		   struct vex_ref *ref);

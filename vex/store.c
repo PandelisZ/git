@@ -45,6 +45,14 @@ static int check_epoch(struct vex_store *store, const struct vex_epoch *epoch)
 	return VEX_STORE_OK;
 }
 
+static int check_optional_epoch(struct vex_store *store,
+				const struct vex_epoch *epoch)
+{
+	if (!store)
+		return VEX_STORE_ERR_INVALID;
+	return epoch ? check_epoch(store, epoch) : VEX_STORE_OK;
+}
+
 static struct vex_meta_epoch *find_epoch(struct vex_meta_state *state,
 					 uint64_t id)
 {
@@ -273,6 +281,14 @@ static int object_is_visible_to_epoch(const struct vex_meta_state *state,
 {
 	return object && (object->state == VEX_OBJECT_PUBLISHED ||
 			  epoch_has_object(state, epoch, &object->oid));
+}
+
+static int object_is_visible(const struct vex_meta_state *state,
+			     const struct vex_meta_object *object,
+			     const struct vex_epoch *epoch)
+{
+	return object && (object->state == VEX_OBJECT_PUBLISHED ||
+			  (epoch && epoch_has_object(state, epoch->id, &object->oid)));
 }
 
 static int ref_expected_matches(const struct vex_meta_ref *ref,
@@ -943,6 +959,132 @@ int vex_store_read_object_in_epoch(struct vex_store *store,
 	if (check_epoch(store, epoch))
 		return VEX_STORE_ERR_STATE;
 	return read_object(store, epoch, oid, type, size, data);
+}
+
+static int compare_object_ptrs(const void *a, const void *b)
+{
+	const struct vex_meta_object *const *left = a;
+	const struct vex_meta_object *const *right = b;
+
+	return oidcmp(&(*left)->oid, &(*right)->oid);
+}
+
+int vex_store_for_each_object(struct vex_store *store,
+			      const struct vex_epoch *epoch,
+			      const struct object_id *prefix,
+			      size_t prefix_hex_len,
+			      vex_object_iter_fn fn, void *cb_data)
+{
+	struct vex_meta_state state;
+	struct vex_meta_object **objects = NULL;
+	size_t objects_nr = 0;
+	size_t i;
+	int ret;
+
+	if (!fn || (prefix_hex_len && !prefix) ||
+	    prefix_hex_len > (store ? store->hash_algo->hexsz : 0))
+		return VEX_STORE_ERR_INVALID;
+	if ((ret = check_optional_epoch(store, epoch)))
+		return ret;
+	if ((ret = vex_meta_fs_load(store->meta, &state)))
+		return ret;
+	if (state.objects_nr)
+		ALLOC_ARRAY(objects, state.objects_nr);
+	for (i = 0; i < state.objects_nr; i++) {
+		if (!object_is_visible(&state, &state.objects[i], epoch))
+			continue;
+		if (prefix && oid_common_prefix_hexlen(&state.objects[i].oid,
+							prefix) < prefix_hex_len)
+			continue;
+		objects[objects_nr++] = &state.objects[i];
+	}
+	QSORT(objects, objects_nr, compare_object_ptrs);
+	for (i = 0; i < objects_nr; i++) {
+		const struct vex_meta_object *object = objects[i];
+		struct vex_object_info info = {
+			.type = object->type,
+			.size = object->size,
+			.epoch = object->epoch,
+			.state = object->state,
+		};
+
+		ret = fn(&object->oid, &info, cb_data);
+		if (ret)
+			break;
+	}
+	free(objects);
+	vex_meta_state_release(&state);
+	return ret;
+}
+
+int vex_store_count_objects(struct vex_store *store,
+			    const struct vex_epoch *epoch, unsigned long *out)
+{
+	struct vex_meta_state state;
+	unsigned long count = 0;
+	size_t i;
+	int ret;
+
+	if (!out)
+		return VEX_STORE_ERR_INVALID;
+	*out = 0;
+	if ((ret = check_optional_epoch(store, epoch)))
+		return ret;
+	if ((ret = vex_meta_fs_load(store->meta, &state)))
+		return ret;
+	for (i = 0; i < state.objects_nr; i++) {
+		if (!object_is_visible(&state, &state.objects[i], epoch))
+			continue;
+		if (count == ULONG_MAX) {
+			ret = VEX_STORE_ERR_STATE;
+			goto out;
+		}
+		count++;
+	}
+	*out = count;
+	ret = VEX_STORE_OK;
+out:
+	vex_meta_state_release(&state);
+	return ret;
+}
+
+int vex_store_find_abbrev_len(struct vex_store *store,
+			     const struct vex_epoch *epoch,
+			     const struct object_id *oid,
+			     unsigned min_length, unsigned *out)
+{
+	struct vex_meta_state state;
+	const unsigned hexsz = store ? store->hash_algo->hexsz : 0;
+	size_t i;
+	int ret;
+
+	if (!oid || !out)
+		return VEX_STORE_ERR_INVALID;
+	if ((ret = check_optional_epoch(store, epoch)))
+		return ret;
+	if (min_length >= hexsz) {
+		*out = hexsz;
+		return VEX_STORE_OK;
+	}
+	*out = min_length;
+	if ((ret = vex_meta_fs_load(store->meta, &state)))
+		return ret;
+	for (i = 0; i < state.objects_nr; i++) {
+		unsigned common;
+
+		if (!object_is_visible(&state, &state.objects[i], epoch))
+			continue;
+		common = oid_common_prefix_hexlen(&state.objects[i].oid, oid);
+		if (common == hexsz || common < *out)
+			continue;
+		*out = common + 1;
+		if (*out >= hexsz) {
+			*out = hexsz;
+			break;
+		}
+	}
+	vex_meta_state_release(&state);
+	return VEX_STORE_OK;
 }
 
 int vex_ref_read(struct vex_store *store, const char *refname, struct vex_ref *ref)

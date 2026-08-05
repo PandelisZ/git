@@ -42,6 +42,101 @@ static void make_blob_oid(const char *contents, struct object_id *oid)
 	hash_object_file(hash_algo, contents, strlen(contents), OBJ_BLOB, oid);
 }
 
+static void publish_blobs(struct vex_store *store,
+			  const struct object_id *oids,
+			  const char *const *payloads, size_t nr)
+{
+	struct vex_epoch *epoch;
+	struct vex_ref_transaction *transaction;
+	size_t i;
+
+	cl_must_pass(vex_epoch_allocate(store, "unit-publish", &epoch));
+	for (i = 0; i < nr; i++)
+		cl_must_pass(vex_store_stage_object(store, epoch, &oids[i], OBJ_BLOB,
+					      payloads[i], strlen(payloads[i])));
+	cl_must_pass(vex_ref_transaction_begin(store, epoch, &transaction));
+	cl_must_pass(vex_ref_transaction_commit(transaction));
+	vex_ref_transaction_abort(transaction);
+	vex_epoch_free(epoch);
+}
+
+static int find_one_hex_pair(struct object_id *first_oid, char *first_payload,
+			     struct object_id *second_oid, char *second_payload)
+{
+	struct {
+		int set;
+		struct object_id oid;
+		char payload[64];
+	} first_by_nibble[16] = { 0 };
+	unsigned int i;
+
+	for (i = 0; i < 4096; i++) {
+		struct object_id oid;
+		char payload[64];
+		unsigned int nibble;
+
+		xsnprintf(payload, sizeof(payload), "vex-enumerate-pair-%u", i);
+		make_blob_oid(payload, &oid);
+		nibble = oid.hash[0] >> 4;
+		if (first_by_nibble[nibble].set &&
+		    oid_common_prefix_hexlen(&first_by_nibble[nibble].oid, &oid) == 1) {
+			oidcpy(first_oid, &first_by_nibble[nibble].oid);
+			xsnprintf(first_payload, 64, "%s",
+				  first_by_nibble[nibble].payload);
+			oidcpy(second_oid, &oid);
+			xsnprintf(second_payload, 64, "%s", payload);
+			return 0;
+		}
+		if (!first_by_nibble[nibble].set) {
+			first_by_nibble[nibble].set = 1;
+			oidcpy(&first_by_nibble[nibble].oid, &oid);
+			xsnprintf(first_by_nibble[nibble].payload,
+				  sizeof(first_by_nibble[nibble].payload), "%s", payload);
+		}
+	}
+	return -1;
+}
+
+static int find_more_specific_oid(const struct object_id *base,
+				  unsigned minimum_common,
+				  struct object_id *oid_out,
+				  char *payload_out)
+{
+	unsigned int i;
+
+	for (i = 0; i < 100000; i++) {
+		struct object_id oid;
+		char payload[64];
+
+		xsnprintf(payload, sizeof(payload), "vex-enumerate-private-%u", i);
+		make_blob_oid(payload, &oid);
+		if (oid_common_prefix_hexlen(base, &oid) < minimum_common)
+			continue;
+		oidcpy(oid_out, &oid);
+		xsnprintf(payload_out, 64, "%s", payload);
+		return 0;
+	}
+	return -1;
+}
+
+struct enumerated_objects {
+	struct object_id oids[4];
+	struct vex_object_info infos[4];
+	size_t nr;
+};
+
+static int collect_object(const struct object_id *oid,
+			  const struct vex_object_info *info, void *cb_data)
+{
+	struct enumerated_objects *objects = cb_data;
+
+	if (objects->nr == ARRAY_SIZE(objects->oids))
+		return -1;
+	oidcpy(&objects->oids[objects->nr], oid);
+	objects->infos[objects->nr++] = *info;
+	return 0;
+}
+
 static struct vex_ref_update direct_update(const char *refname,
 					    const struct object_id *old_oid,
 					    const struct object_id *new_oid,
@@ -63,6 +158,93 @@ static struct vex_ref_update direct_update(const char *refname,
 		oidcpy(&update.old_target.oid, old_oid);
 	oidcpy(&update.new_target.oid, new_oid);
 	return update;
+}
+
+void test_vex_store__object_enumeration_respects_epoch_visibility(void)
+{
+	struct strbuf root = STRBUF_INIT;
+	struct vex_store *store;
+	struct vex_epoch *private_epoch;
+	struct object_id first_oid;
+	struct object_id second_oid;
+	struct object_id private_oid;
+	const char *published_payloads[2];
+	char first_payload[64];
+	char second_payload[64];
+	char private_payload[64];
+	struct object_id published_oids[2];
+	struct enumerated_objects objects = { 0 };
+	unsigned long count;
+	unsigned abbrev;
+	unsigned private_common;
+	int saw_private = 0;
+	size_t i;
+
+	make_root(&root);
+	store = open_store(root.buf, "55555555555555555555555555555555");
+	cl_assert_equal_i(find_one_hex_pair(&first_oid, first_payload, &second_oid,
+					     second_payload), 0);
+	oidcpy(&published_oids[0], &first_oid);
+	oidcpy(&published_oids[1], &second_oid);
+	published_payloads[0] = first_payload;
+	published_payloads[1] = second_payload;
+	publish_blobs(store, published_oids, published_payloads,
+		      ARRAY_SIZE(published_oids));
+
+	cl_assert_equal_i(find_more_specific_oid(&first_oid, 2, &private_oid,
+						 private_payload), 0);
+	private_common = oid_common_prefix_hexlen(&first_oid, &private_oid);
+	cl_assert(private_common >= 2);
+	cl_assert(private_common < hash_algo->hexsz);
+	cl_must_pass(vex_epoch_allocate(store, "unit-private", &private_epoch));
+	cl_must_pass(vex_store_stage_object(store, private_epoch, &private_oid,
+					      OBJ_BLOB, private_payload,
+					      strlen(private_payload)));
+
+	cl_must_pass(vex_store_for_each_object(store, NULL, NULL, 0,
+						 collect_object, &objects));
+	cl_assert_equal_i(objects.nr, 2);
+	for (i = 0; i < objects.nr; i++) {
+		cl_assert_equal_i(objects.infos[i].state, VEX_OBJECT_PUBLISHED);
+		if (i)
+			cl_assert(oidcmp(&objects.oids[i - 1], &objects.oids[i]) < 0);
+	}
+	cl_must_pass(vex_store_count_objects(store, NULL, &count));
+	cl_assert_equal_i(count, 2);
+	cl_must_pass(vex_store_find_abbrev_len(store, NULL, &first_oid, 1,
+						 &abbrev));
+	cl_assert_equal_i(abbrev, 2);
+
+	memset(&objects, 0, sizeof(objects));
+	cl_must_pass(vex_store_for_each_object(store, private_epoch, NULL, 0,
+						 collect_object, &objects));
+	cl_assert_equal_i(objects.nr, 3);
+	for (i = 0; i < objects.nr; i++) {
+		if (oideq(&objects.oids[i], &private_oid)) {
+			saw_private = 1;
+			cl_assert_equal_i(objects.infos[i].state,
+					  VEX_OBJECT_QUARANTINE);
+		}
+	}
+	cl_assert(saw_private);
+	cl_must_pass(vex_store_count_objects(store, private_epoch, &count));
+	cl_assert_equal_i(count, 3);
+	cl_must_pass(vex_store_find_abbrev_len(store, private_epoch, &first_oid, 1,
+						 &abbrev));
+	cl_assert_equal_i(abbrev, private_common + 1);
+
+	memset(&objects, 0, sizeof(objects));
+	cl_must_pass(vex_store_for_each_object(store, NULL, &first_oid,
+						 hash_algo->hexsz, collect_object, &objects));
+	cl_assert_equal_i(objects.nr, 1);
+	cl_assert(oideq(&objects.oids[0], &first_oid));
+	cl_assert_equal_i(vex_store_for_each_object(store, NULL, NULL, 1,
+						    collect_object, &objects),
+			  VEX_STORE_ERR_INVALID);
+
+	cl_must_pass(vex_epoch_compensate(private_epoch));
+	vex_epoch_free(private_epoch);
+	close_root(store, &root);
 }
 
 void test_vex_store__blob_then_metadata_and_repo_isolation(void)
