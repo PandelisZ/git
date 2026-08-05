@@ -2539,6 +2539,8 @@ VEX_MYSQL_CFLAGS = $(shell if $(VEX_MYSQL_PKG_CONFIG) --exists mysqlclient >/dev
 VEX_MYSQL_LIBS = $(shell if $(VEX_MYSQL_PKG_CONFIG) --exists mysqlclient >/dev/null 2>&1; then $(VEX_MYSQL_PKG_CONFIG) --libs mysqlclient; elif command -v $(VEX_MYSQL_CONFIG) >/dev/null 2>&1; then $(VEX_MYSQL_CONFIG) --libs; fi)
 VEX_MYSQL_PROBE_BIN = t/vex/bin/vex-mysql-metadata-probe
 VEX_MYSQL_PROBE_OBJS = vex/meta-mysql-probe.o t/vex/mysql-metadata-probe.o
+VEX_SWEEP_PLAN_BIN = t/vex/bin/vex-sweep-plan
+VEX_SWEEP_PLAN_OBJS = t/vex/vex-sweep-plan.o
 
 # `vex/meta-mysql.o` changes ABI when VEX_MYSQL is toggled. Track that
 # selection separately so alternating normal and MySQL-enabled builds cannot
@@ -3083,6 +3085,9 @@ scalar$X: scalar.o GIT-LDFLAGS $(GITLIBS)
 .PHONY: vex-mysql-metadata-probe
 vex-mysql-metadata-probe: $(VEX_MYSQL_PROBE_BIN)
 
+.PHONY: vex-sweep-plan
+vex-sweep-plan: $(VEX_SWEEP_PLAN_BIN)
+
 vex/meta-mysql-probe.o: vex/meta-mysql.c vex/meta-mysql.h
 	$(QUIET_CC)if test -z "$(VEX_MYSQL_CFLAGS)" || test -z "$(VEX_MYSQL_LIBS)"; then \
 		echo >&2 "Vex MySQL probe requires pkg-config mysqlclient or mysql_config"; \
@@ -3099,10 +3104,18 @@ t/vex/mysql-metadata-probe.o: t/vex/mysql-metadata-probe.c vex/meta-mysql.h
 	$(CC) $(ALL_CFLAGS) $(VEX_MYSQL_CFLAGS) -DVEX_HAVE_MYSQL_CLIENT \
 		-c -o $@ $<
 
+t/vex/vex-sweep-plan.o: t/vex/vex-sweep-plan.c vex/store.h odb/source-vex.h FORCE
+	$(QUIET_CC)$(CC) $(ALL_CFLAGS) -c -o $@ $<
+
 $(VEX_MYSQL_PROBE_BIN): $(VEX_MYSQL_PROBE_OBJS)
 	$(call mkdir_p_parent_template)
 	$(QUIET_LINK)$(CC) $(ALL_CFLAGS) $(ALL_LDFLAGS) -o $@ \
 		$(VEX_MYSQL_PROBE_OBJS) $(VEX_MYSQL_LIBS)
+
+$(VEX_SWEEP_PLAN_BIN): $(VEX_SWEEP_PLAN_OBJS) $(GITLIBS) GIT-LDFLAGS
+	$(call mkdir_p_parent_template)
+	$(QUIET_LINK)$(CC) $(ALL_CFLAGS) -o $@ $(ALL_LDFLAGS) \
+		$(filter %.o,$^) $(filter %.a,$^) $(LIBS)
 
 $(LIB_FILE): $(LIB_OBJS)
 	$(QUIET_AR)$(RM) $@ && $(AR) $(ARFLAGS) $@ $^

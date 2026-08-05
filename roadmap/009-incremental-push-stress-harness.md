@@ -1,7 +1,7 @@
 # Incremental Push Stress Harness PRD
 
 **Status:** Active
-**Current Stage:** L2 Compose smoke verified — ramp/chaos/fault injection pending
+**Current Stage:** L2 Compose smoke, ramp, promotion fault, and bounded readers verified
 **Owner:** Codex
 **Created:** 2026-08-05
 **Updated:** 2026-08-05
@@ -65,8 +65,14 @@ not a calibrated SLO or a clone result.
 
 The Compose run also exposed a real cross-repository audit-ID race. The MySQL
 schema now scopes `ref_updates.id` to its repository and `t1500` proves two
-simultaneous stock-Git first pushes publish independently. Ramp, chaos,
-fault-injection, and concurrent-reader profiles remain unverified.
+simultaneous stock-Git first pushes publish independently. The registered
+500-commit `1,2,4,...,32` ramp now passes 20/20 pushes with fresh-fetch/`fsck`
+and MySQL/S3 reconciliation (p50 `13706.237ms`, p90 `23252.034ms`, p99
+`28033.833ms`). A deterministic staged-to-final S3 promotion fault proves
+epoch compensation, and the bounded reader gate passes 20 writer pushes with
+8 readers, 8 clones, 246 fetches, and 8 final fscks. These are local write
+path measurements and correctness gates, not a clone SLO. Hard-kill chaos,
+larger concurrency, and soak profiles remain unverified.
 
 ---
 

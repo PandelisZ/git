@@ -20,20 +20,30 @@ usage() {
 	cat <<'EOF'
 usage: scripts/vex/push-stress.sh [--profile FILE] [runner options...]
        scripts/vex/push-stress.sh --compose-smoke
+       scripts/vex/push-stress.sh --compose-ramp
 
 --compose-smoke uses stock /usr/bin/git to run the 20 x batch=1 smoke profile
 against a unique empty Vex MySQL+S3 Compose repository. It retains JSON output
 under t/vex/push-stress/work/, which is ignored by Git.
+
+--compose-ramp uses stock /usr/bin/git to replay 500 synthetic commits against
+a unique empty Vex MySQL+S3 Compose repository in 1,2,4,...,32 commit batches.
+It retains JSON output under t/vex/push-stress/work/, which is ignored by Git.
 EOF
 }
 
 profile=''
 compose_smoke=0
+compose_ramp=0
 arguments=()
 while [ "$#" -gt 0 ]; do
 	case "$1" in
 	--compose-smoke)
 		compose_smoke=1
+		shift
+		;;
+	--compose-ramp)
+		compose_ramp=1
 		shift
 		;;
 	--profile)
@@ -59,12 +69,20 @@ while [ "$#" -gt 0 ]; do
 	esac
 done
 
-if [ "$compose_smoke" -eq 1 ]; then
+if [ "$compose_smoke" -eq 1 ] && [ "$compose_ramp" -eq 1 ]; then
+	printf '%s\n' 'push-stress: choose either --compose-smoke or --compose-ramp' >&2
+	exit 2
+fi
+
+if [ "$compose_smoke" -eq 1 ] || [ "$compose_ramp" -eq 1 ]; then
 	if [ -n "$profile" ] || [ "${#arguments[@]}" -ne 0 ]; then
-		printf '%s\n' 'push-stress: --compose-smoke does not accept a profile or runner options' >&2
+		printf '%s\n' 'push-stress: Compose gates do not accept a profile or runner options' >&2
 		exit 2
 	fi
-	exec "$harness_dir/compose-smoke.sh"
+	if [ "$compose_smoke" -eq 1 ]; then
+		exec "$harness_dir/compose-smoke.sh"
+	fi
+	exec "$harness_dir/compose-ramp.sh"
 fi
 
 if [ -n "$profile" ]; then

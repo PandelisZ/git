@@ -217,3 +217,33 @@ The active Vex Compose path now has the first useful L2 write-boundary gates:
 
 These are correctness and write-path smoke results only. Ramp/chaos/fault
 injection, sweep/scrub, sealed packs, and the git/git clone SLO remain open.
+
+## 2026-08-05 — MySQL+S3 safety foundation and 500-commit ramp
+
+Extended the active Compose Vex receiver with measured write-path and
+read-safety gates. All use stock host `/usr/bin/git` over HTTPS; MySQL keeps
+only metadata and MinIO/S3 remains the canonical object-byte source.
+
+- `t1498-vex-push-stress-ramp-compose.sh` replays 500 synthetic commits into
+  a unique empty Vex repository in 20 batches (`1,2,4,8,16,32×14,21`). The
+  registered run passed 20/20, fresh-fetch/`fsck`, final-tip match, and
+  MySQL/S3 reconciliation. Warm-stack write latency was p50 `13706.237ms`,
+  p90 `23252.034ms`, p99 `28033.833ms`.
+- `t1501-vex-compose-mysql-s3-promotion-fault.sh` injects one staged-to-final
+  S3 promotion failure. It observes an aborted generation and proves no new
+  ref, published object, generation claim, audit row, canonical S3 key, or
+  staging key before a normal retry clones and fscks successfully.
+- `t1502-vex-compose-mysql-s3-scrub.sh` walks every MySQL-indexed published
+  object, streams its canonical MinIO/S3 key, and re-hashes the Git object
+  header plus content. It also rejects refs without published metadata.
+- `t1503-vex-compose-mysql-s3-sweep-plan.sh` adds durable pin/unpin plus a
+  conservative read-only graph mark. Its E2E shows three sealed candidates,
+  pin protection across a later stock-Git push, and candidates returning after
+  unpin. It intentionally performs no deletion.
+- `t1518-vex-compose-mysql-s3-concurrent-readers.sh` passes 20 writer pushes
+  with 8 concurrent stock-Git readers: 8 clones, 246 fetches, 8 final fscks,
+  final-tip agreement, and MySQL/S3 reconciliation.
+
+This is still below L3 and L4: hard-kill chaos, grace-period deletion,
+pack/clone-lease roots, sealed-pack serving, `git/git` import, and clone SLOs
+remain open.

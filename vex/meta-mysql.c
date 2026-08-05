@@ -236,6 +236,44 @@ int vex_meta_mysql_ref_cas_direct(struct vex_meta_mysql *db,
 	return mysql_unavailable();
 }
 
+int vex_meta_mysql_pin_object(struct vex_meta_mysql *db,
+			       const char *repo_id,
+			       const unsigned char *oid, size_t oid_len,
+			       const char *reason)
+{
+	(void)db;
+	(void)repo_id;
+	(void)oid;
+	(void)oid_len;
+	(void)reason;
+	return mysql_unavailable();
+}
+
+int vex_meta_mysql_unpin_object(struct vex_meta_mysql *db,
+				 const char *repo_id,
+				 const unsigned char *oid, size_t oid_len,
+				 const char *reason)
+{
+	(void)db;
+	(void)repo_id;
+	(void)oid;
+	(void)oid_len;
+	(void)reason;
+	return mysql_unavailable();
+}
+
+int vex_meta_mysql_for_each_active_pin(struct vex_meta_mysql *db,
+					const char *repo_id,
+					vex_meta_mysql_pin_iter_fn fn,
+					void *cb_data)
+{
+	(void)db;
+	(void)repo_id;
+	(void)fn;
+	(void)cb_data;
+	return mysql_unavailable();
+}
+
 int vex_meta_mysql_state_lock(struct vex_meta_mysql *db, const char *repo_id)
 {
 	(void)db;
@@ -595,6 +633,34 @@ static void vex_mysql_rollback(struct vex_meta_mysql *db)
 static int vex_mysql_commit(struct vex_meta_mysql *db)
 {
 	return mysql_exec(db, "COMMIT");
+}
+
+/*
+ * Pin changes and a state-store write share this repository-row boundary.
+ * Without it, a pin could be installed while state replacement is between
+ * deleting and reinserting object rows.
+ */
+static int require_repository_locked(struct vex_meta_mysql *db,
+				     const char *repo)
+{
+	char hash_algo[32];
+	char *sql;
+	int found;
+	int ret;
+
+	sql = vex_format("SELECT hash_algo FROM repositories WHERE repo_id = %s "
+			 "FOR UPDATE", repo);
+	if (!sql)
+		return set_error(db, VEX_META_MYSQL_ERR_NOMEM,
+				 "could not allocate Vex repository lock query");
+	ret = query_one_text(db, sql, hash_algo, sizeof(hash_algo), &found);
+	free(sql);
+	if (ret)
+		return ret;
+	if (!found)
+		return set_error(db, VEX_META_MYSQL_ERR_NOT_FOUND,
+				 "Vex repository does not exist");
+	return VEX_META_MYSQL_OK;
 }
 
 static int acquire_generation_lock(struct vex_meta_mysql *db,
@@ -1677,6 +1743,193 @@ out:
 	free(repo);
 	return ret;
 }
+
+int vex_meta_mysql_pin_object(struct vex_meta_mysql *db,
+			       const char *repo_id,
+			       const unsigned char *oid, size_t oid_len,
+			       const char *reason)
+{
+	char *repo = NULL;
+	char *object = NULL;
+	char *quoted_reason = NULL;
+	char *sql = NULL;
+	int in_transaction = 0;
+	int ret;
+
+	if (!db || !db->mysql || db->state_transaction || !reason || !*reason ||
+	    strlen(reason) > 255)
+		return VEX_META_MYSQL_ERR_INVALID;
+	repo = sql_repo_literal(repo_id, NULL);
+	object = sql_oid_literal(oid, oid_len);
+	quoted_reason = sql_quote(db, reason);
+	if (!repo || !object || !quoted_reason) {
+		ret = set_error(db, VEX_META_MYSQL_ERR_INVALID,
+				"invalid Vex object pin metadata");
+		goto out;
+	}
+	ret = mysql_begin(db);
+	if (ret)
+		goto out;
+	in_transaction = 1;
+	if ((ret = require_repository_locked(db, repo)) ||
+	    (ret = require_published_object_locked(db, repo, object)))
+		goto out;
+	/*
+	 * Pins are idempotent roots.  Reasserting a retained pin intentionally
+	 * clears any expiry a future retention job may have assigned.
+	 */
+	sql = vex_format("INSERT INTO object_pins "
+			 "(repo_id, oid, reason, expires_at) VALUES (%s, %s, %s, NULL) "
+			 "ON DUPLICATE KEY UPDATE expires_at = NULL",
+			 repo, object, quoted_reason);
+	if (!sql) {
+		ret = set_error(db, VEX_META_MYSQL_ERR_NOMEM,
+				"could not allocate Vex object pin query");
+		goto out;
+	}
+	ret = mysql_exec(db, sql);
+	free(sql);
+	sql = NULL;
+	if (ret)
+		goto out;
+	ret = vex_mysql_commit(db);
+	if (ret)
+		goto out;
+	in_transaction = 0;
+
+out:
+	free(sql);
+	if (in_transaction)
+		vex_mysql_rollback(db);
+	free(quoted_reason);
+	free(object);
+	free(repo);
+	return ret;
+}
+
+int vex_meta_mysql_unpin_object(struct vex_meta_mysql *db,
+				 const char *repo_id,
+				 const unsigned char *oid, size_t oid_len,
+				 const char *reason)
+{
+	char *repo = NULL;
+	char *object = NULL;
+	char *quoted_reason = NULL;
+	char *sql = NULL;
+	int in_transaction = 0;
+	int ret;
+
+	if (!db || !db->mysql || db->state_transaction || !reason || !*reason ||
+	    strlen(reason) > 255)
+		return VEX_META_MYSQL_ERR_INVALID;
+	repo = sql_repo_literal(repo_id, NULL);
+	object = sql_oid_literal(oid, oid_len);
+	quoted_reason = sql_quote(db, reason);
+	if (!repo || !object || !quoted_reason) {
+		ret = set_error(db, VEX_META_MYSQL_ERR_INVALID,
+				"invalid Vex object pin metadata");
+		goto out;
+	}
+	ret = mysql_begin(db);
+	if (ret)
+		goto out;
+	in_transaction = 1;
+	if ((ret = require_repository_locked(db, repo)))
+		goto out;
+	sql = vex_format("DELETE FROM object_pins WHERE repo_id = %s "
+			 "AND oid = %s AND reason = %s", repo, object, quoted_reason);
+	if (!sql) {
+		ret = set_error(db, VEX_META_MYSQL_ERR_NOMEM,
+				"could not allocate Vex object unpin query");
+		goto out;
+	}
+	ret = mysql_exec(db, sql);
+	free(sql);
+	sql = NULL;
+	if (ret)
+		goto out;
+	if (mysql_affected_rows(db->mysql) != 1) {
+		ret = set_error(db, VEX_META_MYSQL_ERR_NOT_FOUND,
+				"Vex object pin does not exist");
+		goto out;
+	}
+	ret = vex_mysql_commit(db);
+	if (ret)
+		goto out;
+	in_transaction = 0;
+
+out:
+	free(sql);
+	if (in_transaction)
+		vex_mysql_rollback(db);
+	free(quoted_reason);
+	free(object);
+	free(repo);
+	return ret;
+}
+
+int vex_meta_mysql_for_each_active_pin(struct vex_meta_mysql *db,
+					const char *repo_id,
+					vex_meta_mysql_pin_iter_fn fn,
+					void *cb_data)
+{
+	char *repo = NULL;
+	char *sql = NULL;
+	MYSQL_RES *res = NULL;
+	MYSQL_ROW row;
+	unsigned long *lengths;
+	int ret = VEX_META_MYSQL_OK;
+
+	if (!db || !db->mysql || !fn)
+		return VEX_META_MYSQL_ERR_INVALID;
+	repo = sql_repo_literal(repo_id, NULL);
+	if (!repo) {
+		ret = set_error(db, VEX_META_MYSQL_ERR_INVALID,
+				"invalid Vex repository UUID");
+		goto out;
+	}
+	sql = vex_format("SELECT oid FROM object_pins WHERE repo_id = %s "
+			 "AND (expires_at IS NULL OR expires_at > CURRENT_TIMESTAMP(6)) "
+			 "ORDER BY oid, reason", repo);
+	if (!sql) {
+		ret = set_error(db, VEX_META_MYSQL_ERR_NOMEM,
+				"could not allocate Vex active-pin query");
+		goto out;
+	}
+	if (mysql_query(db->mysql, sql)) {
+		ret = set_mysql_error(db, "MySQL active-pin read failed");
+		goto out;
+	}
+	res = mysql_store_result(db->mysql);
+	if (!res) {
+		ret = set_mysql_error(db, "MySQL active-pin result retrieval failed");
+		goto out;
+	}
+	if (mysql_num_fields(res) != 1) {
+		ret = set_error(db, VEX_META_MYSQL_ERR,
+				"MySQL returned invalid Vex active-pin metadata");
+		goto out;
+	}
+	while ((row = mysql_fetch_row(res))) {
+		lengths = mysql_fetch_lengths(res);
+		if (!row[0] || !lengths ||
+		    lengths[0] != VEX_META_MYSQL_OID_BYTES) {
+			ret = set_error(db, VEX_META_MYSQL_ERR,
+					"MySQL returned invalid Vex active pin object ID");
+			goto out;
+		}
+		ret = fn((const unsigned char *)row[0], cb_data);
+		if (ret)
+			goto out;
+	}
+
+out:
+	if (res)
+		mysql_free_result(res);
+	free(sql);
+	free(repo);
+	return ret;
+}
 #ifdef VEX_META_MYSQL_STORE
 
 static int state_oid_from_binary(const char *value, unsigned long length,
@@ -2253,17 +2506,142 @@ out:
 	free(repo);
 	return ret;
 }
-static int state_require_no_derived_rows(struct vex_meta_mysql *db,
-					 const char *repo)
+struct vex_meta_mysql_saved_pin {
+	unsigned char oid[VEX_META_MYSQL_OID_BYTES];
+	char *reason;
+	char *created_at;
+	char *expires_at;
+};
+
+struct vex_meta_mysql_saved_pins {
+	struct vex_meta_mysql_saved_pin *items;
+	size_t nr;
+	size_t alloc;
+};
+
+static void state_saved_pins_release(struct vex_meta_mysql_saved_pins *pins)
+{
+	size_t i;
+
+	for (i = 0; i < pins->nr; i++) {
+		free(pins->items[i].reason);
+		free(pins->items[i].created_at);
+		free(pins->items[i].expires_at);
+	}
+	free(pins->items);
+	memset(pins, 0, sizeof(*pins));
+}
+
+/*
+ * The current MySQL state adapter rewrites ordinary store rows under one
+ * repository lock.  Pins are independent durable roots, so preserve them
+ * exactly across that rewrite instead of forbidding a repository from using
+ * pins at all.
+ */
+static int state_load_pins(struct vex_meta_mysql *db, const char *repo,
+			   struct vex_meta_mysql_saved_pins *pins)
+{
+	char *sql = NULL;
+	MYSQL_RES *res = NULL;
+	MYSQL_ROW row;
+	unsigned long *lengths;
+	int ret;
+
+	sql = vex_format("SELECT oid, reason, "
+			 "DATE_FORMAT(created_at, '%%Y-%%m-%%d %%H:%%i:%%s.%%f'), "
+			 "DATE_FORMAT(expires_at, '%%Y-%%m-%%d %%H:%%i:%%s.%%f') "
+			 "FROM object_pins WHERE repo_id = %s ORDER BY oid, reason", repo);
+	if (!sql)
+		return set_error(db, VEX_META_MYSQL_ERR_NOMEM,
+				 "could not allocate Vex pin preservation query");
+	ret = state_query_result(db, sql, &res);
+	free(sql);
+	if (ret)
+		return ret;
+	while ((row = mysql_fetch_row(res))) {
+		struct vex_meta_mysql_saved_pin *pin;
+
+		lengths = mysql_fetch_lengths(res);
+		if (!row[0] || !row[1] || !row[2] || !lengths ||
+		    lengths[0] != VEX_META_MYSQL_OID_BYTES || !lengths[1] ||
+		    lengths[1] > 255 || lengths[2] > 32 ||
+		    (row[3] && lengths[3] > 32)) {
+			ret = set_error(db, VEX_META_MYSQL_ERR,
+					"MySQL returned invalid Vex object pin metadata");
+			goto out;
+		}
+		ALLOC_GROW(pins->items, pins->nr + 1, pins->alloc);
+		pin = &pins->items[pins->nr++];
+		memset(pin, 0, sizeof(*pin));
+		memcpy(pin->oid, row[0], sizeof(pin->oid));
+		pin->reason = state_row_text(row[1], lengths[1]);
+		pin->created_at = state_row_text(row[2], lengths[2]);
+		pin->expires_at = row[3] ? state_row_text(row[3], lengths[3]) : NULL;
+		if (!pin->reason || !pin->created_at ||
+		    (row[3] && !pin->expires_at)) {
+			ret = set_error(db, VEX_META_MYSQL_ERR_NOMEM,
+					"could not preserve Vex object pin metadata");
+			goto out;
+		}
+	}
+	ret = VEX_META_MYSQL_OK;
+out:
+	mysql_free_result(res);
+	return ret;
+}
+
+static int state_insert_pins(struct vex_meta_mysql *db, const char *repo,
+			     const struct vex_meta_mysql_saved_pins *pins)
+{
+	size_t i;
+
+	for (i = 0; i < pins->nr; i++) {
+		const struct vex_meta_mysql_saved_pin *pin = &pins->items[i];
+		char *oid = sql_hex_literal(pin->oid, sizeof(pin->oid));
+		char *reason = sql_quote(db, pin->reason);
+		char *created_at = sql_quote(db, pin->created_at);
+		char *expires_at = pin->expires_at ? sql_quote(db, pin->expires_at) :
+			vex_strdup("NULL");
+		char *sql;
+		int ret;
+
+		if (!oid || !reason || !created_at || !expires_at) {
+			free(expires_at);
+			free(created_at);
+			free(reason);
+			free(oid);
+			return set_error(db, VEX_META_MYSQL_ERR_NOMEM,
+					 "could not encode preserved Vex object pin");
+		}
+		sql = vex_format("INSERT INTO object_pins "
+				 "(repo_id, oid, reason, expires_at, created_at) "
+				 "VALUES (%s, %s, %s, %s, %s)",
+				 repo, oid, reason, expires_at, created_at);
+		free(expires_at);
+		free(created_at);
+		free(reason);
+		free(oid);
+		if (!sql)
+			return set_error(db, VEX_META_MYSQL_ERR_NOMEM,
+					 "could not allocate Vex object pin restore query");
+		ret = mysql_exec(db, sql);
+		free(sql);
+		if (ret)
+			return ret;
+	}
+	return VEX_META_MYSQL_OK;
+}
+
+static int state_require_no_packs(struct vex_meta_mysql *db,
+				  const char *repo)
 {
 	char *sql;
 	uint64_t rows;
 	int found;
 	int ret;
 
-	sql = vex_format("SELECT (SELECT COUNT(*) FROM object_pins WHERE repo_id = %s) "
-			 "+ (SELECT COUNT(*) FROM pack_envelopes WHERE repo_id = %s)",
-			 repo, repo);
+	sql = vex_format("SELECT COUNT(*) FROM pack_envelopes WHERE repo_id = %s",
+			 repo);
 	if (!sql)
 		return set_error(db, VEX_META_MYSQL_ERR_NOMEM,
 				 "could not allocate Vex derived metadata check");
@@ -2273,15 +2651,15 @@ static int state_require_no_derived_rows(struct vex_meta_mysql *db,
 		return ret;
 	if (!found || rows)
 		return set_error(db, VEX_META_MYSQL_ERR_STATE,
-				 "Vex state replacement requires a repository without pins or packs");
+				 "Vex state replacement requires a repository without packs");
 	return VEX_META_MYSQL_OK;
 }
 
 static int state_delete_rows(struct vex_meta_mysql *db, const char *repo)
 {
 	static const char *const tables[] = {
-		"commit_parents", "generation_objects", "objects", "generations",
-		"refs", "ref_updates",
+		"commit_parents", "object_pins", "generation_objects", "objects",
+		"generations", "refs", "ref_updates",
 	};
 	size_t i;
 
@@ -2646,6 +3024,7 @@ int vex_meta_mysql_state_save_locked(struct vex_meta_mysql *db,
 				      const struct vex_meta_state *state)
 {
 	char *repo;
+	struct vex_meta_mysql_saved_pins pins = { 0 };
 	int ret;
 
 	if (!db || !db->mysql || !db->state_transaction || !repo_id || !hash_algo ||
@@ -2655,19 +3034,22 @@ int vex_meta_mysql_state_save_locked(struct vex_meta_mysql *db,
 	if (!repo)
 		return set_error(db, VEX_META_MYSQL_ERR_INVALID,
 				 "invalid Vex repository UUID");
-	if ((ret = state_require_no_derived_rows(db, repo)) ||
+	if ((ret = state_load_pins(db, repo, &pins)) ||
+	    (ret = state_require_no_packs(db, repo)) ||
 	    (ret = state_delete_rows(db, repo)) ||
 	    (ret = state_insert_epochs(db, repo, state)) ||
 	    (ret = state_insert_objects(db, repo, repo_id, hash_algo, state)) ||
 	    (ret = state_insert_generation_objects(db, repo, hash_algo, state)) ||
 	    (ret = state_insert_commit_parents(db, repo, hash_algo, state)) ||
 	    (ret = state_insert_refs(db, repo, hash_algo, state)) ||
-	    (ret = state_insert_ref_updates(db, repo, hash_algo, state)))
+	    (ret = state_insert_ref_updates(db, repo, hash_algo, state)) ||
+	    (ret = state_insert_pins(db, repo, &pins)))
 		goto out;
 	ret = vex_mysql_commit(db);
 	if (!ret)
 		db->state_transaction = 0;
-out:
+	out:
+	state_saved_pins_release(&pins);
 	free(repo);
 	return ret;
 }

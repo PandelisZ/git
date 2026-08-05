@@ -11,6 +11,8 @@ config.mak
 config.mak.autogen
 GIT-BUILD-OPTIONS
 *.o
+**/*.o
 *.a
 git
 git-http-backend
+t/vex/bin/

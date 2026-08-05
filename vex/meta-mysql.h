@@ -72,6 +72,14 @@ struct vex_meta_mysql_options {
 };
 
 /*
+ * A pin is metadata-only protection for a published Vex object.  Pinning is
+ * deliberately separate from ref/audit state: callers use it for an explicit
+ * restore or retention root, and normal ref updates must preserve it.
+ */
+typedef int (*vex_meta_mysql_pin_iter_fn)(
+	const unsigned char oid[VEX_META_MYSQL_OID_BYTES], void *cb_data);
+
+/*
  * Decode either 32 lower-case hexadecimal digits or a lower-case hyphenated
  * UUID into the BINARY(16) repository key used by schema.sql.
  */
@@ -166,6 +174,26 @@ int vex_meta_mysql_ref_cas_direct(struct vex_meta_mysql *db,
 				  const unsigned char *new_oid, size_t new_oid_len,
 				  const char *reason, const char *message,
 				  uint64_t *new_version);
+
+/*
+ * Pinning accepts only a published object.  Pins are idempotent by
+ * (repo_id, oid, reason), never contain Git object bytes, and do not expire
+ * unless a future retention operation assigns an expiry.
+ */
+int vex_meta_mysql_pin_object(struct vex_meta_mysql *db,
+			       const char *repo_id,
+			       const unsigned char *oid, size_t oid_len,
+			       const char *reason);
+int vex_meta_mysql_unpin_object(struct vex_meta_mysql *db,
+				 const char *repo_id,
+				 const unsigned char *oid, size_t oid_len,
+				 const char *reason);
+
+/* Enumerate only non-expired pins.  The callback must not issue SQL on db. */
+int vex_meta_mysql_for_each_active_pin(struct vex_meta_mysql *db,
+					const char *repo_id,
+					vex_meta_mysql_pin_iter_fn fn,
+					void *cb_data);
 
 /*
  * Store adapter boundary.  These methods project the existing Vex metadata

@@ -1,6 +1,7 @@
 #include "git-compat-util.h"
 #include "vex/blob-s3.h"
 #include "hex.h"
+#include "parse.h"
 #include "run-command.h"
 #include "strbuf.h"
 #include "tempfile.h"
@@ -28,6 +29,8 @@ struct vex_blob_s3 {
 	char *ca_file;
 	const struct git_hash_algo *hash_algo;
 	int insecure_tls;
+	/* Test-only one-shot fault for receive-epoch compensation coverage. */
+	int test_fail_promote_once;
 };
 
 static int contains_control(const char *value)
@@ -411,6 +414,13 @@ int vex_blob_s3_open(struct vex_blob_s3 **blob_out,
 	blob->ca_file = opts->ca_file ? xstrdup(opts->ca_file) : NULL;
 	blob->hash_algo = opts->hash_algo;
 	blob->insecure_tls = !!opts->insecure_tls;
+	/*
+	 * This is deliberately not a storage configuration option.  It is an
+	 * opt-in test hook used by the Compose fault-injection gate; a process
+	 * with the variable set fails its first attempted staged-to-final copy.
+	 */
+	blob->test_fail_promote_once =
+		git_env_bool("GIT_VEX_TEST_S3_FAIL_PROMOTE_ONCE", 0) == 1;
 	*blob_out = blob;
 	return VEX_BLOB_S3_OK;
 }
@@ -498,6 +508,11 @@ int vex_blob_s3_promote_object(struct vex_blob_s3 *blob, uint64_t epoch,
 	struct strbuf copy_source = STRBUF_INIT;
 	int exists;
 	int ret;
+
+	if (blob->test_fail_promote_once) {
+		blob->test_fail_promote_once = 0;
+		return VEX_BLOB_S3_ERR;
+	}
 
 	ret = vex_blob_s3_staging_key(blob, epoch, oid, &staged);
 	if (ret)

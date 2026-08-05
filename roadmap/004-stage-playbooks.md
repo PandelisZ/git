@@ -245,9 +245,12 @@ Its long-lived gateway verifies the active store before reporting healthy.
 tag plus branch, delete a branch, and shallow-clone through that gateway; it
 then checks MySQL metadata and MinIO keys. This is an L2 vertical data-plane
 milestone, not an L4 pack/benchmark result. `t1498` adds 20 stock-Git
-batch=1 pushes from an empty repo with fresh reconciliation; `t1499` proves
-rejected-receive compensation; and `t1500` covers simultaneous first pushes
-to separate repositories after the MySQL audit-sequence migration.
+batch=1 pushes and a 500-commit `1,2,4,...,32` ramp from empty repositories
+with fresh reconciliation; `t1499` proves rejected-receive compensation;
+`t1500` covers simultaneous first pushes to separate repositories after the
+MySQL audit-sequence migration; `t1501` forces promotion compensation;
+`t1502` hashes S3 bytes; `t1503` proves pins and the conservative mark plan;
+and `t1518` is a bounded eight-reader stock-Git gate.
 
 Tasks:
 
@@ -260,7 +263,9 @@ Tasks:
 7. [x] `t/vex/integration-mysql-minio.sh` + `t1497` stock-client smoke.
 8. [x] Compose smoke push-stress ([009](009-incremental-push-stress-harness.md)): empty repo, 20× batch=1 with stock Git.
 9. [x] Post-batch fresh-fetch/`fsck` recon asserts and checkpoint/metrics anti-cheat fields.
-10. [ ] Compose ramp + **chaos** + **fault_inject** profiles.
+10. [~] Compose ramp + **chaos** + **fault_inject** profiles. The 500-commit
+    ramp and deterministic S3-promotion fault are green; hard-kill chaos is
+    still required.
 11. Compose resource limits for stress profile (W5-10).
 12. CI: up → seed-small → clone smoke → **push-stress smoke** → down -v.
 13. **Sealed packs still optional** at L2 (W5-4).
@@ -270,7 +275,9 @@ Acceptance:
 - L2 checklist green **on Compose** (Valkey off).
 - Stock clone smoke.
 - Empty repo + 20× batch=1; ramp 500 commits; chaos no split-brain.
-- Fault inject: tip unchanged; epoch compensated.
+- 500-commit ramp and deterministic promotion fault: tips reconcile; the
+  failed epoch is compensated.
+- Hard-kill chaos remains required before a crash-safety claim.
 - Reproducible with Docker + git only.
 
 ---
@@ -294,18 +301,20 @@ Acceptance: FLUSHALL safe; default profile still passes without Valkey.
 
 Tasks:
 
-1. Seal published gens
-2. Mark unreachable past grace_days (default 14)
+1. [x] Seal published generations
+2. [~] Read-only graph mark from tips and durable pins; grace-period policy
+   remains pending
 3. Delete blob+index **only if** not in tips ∪ pins ∪ **active advertised packs**
-4. Pins
+4. [x] Durable pins
 5. Optional auto-pin previous default-branch tip on force (open product flag)
 6. Test: object only reachable via advertised pack is not swept
 
-Acceptance: orphans reclaimed; pins held; pack-referenced oids survive.
+Acceptance: **not reached**. Pins and the conservative mark proof are green,
+but deletion and pack/lease roots remain required.
 
 ### Stage 6 add-on — push stress soak
 
-- [ ] `ramp.env` + `chaos.env` green on Compose
+- [~] 500-commit ramp green on Compose; hard-kill chaos remains
 - [ ] Optional `steady-1.env` 5k batch=1 overnight
 - [ ] Metrics summary checked for error rate = 0
 
@@ -315,11 +324,12 @@ Acceptance: orphans reclaimed; pins held; pack-referenced oids survive.
 
 Tasks:
 
-1. Job: tips → commits/trees → blob exists
-2. Report missing blob_key
-3. Sample mode for large repos
+1. [x] Job: published-object index → canonical S3 bytes → Git object hash
+2. [x] Report a ref/object or byte/hash mismatch
+3. [ ] Sample mode for large repos
 
-Acceptance: scrub runs clean on test repo; L3 allowed only with scrub+sweeper.
+Acceptance: scrub runs clean on a stock-Git test repo; L3 remains blocked on
+the destructive pack/lease-aware sweeper.
 
 ---
 
@@ -392,7 +402,7 @@ Tasks:
 
 - Playbooks derived from 001 stages + 003 passes 02,05,13,14,16,21,25,26,28,35.
 - receive-pack quarantine/`odb_transaction` integration requirement confirmed in-tree.
-- Compose Stage 4 data plane: source-built Vex Git, MySQL metadata, and MinIO canonical bytes verified by `t1497`; `t1498` is green for the serial 20× smoke plus reconciliation, `t1499` is green for receive compensation, and `t1500` is green for two concurrent repositories. Ramp, chaos, fault injection, and sweeper/scrub remain the next gates.
+- Compose Stage 4 data plane: source-built Vex Git, MySQL metadata, and MinIO canonical bytes verified by `t1497`; `t1498` is green for the serial 20× smoke plus reconciliation and the 500-commit ramp; `t1499` is green for receive compensation; `t1500` is green for two concurrent repositories; `t1501` forces S3-promotion compensation; `t1502` hashes canonical bytes; `t1503` proves pin/mark protection; and `t1518` runs eight readers during twenty writer pushes. Hard-kill chaos, destructive pack/lease-aware sweeping, and L4 pack work remain next.
 
 ## Open Questions
 

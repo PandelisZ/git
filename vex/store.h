@@ -105,6 +105,21 @@ struct vex_ref_update {
 };
 
 /*
+ * A sweep plan is intentionally read-only.  It performs a complete object
+ * graph mark from live ref tips and durable MySQL pins, reading canonical
+ * bytes from the configured blob backend.  `sealed_candidates` is therefore
+ * an auditable input to a later grace-period/pack-aware deletion phase, not a
+ * deletion authorization by itself.
+ */
+struct vex_sweep_plan {
+	uint64_t published_objects;
+	uint64_t ref_roots;
+	uint64_t pin_roots;
+	uint64_t reachable_objects;
+	uint64_t sealed_candidates;
+};
+
+/*
  * Object iteration is an index operation: it never reads raw object bytes.
  * A NULL epoch exposes only published objects.  Passing the current epoch
  * additionally exposes its quarantined objects, which is needed while Git is
@@ -216,6 +231,18 @@ int vex_store_find_abbrev_len(struct vex_store *store,
 			     const struct vex_epoch *epoch,
 			     const struct object_id *oid,
 			     unsigned min_length, unsigned *out);
+
+/* Durable, MySQL-only retain/release roots for published objects. */
+int vex_store_pin_object(struct vex_store *store, const struct object_id *oid,
+			 const char *reason);
+int vex_store_unpin_object(struct vex_store *store, const struct object_id *oid,
+			   const char *reason);
+
+/*
+ * Build a conservative, non-mutating sweep plan.  Only the active
+ * MySQL+S3 Vex backend implements this first safety slice.
+ */
+int vex_store_sweep_plan(struct vex_store *store, struct vex_sweep_plan *plan);
 
 int vex_ref_read(struct vex_store *store, const char *refname,
 		   struct vex_ref *ref);

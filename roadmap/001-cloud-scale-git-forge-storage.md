@@ -1,7 +1,7 @@
 # Vex Git Forge Storage (Cloud-Scale PoC) PRD
 
 **Status:** Active
-**Current Stage:** 4 - MySQL metadata + S3 object-byte Compose data plane
+**Current Stage:** 4 - MySQL metadata + S3 object-byte data plane; L3 safety foundation
 **Owner:** Codex
 **Created:** 2026-08-05
 **Updated:** 2026-08-05
@@ -10,8 +10,11 @@
 
 Stage 0 design is frozen after 45 adversarial passes. Stages 1–4 now have a
 targeted implementation foundation: the active Compose path uses MySQL for
-metadata and MinIO/S3 for canonical Git object bytes. Push-stress, fault
-injection, sweeping, and the sealed-pack L4 path remain pending.
+metadata and MinIO/S3 for canonical Git object bytes. The 500-commit ramp,
+deterministic promotion-fault compensation, byte scrub, durable pins, and a
+read-only reachability mark plan are verified. Hard-kill chaos, destructive
+grace-period sweeping, pack/lease roots, and the sealed-pack L4 path remain
+pending.
 
 **Implementation identity:** this experiment is the **Vex backend**.  “Cloud
 storage” describes its MySQL + blob-store architecture; code, extension URIs,
@@ -383,8 +386,11 @@ push-stress harness against this endpoint.
 - [x] Wire a Vex-aware Compose git-http command to the MySQL+S3 store
 - [x] Protocol tests against a Vex `https://localhost…` endpoint: stock push/clone/fetch, atomic tag+branch, branch delete, and depth-one clone
 - [x] Empty-repo 20× batch=1 stock-Git HTTPS push stress with fresh-fetch/`fsck` reconciliation
+- [x] 500-commit stock-Git ramp (`1,2,4,...,32`) with fresh-fetch/`fsck` and MySQL/S3 reconciliation
 - [x] Rejected receive compensates MySQL metadata, canonical/staging S3 keys, and leaves the accepted tip readable
+- [x] Deterministic staged-to-final S3 promotion fault compensates its failed receive epoch before a successful retry
 - [x] Concurrent first pushes to two repositories retain independent MySQL ref-audit sequences
+- [x] S3 byte scrub, durable pin/mark plan, and bounded eight-reader stock-Git correctness gate
 - [ ] CI: Compose → Vex seed → Vex smoke → down -v (no AWS)
 
 The Compose default is now a source-built Vex Git image and a long-lived
@@ -394,9 +400,10 @@ clients and reports `metadata_backend:mysql`, `blob_backend:s3`, and
 unmodified host Git over HTTPS to verify the basic P0/P1 surface and queries
 MySQL plus MinIO afterward to prove the durable split. The old classic-bare
 bootstrap remains only an explicitly labelled fallback, not the Compose
-default. The serial smoke and compensation gates are green, but this does not
-claim ramp/chaos or fault injection, sweeping, sealed-pack clone performance,
-or an L3/L4 readiness level.
+default. The serial smoke, 500-commit ramp, deterministic promotion fault,
+byte scrub, pin/mark, and bounded-reader gates are green. This does not claim
+hard-kill chaos, destructive sweeping, sealed-pack clone performance, or an
+L3/L4 readiness level.
 
 Acceptance remains pending: Stage 3 tests must pass on **local** MySQL+MinIO
 through a Vex-aware server; Valkey off; second machine can reproduce from
@@ -411,10 +418,16 @@ Acceptance: FLUSHALL safe on compose Valkey; stale cache cannot resurrect tips; 
 
 ### Stage 6: sealer / sweeper / pins
 
-**Status:** Draft
-**Owned Paths:** `generation.c`, jobs docs
+**Status:** Active — durable pins and read-only reachability mark
+**Owned Paths:** `vex/store.[ch]`, `vex/meta-mysql.[ch]`, operator helper,
+Compose tests
 
-Acceptance: unpinned orphans reclaim after grace; pins survive.
+- [x] Durable MySQL pins survive later MySQL state writes.
+- [x] Read-only graph mark walks refs and pins through canonical S3 bytes.
+- [ ] Grace-period deletion of blob+index only after tip/pin/**pack/lease** roots.
+
+Acceptance: **not reached**. Pin protection and conservative candidates are
+proven; destructive grace-period sweeping and pack/lease roots are pending.
 
 ### Stage 7: Bundle URI / pack path + git/git SLO (L4) — **acceptance stage**
 
@@ -482,7 +495,7 @@ scripts/vex/bench-clone.sh
 - `make VEX_MYSQL=YesPlease git` builds the Vex store with its MySQL metadata adapter; the normal build retains an explicit unavailable-stub error when MySQL support is omitted.
 - `scripts/vex/up.sh` starts loopback-only Compose services `vex-mysql-1`, `vex-minio-1`, and `vex-git-http-1`. The server is source-built and the health endpoint reports active MySQL metadata plus S3 bytes.
 - `VEX_COMPOSE_NO_BUILD=1 VEX_TEST_COMPOSE_MYSQL_S3=1 make -C t T=t1497-vex-compose-mysql-s3.sh` passed stock Git HTTPS push, clone, fetch, atomic annotated tag plus branch, deletion, depth-one clone, and MySQL/MinIO postconditions.
-- No L4 claim: object reads are still the loose-object correctness path; sealed packs, clone SLO measurements, ramp/chaos/fault injection, and sweep/lease roots remain future gates.
+- No L4 claim: object reads are still the loose-object correctness path; sealed packs, clone SLO measurements, hard-kill chaos, destructive sweeping, and pack/lease roots remain future gates.
 
 ### 2026-08-05 - Stage 4 MySQL + S3 receive safety and smoke stress
 
@@ -499,6 +512,28 @@ scripts/vex/bench-clone.sh
   stock-Git HTTPS repositories and verifies both tips plus one audit row each.
 - Existing local volumes migrate `ref_updates_id` to a non-unique leading index
   under a MySQL advisory schema lock. Raw Git bytes remain S3-only.
+
+### 2026-08-05 - MySQL + S3 safety foundation and 500-commit ramp
+
+- `t1498-vex-push-stress-ramp-compose.sh` passed a unique empty-repository,
+  stock-Git 500-commit `1,2,4,...,32` replay: 20/20 pushes, final-tip match,
+  fresh-fetch/`fsck`, and MySQL/S3 reconciliation. Its registered warm-stack
+  write measurement was p50 `13706.237ms`, p90 `23252.034ms`, p99
+  `28033.833ms`.
+- `t1501` forces one staged-to-final S3 promotion failure and proves an
+  aborted generation with no new ref/object/claim/audit/final-or-staging
+  bytes before a normal retry clones and fscks.
+- `t1502` walks MySQL-indexed published objects, streams canonical MinIO/S3
+  bytes, and re-hashes the Git object header plus content. `t1503` proves a
+  durable pin protects an old sealed graph across a later push, then unpin
+  restores conservative candidates; it intentionally performs no deletion.
+- `t1518` passed 20 writer pushes with 8 concurrent stock-Git readers: 8
+  clones, 246 fetches, 8 final fscks, final-tip agreement, and MySQL/S3
+  reconciliation.
+
+These are L3 foundations only. Hard-kill chaos, grace-period deletion,
+pack/clone-lease roots, sealed-pack serving, `git/git` import, and clone SLOs
+remain open.
 
 ---
 

@@ -1,6 +1,8 @@
 #include "git-compat-util.h"
 #include "vex/store-internal.h"
 #include "hex.h"
+#include "oid-array.h"
+#include "oidset.h"
 #include "object-file.h"
 #include "strbuf.h"
 #include "trace.h"
@@ -1476,6 +1478,297 @@ int vex_store_find_abbrev_len(struct vex_store *store,
 	}
 	vex_meta_state_release(&state);
 	return VEX_STORE_OK;
+}
+
+/*
+ * This is the mark half of Vex sweeping.  It deliberately holds the MySQL
+ * repository-row transaction while it reads the canonical blob graph so the
+ * resulting plan has one stable ref/pin snapshot.  The operation is
+ * read-only; a later pack/lease/grace-aware delete phase can consume only the
+ * sealed candidates reported here.
+ */
+struct vex_sweep_walk {
+	struct vex_store *store;
+	const struct vex_meta_state *state;
+	struct oidset reachable;
+	struct oidset ref_roots;
+	struct oidset pin_roots;
+	struct oid_array pending;
+	int result;
+};
+
+static int sweep_enqueue(struct vex_sweep_walk *walk,
+			 const struct object_id *oid)
+{
+	if (!oidset_insert(&walk->reachable, oid))
+		oid_array_append(&walk->pending, oid);
+	return VEX_STORE_OK;
+}
+
+static int sweep_enqueue_hex_link(struct vex_sweep_walk *walk,
+				  const char *hex, size_t hex_len)
+{
+	struct object_id oid;
+
+	if (hex_len != walk->store->hash_algo->hexsz ||
+	    get_oid_hex_algop(hex, &oid, walk->store->hash_algo))
+		return VEX_STORE_ERR_CORRUPT;
+	return sweep_enqueue(walk, &oid);
+}
+
+static int sweep_parse_commit(struct vex_sweep_walk *walk,
+			      const void *data, unsigned long size)
+{
+	if (!data)
+		return VEX_STORE_ERR_CORRUPT;
+	const char *cursor = data;
+	const char *end = cursor + size;
+	int saw_tree = 0;
+
+	while (cursor < end) {
+		const char *line = cursor;
+		const char *newline = memchr(line, '\n', end - line);
+		size_t line_len = newline ? (size_t)(newline - line) :
+			(size_t)(end - line);
+		int ret;
+
+		cursor = newline ? newline + 1 : end;
+		if (!line_len)
+			break;
+		if (line_len >= 5 && !memcmp(line, "tree ", 5)) {
+			ret = sweep_enqueue_hex_link(walk, line + 5, line_len - 5);
+			if (ret)
+				return ret;
+			saw_tree = 1;
+		} else if (line_len >= 7 && !memcmp(line, "parent ", 7)) {
+			ret = sweep_enqueue_hex_link(walk, line + 7, line_len - 7);
+			if (ret)
+				return ret;
+		}
+	}
+	return saw_tree ? VEX_STORE_OK : VEX_STORE_ERR_CORRUPT;
+}
+
+static int sweep_parse_tag(struct vex_sweep_walk *walk,
+			   const void *data, unsigned long size)
+{
+	if (!data)
+		return VEX_STORE_ERR_CORRUPT;
+	const char *cursor = data;
+	const char *end = cursor + size;
+	int saw_object = 0;
+
+	while (cursor < end) {
+		const char *line = cursor;
+		const char *newline = memchr(line, '\n', end - line);
+		size_t line_len = newline ? (size_t)(newline - line) :
+			(size_t)(end - line);
+		int ret;
+
+		cursor = newline ? newline + 1 : end;
+		if (!line_len)
+			break;
+		if (line_len < 7 || memcmp(line, "object ", 7))
+			continue;
+		ret = sweep_enqueue_hex_link(walk, line + 7, line_len - 7);
+		if (ret)
+			return ret;
+		saw_object = 1;
+	}
+	return saw_object ? VEX_STORE_OK : VEX_STORE_ERR_CORRUPT;
+}
+
+static int sweep_parse_tree(struct vex_sweep_walk *walk,
+			    const void *data, unsigned long size)
+{
+	if (!size)
+		return VEX_STORE_OK;
+	if (!data)
+		return VEX_STORE_ERR_CORRUPT;
+	const unsigned char *cursor = data;
+	const unsigned char *end = cursor + size;
+
+	while (cursor < end) {
+		const unsigned char *mode = cursor;
+		const unsigned char *space;
+		const unsigned char *nul;
+		struct object_id oid;
+		size_t mode_len;
+		size_t i;
+		int is_gitlink;
+
+		space = memchr(cursor, ' ', end - cursor);
+		if (!space || space == cursor)
+			return VEX_STORE_ERR_CORRUPT;
+		mode_len = space - mode;
+		for (i = 0; i < mode_len; i++)
+			if (mode[i] < '0' || mode[i] > '7')
+				return VEX_STORE_ERR_CORRUPT;
+		nul = memchr(space + 1, '\0', end - (space + 1));
+		if (!nul || nul == space + 1 ||
+		    (size_t)(end - (nul + 1)) < walk->store->hash_algo->rawsz)
+			return VEX_STORE_ERR_CORRUPT;
+		is_gitlink = mode_len == 6 && !memcmp(mode, "160000", 6);
+		if (!is_gitlink) {
+			oidread(&oid, nul + 1, walk->store->hash_algo);
+			sweep_enqueue(walk, &oid);
+		}
+		cursor = nul + 1 + walk->store->hash_algo->rawsz;
+	}
+	return VEX_STORE_OK;
+}
+
+static int sweep_walk_one(struct vex_sweep_walk *walk,
+			  const struct object_id *oid)
+{
+	const struct vex_meta_object *object;
+	void *data = NULL;
+	unsigned long size = 0;
+	int ret;
+
+	object = find_object((struct vex_meta_state *)walk->state, oid);
+	if (!object || object->state != VEX_OBJECT_PUBLISHED)
+		return VEX_STORE_ERR_CORRUPT;
+	ret = blob_backend_read_final(walk->store, oid, &data, &size);
+	if (ret)
+		goto out;
+	if (size != object->size ||
+	    verify_object(walk->store, oid, object->type, data, size)) {
+		ret = VEX_STORE_ERR_CORRUPT;
+		goto out;
+	}
+	switch (object->type) {
+	case OBJ_COMMIT:
+		ret = sweep_parse_commit(walk, data, size);
+		break;
+	case OBJ_TREE:
+		ret = sweep_parse_tree(walk, data, size);
+		break;
+	case OBJ_TAG:
+		ret = sweep_parse_tag(walk, data, size);
+		break;
+	case OBJ_BLOB:
+		ret = VEX_STORE_OK;
+		break;
+	default:
+		ret = VEX_STORE_ERR_CORRUPT;
+		break;
+	}
+out:
+	free(data);
+	return ret;
+}
+
+static int sweep_collect_pin(
+	const unsigned char raw_oid[VEX_META_MYSQL_OID_BYTES], void *cb_data)
+{
+	struct vex_sweep_walk *walk = cb_data;
+	struct object_id oid;
+	unsigned int i;
+
+	for (i = walk->store->hash_algo->rawsz;
+	     i < VEX_META_MYSQL_OID_BYTES; i++)
+		if (raw_oid[i]) {
+			walk->result = VEX_STORE_ERR_CORRUPT;
+			return VEX_META_MYSQL_ERR_STATE;
+		}
+	oidread(&oid, raw_oid, walk->store->hash_algo);
+	if (!oidset_insert(&walk->pin_roots, &oid))
+		sweep_enqueue(walk, &oid);
+	return VEX_META_MYSQL_OK;
+}
+
+int vex_store_pin_object(struct vex_store *store, const struct object_id *oid,
+			 const char *reason)
+{
+	if (!store || !oid || !reason || !*reason ||
+	    store->backend != VEX_STORE_BACKEND_MYSQL_S3)
+		return VEX_STORE_ERR_INVALID;
+	return meta_mysql_result(vex_meta_mysql_pin_object(
+		store->meta_mysql, store->repo_id, oid->hash, store->hash_algo->rawsz,
+		reason));
+}
+
+int vex_store_unpin_object(struct vex_store *store, const struct object_id *oid,
+			   const char *reason)
+{
+	if (!store || !oid || !reason || !*reason ||
+	    store->backend != VEX_STORE_BACKEND_MYSQL_S3)
+		return VEX_STORE_ERR_INVALID;
+	return meta_mysql_result(vex_meta_mysql_unpin_object(
+		store->meta_mysql, store->repo_id, oid->hash, store->hash_algo->rawsz,
+		reason));
+}
+
+int vex_store_sweep_plan(struct vex_store *store, struct vex_sweep_plan *plan)
+{
+	struct vex_meta_lock lock;
+	struct vex_meta_state state;
+	struct vex_sweep_walk walk = { 0 };
+	size_t at = 0;
+	size_t i;
+	int ret;
+
+	if (!store || !plan || store->backend != VEX_STORE_BACKEND_MYSQL_S3)
+		return VEX_STORE_ERR_INVALID;
+	memset(plan, 0, sizeof(*plan));
+	memset(&state, 0, sizeof(state));
+	if ((ret = load_locked(store, &lock, &state)))
+		return ret;
+	walk.store = store;
+	walk.state = &state;
+	oidset_init(&walk.reachable, state.objects_nr);
+	oidset_init(&walk.ref_roots, state.refs_nr);
+	oidset_init(&walk.pin_roots, state.objects_nr);
+	for (i = 0; i < state.refs_nr; i++) {
+		const struct vex_meta_ref *ref = &state.refs[i];
+
+		if (ref->target.type != VEX_REF_TARGET_OID)
+			continue;
+		if (!oidset_insert(&walk.ref_roots, &ref->target.oid))
+			sweep_enqueue(&walk, &ref->target.oid);
+	}
+	ret = vex_meta_mysql_for_each_active_pin(store->meta_mysql, store->repo_id,
+						   sweep_collect_pin, &walk);
+	if (walk.result) {
+		ret = walk.result;
+		goto out;
+	}
+	if (ret) {
+		ret = meta_mysql_result(ret);
+		goto out;
+	}
+	while (at < walk.pending.nr) {
+		ret = sweep_walk_one(&walk, &walk.pending.oid[at++]);
+		if (ret)
+			goto out;
+	}
+	for (i = 0; i < state.objects_nr; i++) {
+		const struct vex_meta_object *object = &state.objects[i];
+		const struct vex_meta_epoch *epoch;
+
+		if (object->state != VEX_OBJECT_PUBLISHED)
+			continue;
+		plan->published_objects++;
+		if (oidset_contains(&walk.reachable, &object->oid))
+			continue;
+		epoch = find_epoch(&state, object->epoch);
+		if (epoch && epoch->state == VEX_EPOCH_SEALED)
+			plan->sealed_candidates++;
+	}
+	plan->ref_roots = oidset_size(&walk.ref_roots);
+	plan->pin_roots = oidset_size(&walk.pin_roots);
+	plan->reachable_objects = oidset_size(&walk.reachable);
+	ret = VEX_STORE_OK;
+out:
+	oid_array_clear(&walk.pending);
+	oidset_clear(&walk.pin_roots);
+	oidset_clear(&walk.ref_roots);
+	oidset_clear(&walk.reachable);
+	if (lock.held)
+		meta_unlock(store, &lock);
+	vex_meta_state_release(&state);
+	return ret;
 }
 
 int vex_ref_read(struct vex_store *store, const char *refname, struct vex_ref *ref)
