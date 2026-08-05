@@ -11,8 +11,11 @@
 #include "sideband.h"
 #include "repository.h"
 #include "odb.h"
+#include "odb/source-packed.h"
+#include "odb/source-vex.h"
 #include "oid-array.h"
 #include "object.h"
+#include "packfile.h"
 #include "commit.h"
 #include "diff.h"
 #include "revision.h"
@@ -31,6 +34,7 @@
 #include "shallow.h"
 #include "trace.h"
 #include "write-or-die.h"
+#include "wrapper.h"
 #include "json-writer.h"
 #include "strmap.h"
 #include "promisor-remote.h"
@@ -296,6 +300,174 @@ static int relay_pack_data(int pack_objects_out, struct output_state *os,
 	return readsz;
 }
 
+struct vex_precomputed_want_check {
+	struct upload_pack_data *data;
+	unsigned char *visible;
+};
+
+static int vex_precomputed_pack_fallback(const char *reason)
+{
+	trace_printf("vex: precomputed-pack fallback: %s", reason);
+	return 0;
+}
+
+static int vex_precomputed_want_is_visible(const struct reference *ref,
+					   void *cb_data)
+{
+	struct vex_precomputed_want_check *check = cb_data;
+	int i;
+
+	for (i = 0; i < check->data->want_obj.nr; i++) {
+		struct object *want = check->data->want_obj.objects[i].item;
+
+		if (oideq(ref->oid, &want->oid))
+			check->visible[i] = 1;
+	}
+	return 0;
+}
+
+/*
+ * A derived Vex pack is a complete, immutable snapshot of the public object
+ * graph at one sealed generation.  It is only safe to put that whole pack on
+ * the wire when the request has no operation that would require us to trim or
+ * synthesize it.  Keep this deliberately narrow: all other fetches retain
+ * the normal pack-objects path.
+ */
+static int vex_precomputed_pack_eligible(struct upload_pack_data *data,
+					 struct packed_git **pack_out)
+{
+	struct odb_source *source;
+	struct odb_source_packed *packed;
+	struct packfile_list_entry *entry;
+	struct vex_precomputed_want_check want_check;
+	unsigned char *visible = NULL;
+	int ret;
+	int i;
+
+	*pack_out = NULL;
+	if (!repo_uses_vex_storage(the_repository) ||
+	    (get_git_namespace() && *get_git_namespace()) ||
+	    data->pack_objects_hook || data->hidden_refs.nr ||
+	    repo_has_promisor_remote(the_repository) ||
+	    is_repository_shallow(the_repository) ||
+	    !data->want_obj.nr || data->have_obj.nr || data->seen_haves ||
+	    data->extra_edge_obj.nr || data->shallows.nr || data->shallow_nr ||
+	    data->depth || data->deepen_since || data->deepen_rev_list ||
+	    data->deepen_relative || data->filter_options.choice ||
+	    data->uri_protocols.nr || strmap_get_size(&data->wanted_refs) ||
+	    data->use_include_tag)
+		return vex_precomputed_pack_fallback("request is not a complete public clone");
+	/* A client advertising thin-pack may always accept the complete pack. */
+
+	/*
+	 * A Vex repository owns the primary source.  Refuse alternates: their
+	 * objects are neither covered by the Vex artifact nor by its clone lease.
+	 */
+	source = the_repository->objects->sources;
+	if (!source || source->next || !odb_source_is_vex(source))
+		return vex_precomputed_pack_fallback("repository has non-Vex object sources");
+
+	/* Refresh the selected current artifact before taking its local pack FD. */
+	odb_source_prepare(source, ODB_PREPARE_FLUSH_CACHES);
+	packed = odb_source_vex_packed_store(source);
+	if (!packed)
+		return vex_precomputed_pack_fallback("no current verified Vex pack cache");
+	entry = packfile_store_get_packs(packed);
+	if (!entry || entry->next || !entry->pack || !entry->pack->pack_size)
+		return vex_precomputed_pack_fallback("Vex cache does not contain exactly one pack");
+
+	/*
+	 * Do not turn an allowed unadvertised-object request into a whole-pack
+	 * disclosure.  Every requested object must still be a current public ref.
+	 */
+	CALLOC_ARRAY(visible, data->want_obj.nr);
+	want_check.data = data;
+	want_check.visible = visible;
+	ret = refs_for_each_ref(get_main_ref_store(the_repository),
+				vex_precomputed_want_is_visible, &want_check);
+	if (ret)
+		goto out;
+	for (i = 0; i < data->want_obj.nr; i++) {
+		struct object *want = data->want_obj.objects[i].item;
+
+		if (!visible[i] || !find_pack_entry_one(&want->oid, entry->pack))
+			goto out;
+	}
+
+	*pack_out = entry->pack;
+	out:
+	free(visible);
+	if (!*pack_out)
+		trace_printf("vex: precomputed-pack fallback: wanted object is not public or missing from current pack");
+	return !!*pack_out;
+}
+
+static void create_vex_precomputed_pack_file(struct upload_pack_data *pack_data,
+					      int pack_fd)
+{
+	char abort_msg[] = "aborting due to possible repository "
+		"corruption on the remote side.";
+	char header[4];
+	char buffer[LARGE_PACKET_DATA_MAX - 1];
+	ssize_t ret = 0;
+
+	/*
+	 * This file has already been verified by the Vex packed source. Unlike
+	 * pack-objects' pipe, it cannot contain packfile-URI records, so send it
+	 * directly through upload-pack's normal data/sideband wire helper. Do
+	 * not use relay_pack_data here: that helper intentionally retains one
+	 * byte while it waits for a possibly-corrupt producer to finish.
+	 */
+	reset_timeout(pack_data->timeout);
+	if (read_in_full(pack_fd, header, sizeof(header)) != sizeof(header) ||
+	    memcmp(header, "PACK", sizeof(header)))
+		goto fail;
+	send_client_data(1, header, sizeof(header), pack_data->use_sideband);
+
+	while ((ret = xread(pack_fd, buffer, sizeof(buffer))) > 0) {
+		reset_timeout(pack_data->timeout);
+		send_client_data(1, buffer, ret, pack_data->use_sideband);
+	}
+	if (ret < 0 || close(pack_fd) < 0)
+		goto fail;
+	if (pack_data->use_sideband)
+		packet_flush(1);
+	return;
+
+fail:
+	send_client_data(3, abort_msg, strlen(abort_msg),
+			 pack_data->use_sideband);
+	die("git upload-pack: %s", abort_msg);
+}
+
+/* Return true only after safely opening a fully verified Vex cache pack. */
+static int try_vex_precomputed_pack(struct upload_pack_data *pack_data,
+					   const struct string_list *uri_protocols)
+{
+	struct packed_git *pack;
+	struct stat st;
+	int pack_fd;
+
+	if (uri_protocols && uri_protocols->nr)
+		return 0;
+	if (!vex_precomputed_pack_eligible(pack_data, &pack))
+		return 0;
+	pack_fd = open_nofollow(pack->pack_name, O_RDONLY);
+	if (pack_fd < 0)
+		return 0;
+	if (fstat(pack_fd, &st) || !S_ISREG(st.st_mode) ||
+	    st.st_size != pack->pack_size ||
+	    st.st_size < the_hash_algo->rawsz) {
+		close(pack_fd);
+		return 0;
+	}
+
+	trace_printf("vex: serving verified precomputed pack %s",
+		     pack->pack_name);
+	create_vex_precomputed_pack_file(pack_data, pack_fd);
+	return 1;
+}
+
 static void create_pack_file(struct upload_pack_data *pack_data,
 			     const struct string_list *uri_protocols)
 {
@@ -308,6 +480,13 @@ static void create_pack_file(struct upload_pack_data *pack_data,
 	ssize_t sz;
 	int i;
 	FILE *pipe_fd;
+
+	if (try_vex_precomputed_pack(pack_data, uri_protocols))
+		return;
+	/* Test-only dispatch proof: an eligible Vex request must never get here. */
+	if (repo_uses_vex_storage(the_repository) &&
+	    git_env_bool("GIT_VEX_TEST_FAIL_PACK_OBJECTS", 0))
+		die("git upload-pack: test hook refused git-pack-objects dispatch");
 
 	if (!pack_data->pack_objects_hook)
 		pack_objects.git_cmd = 1;
