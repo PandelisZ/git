@@ -722,7 +722,7 @@ finally:
     temporary.unlink(missing_ok=True)
 PY
 
-restore_gateway_request_limit || die 'git-http request limit could not be restored after the seed'
+restore_gateway_limits || die 'git-http gateway limits could not be restored after the seed'
 
 printf 'vex seed-git-git: PASS repository=git/git.git refs=%s objects=%s pack=%s disk_control=%s manifest=%s\n' \
 	"$source_ref_count" "$source_object_count" "$pack_id" "$disk_control" "$manifest"
