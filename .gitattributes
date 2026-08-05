@@ -1,6 +1,9 @@
 * whitespace=trail,space
 *.[ch] whitespace=indent,trail,space,incomplete diff=cpp
 *.sh whitespace=indent,trail,space,incomplete text eol=lf
+# This shell wrapper embeds a Python manifest writer, whose indentation is
+# significant and intentionally uses spaces.
+scripts/vex/seed-git-git.sh whitespace=trail,space,incomplete text eol=lf
 *.perl text eol=lf diff=perl
 *.pl text eol=lf diff=perl
 *.pm text eol=lf diff=perl

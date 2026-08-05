@@ -1,0 +1,4 @@
+# Seed mirrors, disk-control bare repositories, and manifests are local
+# benchmark artifacts. They may identify a local checkout or endpoint.
+*
+!.gitignore
