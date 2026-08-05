@@ -1166,10 +1166,10 @@ static int ensure_generations_receive_heartbeat_column(struct vex_meta_mysql *db
 		"WHERE table_schema = DATABASE() AND table_name = 'generations' "
 		"AND index_name = 'generations_open_heartbeat'";
 	static const char alter_sql[] =
-		"ALTER TABLE generations ADD COLUMN IF NOT EXISTS "
+		"ALTER TABLE generations ADD COLUMN "
 		"receive_heartbeat_at DATETIME(6) NULL AFTER expires_at";
 	static const char add_index_sql[] =
-		"ALTER TABLE generations ADD INDEX IF NOT EXISTS "
+		"ALTER TABLE generations ADD INDEX "
 		"generations_open_heartbeat (repo_id, state, receive_heartbeat_at)";
 	uint64_t columns;
 	uint64_t indexes;
