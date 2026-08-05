@@ -130,6 +130,8 @@ sealed:[1-9]*:git/v1/"$repo_id"/packs/*.pack:git/v1/"$repo_id"/packs/*.idx) ;;
 	exit 1
 	;;
 esac
+covering_generation=${pack_state#sealed:}
+covering_generation=${covering_generation%%:*}
 registered_before=$(mysql_query "
 	SELECT COUNT(*) FROM pack_objects WHERE repo_id = UNHEX('$repo_id');")
 [ "$registered_before" = "$object_count" ] || {
@@ -139,8 +141,9 @@ registered_before=$(mysql_query "
 }
 
 # This pushes through the state-replacement adapter after pack registration.
-# The immutable envelope/object map must survive. A later serving path will
-# invalidate it when it is no longer current.
+# The immutable envelope/object map must survive, but its sealed generation is
+# no longer current and must be marked obsolete before any serving path can
+# select it.
 printf 'post-pack normal receive\n' >>"$client/history"
 "$stock_git" -C "$client" add history
 "$stock_git" -C "$client" -c commit.gpgSign=false commit -q -m 'post-pack normal receive'
@@ -160,6 +163,22 @@ envelopes_after=$(mysql_query "
 		"$envelopes_after" >&2
 	exit 1
 }
+post_push_pack_state=$(mysql_query "
+	SELECT CONCAT(state, ':', covering_generation, ':',
+		       DATE_FORMAT(obsolete_at, '%Y-%m-%d %H:%i:%s.%f'))
+	  FROM pack_envelopes
+	 WHERE repo_id = UNHEX('$repo_id');")
+post_push_state=${post_push_pack_state%%:*}
+post_push_remainder=${post_push_pack_state#*:}
+post_push_generation=${post_push_remainder%%:*}
+post_push_obsolete_at=${post_push_remainder#*:}
+if [ "$post_push_state" != obsolete ] ||
+	[ "$post_push_generation" != "$covering_generation" ] ||
+	[ -z "$post_push_obsolete_at" ] || [ "$post_push_obsolete_at" = NULL ]; then
+	printf 'vex pack artifact E2E: post-pack push did not obsolete the stale pack envelope: %s\n' \
+		"$post_push_pack_state" >&2
+	exit 1
+fi
 
 fresh="$scratch/fresh"
 "$stock_git" -c http.sslCAInfo="$ca_file" clone -q "$origin" "$fresh"
@@ -180,5 +199,5 @@ case "$scrub_output" in
 	;;
 esac
 
-printf 'vex pack artifact E2E: PASS custom-Git pack/index lives in S3, MySQL tracks %s object(s), and a later stock-Git push/clone/fsck/scrub remains correct for %s\n' \
+printf 'vex pack artifact E2E: PASS custom-Git pack/index lives in S3, MySQL retains %s object(s) in an obsolete envelope after a later stock-Git push/clone/fsck/scrub for %s\n' \
 	"$object_count" "$origin"

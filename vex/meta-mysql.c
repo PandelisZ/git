@@ -2522,9 +2522,10 @@ struct vex_meta_mysql_saved_pins {
 /*
  * Derived packs are immutable S3 artifacts.  The current state adapter still
  * replaces the ordinary per-repository metadata under one lock, so retain the
- * pack rows exactly through that replacement rather than making packs block
- * subsequent receives.  A future deletion path must obsolete a pack before it
- * deletes an object referenced by that pack.
+ * immutable pack rows and membership through that replacement rather than
+ * making packs block subsequent receives.  A sealed pack becomes obsolete if
+ * a later sealed generation makes its coverage stale; a future deletion path
+ * must leave it obsolete before deleting an object it references.
  */
 struct vex_meta_mysql_saved_pack {
 	unsigned char pack_id[VEX_META_MYSQL_OID_BYTES];
@@ -2805,13 +2806,31 @@ out:
 	return ret;
 }
 
+static uint64_t state_latest_sealed_generation(const struct vex_meta_state *state)
+{
+	uint64_t generation = 0;
+	size_t i;
+
+	for (i = 0; i < state->epochs_nr; i++) {
+		const struct vex_meta_epoch *epoch = &state->epochs[i];
+
+		if (epoch->state == VEX_EPOCH_SEALED && epoch->id > generation)
+			generation = epoch->id;
+	}
+	return generation;
+}
+
 static int state_insert_packs(struct vex_meta_mysql *db, const char *repo,
-				      const struct vex_meta_mysql_saved_packs *packs)
+				      const struct vex_meta_mysql_saved_packs *packs,
+				      uint64_t sealed_generation)
 {
 	size_t i;
 
 	for (i = 0; i < packs->nr; i++) {
 		const struct vex_meta_mysql_saved_pack *pack = &packs->items[i];
+		/* Never restore a stale sealed artifact as selectable/current. */
+		int obsolete = !strcmp(pack->state, "sealed") &&
+			pack->covering_generation < sealed_generation;
 		char *pack_id = sql_hex_literal(pack->pack_id, sizeof(pack->pack_id));
 		char *pack_key = pack->pack_key ?
 			sql_hex_literal(pack->pack_key, pack->pack_key_len) : NULL;
@@ -2819,12 +2838,13 @@ static int state_insert_packs(struct vex_meta_mysql *db, const char *repo,
 			sql_hex_literal(pack->idx_key, pack->idx_key_len) : vex_strdup("NULL");
 		char *bitmap_key = pack->bitmap_key ?
 			sql_hex_literal(pack->bitmap_key, pack->bitmap_key_len) : vex_strdup("NULL");
-		char *state = sql_quote(db, pack->state);
+		char *state = sql_quote(db, obsolete ? "obsolete" : pack->state);
 		char *created_at = sql_quote(db, pack->created_at);
 		char *sealed_at = pack->sealed_at ? sql_quote(db, pack->sealed_at) :
 			vex_strdup("NULL");
-		char *obsolete_at = pack->obsolete_at ? sql_quote(db, pack->obsolete_at) :
-			vex_strdup("NULL");
+		char *obsolete_at = obsolete ? vex_strdup("CURRENT_TIMESTAMP(6)") :
+			(pack->obsolete_at ? sql_quote(db, pack->obsolete_at) :
+			 vex_strdup("NULL"));
 		char *sql;
 		int ret;
 
@@ -3284,7 +3304,8 @@ int vex_meta_mysql_state_save_locked(struct vex_meta_mysql *db,
 	    (ret = state_insert_refs(db, repo, hash_algo, state)) ||
 	    (ret = state_insert_ref_updates(db, repo, hash_algo, state)) ||
 	    (ret = state_insert_pins(db, repo, &pins)) ||
-	    (ret = state_insert_packs(db, repo, &packs)))
+	    (ret = state_insert_packs(db, repo, &packs,
+				      state_latest_sealed_generation(state))))
 		goto out;
 	ret = vex_mysql_commit(db);
 	if (!ret)
