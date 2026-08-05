@@ -74,6 +74,16 @@ struct vex_object_info {
 	enum vex_object_state state;
 };
 
+/*
+ * A selected immutable derived pack.  The identifier is a pack checksum, not
+ * a Git object ID, but uses object_id storage so the active repository hash
+ * algorithm is carried consistently through the ODB path.
+ */
+struct vex_pack_artifact {
+	struct object_id pack_id;
+	uint64_t covering_generation;
+};
+
 struct vex_ref_target {
 	enum vex_ref_target_type type;
 	struct object_id oid;
@@ -214,6 +224,18 @@ int vex_store_read_object_in_epoch(struct vex_store *store,
 			     const struct object_id *oid,
 			     enum object_type *type, unsigned long *size,
 			     void **data);
+
+/*
+ * Find a derived pack that is sealed for exactly the current repository
+ * generation.  Its payload remains in S3; callers may materialize it only as
+ * a disposable local read cache with vex_store_download_pack().
+ */
+int vex_store_current_pack(struct vex_store *store,
+			   struct vex_pack_artifact *artifact);
+int vex_store_download_pack(struct vex_store *store,
+			    const struct vex_pack_artifact *artifact,
+			    const char *pack_destination,
+			    const char *idx_destination);
 
 /*
  * Enumerate visible metadata records in object-id order.  A nonzero callback

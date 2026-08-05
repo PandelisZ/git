@@ -40,3 +40,17 @@ void odb_source_release(struct odb_source *source)
 		return;
 	free(source->path);
 }
+
+struct odb_source_packed *odb_source_get_packed(struct odb_source *source)
+{
+	if (!source)
+		return NULL;
+	switch (source->type) {
+	case ODB_SOURCE_FILES:
+		return odb_source_files_downcast(source)->packed;
+	case ODB_SOURCE_VEX:
+		return odb_source_vex_packed_store(source);
+	default:
+		return NULL;
+	}
+}

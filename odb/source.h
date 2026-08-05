@@ -30,6 +30,7 @@ enum odb_source_type {
 
 struct object_id;
 struct odb_read_stream;
+struct odb_source_packed;
 struct strvec;
 
 /*
@@ -304,6 +305,12 @@ void odb_source_free(struct odb_source *source);
  * implementations.
  */
 void odb_source_release(struct odb_source *source);
+
+/*
+ * Return a source's optional packed-object store.  Most source types do not
+ * own one; Vex uses this only for its disposable derived-pack cache.
+ */
+struct odb_source_packed *odb_source_get_packed(struct odb_source *source);
 
 /*
  * Close the object database source without releasing he underlying data. The

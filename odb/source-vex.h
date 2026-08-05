@@ -7,6 +7,7 @@ struct odb_source_vex;
 struct vex_store;
 struct vex_epoch;
 struct odb_transaction;
+struct odb_source_packed;
 struct repository;
 
 /*
@@ -25,6 +26,7 @@ int vex_store_open_for_repository(struct repository *repo, const char *gitdir,
 					    struct vex_store **out);
 
 bool odb_source_is_vex(const struct odb_source *source);
+struct odb_source_packed *odb_source_vex_packed_store(struct odb_source *source);
 bool repo_uses_vex_storage(const struct repository *repo);
 
 /*

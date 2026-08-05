@@ -13,10 +13,13 @@ targeted implementation foundation: the active Compose path uses MySQL for
 metadata and MinIO/S3 for canonical Git object bytes. The 500-commit ramp,
 deterministic promotion-fault compensation, byte scrub, durable pins, and a
 read-only reachability mark plan are verified. A deterministic pack/index
-artifact now reaches per-repository S3 keys with a MySQL envelope/object map,
-but it is not yet used to serve clones. Hard-kill chaos, destructive
-grace-period sweeping, pack/lease roots, invalidation, and the sealed-pack L4
-serve path remain pending.
+artifact now reaches per-repository S3 keys with a MySQL envelope/object map;
+the current sealed artifact is downloaded into a verified, disposable local
+packed-object cache for normal server-side object reads. `t1522` proves a
+fresh stock clone and `fsck` still succeed after all S3 byte reads are faulted.
+This is not direct precomputed-pack streaming to the client or an L4 result.
+Hard-kill chaos, destructive grace-period sweeping, pack/lease roots, cache
+lifecycle invalidation, and the sealed-pack L4 serve path remain pending.
 
 **Implementation identity:** this experiment is the **Vex backend**.  “Cloud
 storage” describes its MySQL + blob-store architecture; code, extension URIs,

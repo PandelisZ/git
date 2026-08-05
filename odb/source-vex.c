@@ -1,18 +1,27 @@
 #include "git-compat-util.h"
 #include "config.h"
+#include "hash.h"
 #include "hex.h"
+#include "lockfile.h"
+#include "pack.h"
+#include "packfile.h"
 #include "vex/blob-s3.h"
 #include "vex/meta-mysql.h"
 #include "vex/store.h"
 #include "gettext.h"
 #include "object-file.h"
 #include "odb.h"
+#include "odb/source-packed.h"
 #include "odb/source-vex.h"
 #include "odb/streaming.h"
 #include "odb/transaction.h"
+#include "path.h"
 #include "repository.h"
 #include "strbuf.h"
 #include "strvec.h"
+#include "tempfile.h"
+#include "trace.h"
+#include "wrapper.h"
 
 /*
  * The Vex source deliberately keeps source.path pointed at the thin
@@ -24,6 +33,14 @@ struct odb_source_vex {
 	struct vex_store *store;
 	/* A child process's non-owning handle to the parent's receive epoch. */
 	struct vex_epoch *inherited_epoch;
+	/*
+	 * A read-only, disposable cache of one S3-derived pack.  It is never an
+	 * object source of truth: cache misses and cache failures fall through to
+	 * the canonical Vex store below.
+	 */
+	struct odb_source_packed *pack_cache;
+	char *pack_cache_id;
+	char *pack_cache_path;
 };
 
 struct odb_transaction_vex {
@@ -200,13 +217,237 @@ int vex_store_open_for_repository(struct repository *repo, const char *gitdir,
 	return ret;
 }
 
+static void vex_source_release_pack_cache(struct odb_source_vex *source)
+{
+	if (source->pack_cache) {
+		odb_source_close(&source->pack_cache->base);
+		odb_source_free(&source->pack_cache->base);
+	}
+	source->pack_cache = NULL;
+	free(source->pack_cache_id);
+	source->pack_cache_id = NULL;
+	free(source->pack_cache_path);
+	source->pack_cache_path = NULL;
+}
+
+static char *vex_source_pack_cache_root(const struct odb_source_vex *source)
+{
+	const char *scratch = getenv("GIT_VEX_SCRATCH");
+	const char *fallback;
+
+	if (scratch && *scratch && !strpbrk(scratch, "\r\n"))
+		fallback = scratch;
+	else
+		fallback = source->base.odb->repo->gitdir;
+	if (!fallback || !*fallback || !source->store)
+		return NULL;
+	return xstrfmt("%s/vex-pack-cache/%s", fallback,
+		       vex_store_repo_id(source->store));
+}
+
+static int vex_source_verify_pack_checksum(struct odb_source_vex *source,
+					    struct packed_git *pack,
+					    const struct vex_pack_artifact *artifact)
+{
+	const struct git_hash_algo *hash_algo = source->base.odb->repo->hash_algo;
+	struct git_hash_ctx ctx;
+	struct stat st;
+	unsigned char buffer[65536];
+	unsigned char computed[GIT_MAX_RAWSZ];
+	unsigned char trailer[GIT_MAX_RAWSZ];
+	off_t remaining;
+	int fd = -1;
+	int ret = -1;
+
+	if (!pack || !artifact || !hash_algo)
+		return -1;
+	fd = open_nofollow(pack->pack_name, O_RDONLY);
+	if (fd < 0 || fstat(fd, &st) || !S_ISREG(st.st_mode) ||
+	    st.st_size < hash_algo->rawsz)
+		goto out;
+	remaining = st.st_size - hash_algo->rawsz;
+	git_hash_init(&ctx, hash_algo);
+	while (remaining) {
+		size_t to_read = remaining > (off_t)sizeof(buffer) ?
+			sizeof(buffer) : (size_t)remaining;
+		ssize_t read_len = read_in_full(fd, buffer, to_read);
+
+		if (read_len != (ssize_t)to_read)
+			goto out;
+		git_hash_update(&ctx, buffer, to_read);
+		remaining -= to_read;
+	}
+	if (read_in_full(fd, trailer, hash_algo->rawsz) != hash_algo->rawsz)
+		goto out;
+	git_hash_final(computed, &ctx);
+	if (hasheq(computed, artifact->pack_id.hash, hash_algo) &&
+	    hasheq(trailer, artifact->pack_id.hash, hash_algo))
+		ret = 0;
+
+out:
+	if (fd >= 0)
+		close(fd);
+	return ret;
+}
+
+static struct odb_source_packed *vex_source_open_verified_pack_cache(
+		struct odb_source_vex *source, const char *objects_path,
+		const struct vex_pack_artifact *artifact)
+{
+	struct odb_source_packed *cache;
+	struct packfile_list_entry *entry;
+
+	cache = odb_source_packed_new(source->base.odb, objects_path, false);
+	odb_source_prepare(&cache->base, ODB_PREPARE_FLUSH_CACHES);
+	entry = packfile_store_get_packs(cache);
+	if (!entry || entry->next || verify_pack_index(entry->pack) ||
+	    vex_source_verify_pack_checksum(source, entry->pack, artifact)) {
+		odb_source_close(&cache->base);
+		odb_source_free(&cache->base);
+		return NULL;
+	}
+	return cache;
+}
+
+static struct tempfile *vex_source_pack_cache_tempfile(const char *pack_dir,
+						const char *component)
+{
+	char *template = xstrfmt("%s/.vex-pack-%s-XXXXXX", pack_dir, component);
+	struct tempfile *temp = mks_tempfile_m(template, 0600);
+
+	free(template);
+	return temp;
+}
+
+static int vex_source_install_pack_cache(struct odb_source_vex *source,
+					 const struct vex_pack_artifact *artifact,
+					 const char *pack_id)
+{
+	struct lock_file lock = LOCK_INIT;
+	struct tempfile *pack_temp = NULL;
+	struct tempfile *idx_temp = NULL;
+	struct odb_source_packed *cache = NULL;
+	char *root = NULL;
+	char *objects_path = NULL;
+	char *pack_dir = NULL;
+	char *pack_path = NULL;
+	char *idx_path = NULL;
+	char *lock_path = NULL;
+	int ret = -1;
+
+	root = vex_source_pack_cache_root(source);
+	if (!root)
+		goto out;
+	objects_path = xstrfmt("%s/%s/objects", root, pack_id);
+	pack_dir = xstrfmt("%s/pack", objects_path);
+	pack_path = xstrfmt("%s/pack-%s.pack", pack_dir, pack_id);
+	idx_path = xstrfmt("%s/pack-%s.idx", pack_dir, pack_id);
+	lock_path = xstrfmt("%s/.vex-pack-install-%s", pack_dir, pack_id);
+	if (safe_create_leading_directories_const(source->base.odb->repo,
+						  pack_path) < 0)
+		goto out;
+	/*
+	 * The index is the pack discovery point.  Serialize installers and publish
+	 * the .pack before the .idx so readers see either a verified old pair or a
+	 * complete new pair, never an index pointing at an absent pack.
+	 */
+	if (hold_lock_file_for_update_timeout(&lock, lock_path, LOCK_NO_DEREF,
+					      30000) < 0)
+		goto out;
+	cache = vex_source_open_verified_pack_cache(source, objects_path, artifact);
+	if (!cache) {
+		unlink(pack_path);
+		unlink(idx_path);
+		pack_temp = vex_source_pack_cache_tempfile(pack_dir, "pack");
+		idx_temp = vex_source_pack_cache_tempfile(pack_dir, "idx");
+		if (!pack_temp || !idx_temp || close_tempfile_gently(pack_temp) < 0 ||
+		    close_tempfile_gently(idx_temp) < 0)
+			goto out;
+		if (vex_store_download_pack(source->store, artifact,
+					    get_tempfile_path(pack_temp),
+					    get_tempfile_path(idx_temp)))
+			goto out;
+		if (rename_tempfile(&pack_temp, pack_path) ||
+		    rename_tempfile(&idx_temp, idx_path)) {
+			unlink(pack_path);
+			unlink(idx_path);
+			goto out;
+		}
+		cache = vex_source_open_verified_pack_cache(source, objects_path,
+						      artifact);
+		if (!cache) {
+			unlink(pack_path);
+			unlink(idx_path);
+			goto out;
+		}
+	}
+	vex_source_release_pack_cache(source);
+	source->pack_cache = cache;
+	cache = NULL;
+	source->pack_cache_id = xstrdup(pack_id);
+	source->pack_cache_path = xstrdup(objects_path);
+	ret = 0;
+
+out:
+	if (cache) {
+		odb_source_close(&cache->base);
+		odb_source_free(&cache->base);
+	}
+	delete_tempfile(&idx_temp);
+	delete_tempfile(&pack_temp);
+	rollback_lock_file(&lock);
+	free(lock_path);
+	free(idx_path);
+	free(pack_path);
+	free(pack_dir);
+	free(objects_path);
+	free(root);
+	return ret;
+}
+
+static int vex_source_refresh_pack_cache(struct odb_source_vex *source)
+{
+	struct vex_pack_artifact artifact;
+	char pack_id[GIT_MAX_HEXSZ + 1];
+	int ret;
+
+	ret = vex_store_current_pack(source->store, &artifact);
+	if (ret == VEX_STORE_ERR_NOT_FOUND) {
+		vex_source_release_pack_cache(source);
+		return 0;
+	}
+	if (ret)
+		return ret;
+	hash_to_hex_algop_r(pack_id, artifact.pack_id.hash,
+			    source->base.odb->repo->hash_algo);
+	if (source->pack_cache && source->pack_cache_id &&
+	    !strcmp(source->pack_cache_id, pack_id))
+		return 0;
+	ret = vex_source_install_pack_cache(source, &artifact, pack_id);
+	if (!ret)
+		trace_printf("vex: activated derived pack cache repo=%s pack=%s generation=%"PRIu64,
+			     vex_store_repo_id(source->store), pack_id,
+			     artifact.covering_generation);
+	return ret;
+}
+
 static int vex_source_open(struct odb_source_vex *source)
 {
+	int ret;
+
 	if (source->store)
 		return 0;
-	return vex_store_open_for_repository(source->base.odb->repo,
-					       source->base.odb->repo->gitdir,
-					       &source->store);
+	ret = vex_store_open_for_repository(source->base.odb->repo,
+					    source->base.odb->repo->gitdir,
+					    &source->store);
+	if (ret)
+		return ret;
+	/* The cache is strictly opportunistic: canonical Vex reads stay available. */
+	ret = vex_source_refresh_pack_cache(source);
+	if (ret)
+		trace_printf("vex: derived pack cache unavailable repo=%s (%d)",
+			     vex_store_repo_id(source->store), ret);
+	return 0;
 }
 
 static struct odb_transaction_vex *vex_source_transaction(
@@ -357,7 +598,7 @@ static void vex_populate_object_info(struct odb_source_vex *source,
 static int odb_source_vex_read_object_info(struct odb_source *base,
 					     const struct object_id *oid,
 					     struct object_info *oi,
-					     enum object_info_flags flags UNUSED)
+					     enum object_info_flags flags)
 {
 	struct odb_source_vex *source = container_of(base, struct odb_source_vex, base);
 	struct vex_epoch *epoch;
@@ -369,6 +610,15 @@ static int odb_source_vex_read_object_info(struct odb_source *base,
 
 	if (vex_source_open(source))
 		return -1;
+	if (flags & OBJECT_INFO_SECOND_READ) {
+		ret = vex_source_refresh_pack_cache(source);
+		if (ret)
+			trace_printf("vex: derived pack cache refresh unavailable repo=%s (%d)",
+				     vex_store_repo_id(source->store), ret);
+	}
+	if (source->pack_cache &&
+	    !odb_source_read_object_info(&source->pack_cache->base, oid, oi, flags))
+		return 0;
 
 	if (vex_source_active_epoch(source, &epoch))
 		return -1;
@@ -429,6 +679,9 @@ static int odb_source_vex_read_object_stream(struct odb_read_stream **out,
 
 	if (vex_source_open(source))
 		return -1;
+	if (source->pack_cache &&
+	    !odb_source_read_object_stream(out, &source->pack_cache->base, oid))
+		return 0;
 	if (vex_source_active_epoch(source, &epoch))
 		return -1;
 	if (epoch)
@@ -829,24 +1082,35 @@ static void odb_source_vex_close(struct odb_source *base)
 
 	vex_epoch_detach(source->inherited_epoch);
 	source->inherited_epoch = NULL;
+	vex_source_release_pack_cache(source);
 	if (source->store)
 		vex_store_close(source->store);
 	source->store = NULL;
 }
 
-static void odb_source_vex_prepare(struct odb_source *base UNUSED,
-					     enum odb_prepare_flags flags UNUSED)
+static void odb_source_vex_prepare(struct odb_source *base,
+					     enum odb_prepare_flags flags)
 {
+	struct odb_source_vex *source = container_of(base, struct odb_source_vex, base);
+	int ret;
+
+	if (vex_source_open(source))
+		return;
+	if (flags & ODB_PREPARE_FLUSH_CACHES) {
+		ret = vex_source_refresh_pack_cache(source);
+		if (ret)
+			trace_printf("vex: derived pack cache refresh unavailable repo=%s (%d)",
+				     vex_store_repo_id(source->store), ret);
+	}
+	if (source->pack_cache)
+		odb_source_prepare(&source->pack_cache->base, flags);
 }
 
 static void odb_source_vex_free(struct odb_source *base)
 {
 	struct odb_source_vex *source = container_of(base, struct odb_source_vex, base);
 
-	vex_epoch_detach(source->inherited_epoch);
-	source->inherited_epoch = NULL;
-	if (source->store)
-		vex_store_close(source->store);
+	odb_source_vex_close(base);
 	odb_source_release(base);
 	free(source);
 }
@@ -882,6 +1146,16 @@ struct odb_source *odb_source_vex_new(struct object_database *odb,
 bool odb_source_is_vex(const struct odb_source *source)
 {
 	return source && source->type == ODB_SOURCE_VEX;
+}
+
+struct odb_source_packed *odb_source_vex_packed_store(struct odb_source *base)
+{
+	struct odb_source_vex *source;
+
+	if (!odb_source_is_vex(base))
+		return NULL;
+	source = container_of(base, struct odb_source_vex, base);
+	return source->pack_cache;
 }
 
 bool repo_uses_vex_storage(const struct repository *repo)

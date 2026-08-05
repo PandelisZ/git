@@ -267,6 +267,7 @@ integration_tests = [
   't1519-vex-compose-mysql-s3-workflows.sh',
   't1520-vex-compose-clone-benchmark.sh',
   't1521-vex-compose-mysql-s3-pack-artifact.sh',
+  't1522-vex-compose-mysql-s3-pack-cache.sh',
   't1600-index.sh',
   't1601-index-bogus.sh',
   't1700-split-index.sh',

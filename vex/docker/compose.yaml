@@ -109,6 +109,9 @@ services:
       # Empty in normal operation.  The opt-in Compose fault gate sets this to
       # inject one staged-to-final S3 promotion failure in a server request.
       GIT_VEX_TEST_S3_FAIL_PROMOTE_ONCE: ${GIT_VEX_TEST_S3_FAIL_PROMOTE_ONCE:-}
+      # Test-only: reject all S3 byte reads after a derived pack has been
+      # materialized, proving that normal Git object reads use the cache.
+      GIT_VEX_TEST_S3_FAIL_READS: ${GIT_VEX_TEST_S3_FAIL_READS:-}
       GIT_VEX_SCRATCH: /var/git-scratch
       GIT_VEX_REPO_GIT_GIT_UUID: ${GIT_VEX_REPO_GIT_GIT_UUID}
       VEX_GIT_HTTP_COMMAND: ${VEX_GIT_HTTP_COMMAND:-/usr/local/lib/vex-git-http/vex_mysql_s3_http.py}

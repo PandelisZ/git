@@ -39,7 +39,14 @@ up_args=()
 case "${VEX_COMPOSE_NO_BUILD:-}" in
 1|true|yes) up_args+=(--no-build) ;;
 esac
-"$repo_root/scripts/vex/up.sh" "${up_args[@]}" >/dev/null
+# The focused Compose E2E gates bring the stack up themselves.  Reusing that
+# already-healthy topology avoids a second full Compose --wait without making
+# this operator command silently accept a missing service: the container IDs
+# below remain mandatory before any pack bytes are built or registered.
+case "${VEX_COMPOSE_ALREADY_UP:-}" in
+1|true|yes) ;;
+*) "$repo_root/scripts/vex/up.sh" "${up_args[@]}" >/dev/null ;;
+esac
 
 [ -f "$env_file" ] || env_file="$docker_dir/.env.example"
 set -a

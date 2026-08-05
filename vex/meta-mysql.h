@@ -62,6 +62,20 @@ struct vex_meta_mysql_object {
 	char *blob_key;
 };
 
+/*
+ * Metadata-only description of one derived pack which is safe to select for
+ * the repository's current sealed generation.  pack_id uses the schema's
+ * BINARY(32) form: SHA-1 IDs are zero-padded and SHA-256 IDs fill the array.
+ * Neither key contains pack bytes; release it with
+ * vex_meta_mysql_pack_release().
+ */
+struct vex_meta_mysql_pack {
+	unsigned char pack_id[VEX_META_MYSQL_OID_BYTES];
+	uint64_t covering_generation;
+	char *pack_key;
+	char *idx_key;
+};
+
 struct vex_meta_mysql_options {
 	const char *host;
 	unsigned int port;
@@ -148,6 +162,17 @@ int vex_meta_mysql_object_get_visible(struct vex_meta_mysql *db,
 				      uint64_t visible_generation,
 				      struct vex_meta_mysql_object *object);
 void vex_meta_mysql_object_release(struct vex_meta_mysql_object *object);
+
+/*
+ * Select a sealed derived pack only when it covers the latest sealed
+ * repository generation.  This equality guard keeps a builder which raced a
+ * newer push from becoming readable merely because its row says "sealed".
+ */
+int vex_meta_mysql_current_sealed_pack(struct vex_meta_mysql *db,
+				       const char *repo_id,
+				       const struct git_hash_algo *hash_algo,
+				       struct vex_meta_mysql_pack *pack);
+void vex_meta_mysql_pack_release(struct vex_meta_mysql_pack *pack);
 
 /* Store only commit-graph edge metadata; neither object contains Git bytes. */
 int vex_meta_mysql_add_commit_parent(struct vex_meta_mysql *db,

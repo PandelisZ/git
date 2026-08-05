@@ -437,6 +437,7 @@ Healthchecks + `restart: on-failure`. Exact YAML at implement time.
 - MinIO as S3 stand-in; MySQL 8; optional Valkey; smart HTTP on localhost.
 - Active Stage 4 evidence: `vex-git-http-1`, `vex-mysql-1`, and `vex-minio-1` run under the `vex` Compose project; `t1497` passes stock Git HTTPS P0/P1 basics and verifies MySQL plus MinIO after the wire operation.
 - Active write-boundary evidence: `t1498` passes 20× batch=1 against the active MySQL+S3 server with fresh reconciliation (latest p50 `1622.890ms`, p90 `2332.091ms`, p99 `2556.664ms`); `t1499` passes rejected-receive compensation; and `t1500` passes simultaneous first pushes to two distinct repositories after converting `ref_updates.id` to a repository-scoped audit sequence. These are functional/write-path measurements, not L4 clone results.
+- Derived-pack cache evidence: `t1521` builds a custom-Git pack/index in per-repository S3 keys and retains its MySQL envelope after a later receive. `t1522` cold-materializes the current sealed artifact under the `vex_git_scratch` volume, faults every S3 byte GET, and passes a new stock-Git clone plus `fsck`. This is a bounded server-side object-cache check, not direct pack streaming to the client or an L4 benchmark.
 
 ## Open Questions
 

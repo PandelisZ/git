@@ -31,6 +31,8 @@ struct vex_blob_s3 {
 	int insecure_tls;
 	/* Test-only one-shot fault for receive-epoch compensation coverage. */
 	int test_fail_promote_once;
+	/* Test-only fault for proving a derived-pack cache serves object bytes. */
+	int test_fail_reads;
 };
 
 static int contains_control(const char *value)
@@ -337,6 +339,8 @@ static int read_key(struct vex_blob_s3 *blob, const char *key,
 	int fd = -1;
 	int ret;
 
+	if (blob->test_fail_reads)
+		return VEX_BLOB_S3_ERR_UNAVAILABLE;
 	if (!data || !size)
 		return VEX_BLOB_S3_ERR_INVALID;
 	*data = NULL;
@@ -374,6 +378,38 @@ static int read_key(struct vex_blob_s3 *blob, const char *key,
 		close(fd);
 	delete_tempfile(&temp);
 	return ret;
+}
+
+static int download_key(struct vex_blob_s3 *blob, const char *key,
+			const char *destination)
+{
+	struct strbuf url = STRBUF_INIT;
+	int ret;
+
+	if (blob->test_fail_reads)
+		return VEX_BLOB_S3_ERR_UNAVAILABLE;
+	if (!destination || !*destination || contains_control(destination))
+		return VEX_BLOB_S3_ERR_INVALID;
+	ret = make_url(blob, key, &url);
+	if (!ret)
+		ret = run_curl(blob, "GET", url.buf, NULL, destination, NULL);
+	strbuf_release(&url);
+	return ret;
+}
+
+static int derived_pack_key(const struct vex_blob_s3 *blob,
+			    const unsigned char *pack_id, size_t pack_id_len,
+			    int index, struct strbuf *key)
+{
+	char hex[GIT_MAX_HEXSZ + 1];
+
+	if (!blob || !blob->hash_algo || !pack_id ||
+	    pack_id_len != blob->hash_algo->rawsz || !key)
+		return VEX_BLOB_S3_ERR_INVALID;
+	hash_to_hex_algop_r(hex, pack_id, blob->hash_algo);
+	strbuf_addf(key, "git/v1/%s/packs/%s.%s", blob->repo_id, hex,
+		    index ? "idx" : "pack");
+	return VEX_BLOB_S3_OK;
 }
 
 int vex_blob_s3_open(struct vex_blob_s3 **blob_out,
@@ -421,6 +457,13 @@ int vex_blob_s3_open(struct vex_blob_s3 **blob_out,
 	 */
 	blob->test_fail_promote_once =
 		git_env_bool("GIT_VEX_TEST_S3_FAIL_PROMOTE_ONCE", 0) == 1;
+	/*
+	 * This deliberately affects every S3 byte-read (canonical object or
+	 * derived pack).  The Compose cache test first materializes and verifies
+	 * the pair, then turns this on to prove the next request uses no S3 bytes.
+	 */
+	blob->test_fail_reads =
+		git_env_bool("GIT_VEX_TEST_S3_FAIL_READS", 0) == 1;
 	*blob_out = blob;
 	return VEX_BLOB_S3_OK;
 }
@@ -587,6 +630,22 @@ int vex_blob_s3_read_staging(struct vex_blob_s3 *blob, uint64_t epoch,
 	ret = vex_blob_s3_staging_key(blob, epoch, oid, &key);
 	if (!ret)
 		ret = read_key(blob, key.buf, data, size);
+	strbuf_release(&key);
+	return ret;
+}
+
+int vex_blob_s3_download_derived_pack(struct vex_blob_s3 *blob,
+				      const unsigned char *pack_id,
+				      size_t pack_id_len,
+				      int index,
+				      const char *destination)
+{
+	struct strbuf key = STRBUF_INIT;
+	int ret;
+
+	ret = derived_pack_key(blob, pack_id, pack_id_len, index, &key);
+	if (!ret)
+		ret = download_key(blob, key.buf, destination);
 	strbuf_release(&key);
 	return ret;
 }

@@ -191,6 +191,28 @@ void vex_meta_mysql_object_release(struct vex_meta_mysql_object *object)
 	memset(object, 0, sizeof(*object));
 }
 
+int vex_meta_mysql_current_sealed_pack(struct vex_meta_mysql *db,
+				       const char *repo_id,
+				       const struct git_hash_algo *hash_algo,
+				       struct vex_meta_mysql_pack *pack)
+{
+	(void)db;
+	(void)repo_id;
+	(void)hash_algo;
+	if (pack)
+		memset(pack, 0, sizeof(*pack));
+	return mysql_unavailable();
+}
+
+void vex_meta_mysql_pack_release(struct vex_meta_mysql_pack *pack)
+{
+	if (!pack)
+		return;
+	free(pack->pack_key);
+	free(pack->idx_key);
+	memset(pack, 0, sizeof(*pack));
+}
+
 int vex_meta_mysql_add_commit_parent(struct vex_meta_mysql *db,
 			     const char *repo_id,
 			     const unsigned char *commit_oid, size_t commit_oid_len,
@@ -2003,6 +2025,107 @@ static int state_query_result(struct vex_meta_mysql *db, const char *sql,
 	return VEX_META_MYSQL_OK;
 }
 
+int vex_meta_mysql_current_sealed_pack(struct vex_meta_mysql *db,
+				       const char *repo_id,
+				       const struct git_hash_algo *hash_algo,
+				       struct vex_meta_mysql_pack *pack)
+{
+	char *repo = NULL;
+	char *sql = NULL;
+	MYSQL_RES *res = NULL;
+	MYSQL_ROW row;
+	unsigned long *lengths;
+	struct object_id checked_id;
+	char *pack_key = NULL;
+	char *idx_key = NULL;
+	uint64_t covering_generation;
+	int ret = VEX_META_MYSQL_ERR;
+
+	if (!db || !db->mysql || !repo_id || !hash_algo || !pack)
+		return VEX_META_MYSQL_ERR_INVALID;
+	memset(pack, 0, sizeof(*pack));
+	repo = sql_repo_literal(repo_id, NULL);
+	if (!repo) {
+		ret = set_error(db, VEX_META_MYSQL_ERR_INVALID,
+				"invalid Vex repository UUID for pack selection");
+		goto out;
+	}
+	/*
+	 * A build can sample a generation before a concurrent push seals a newer
+	 * one, then insert its row afterwards.  Selecting by state alone would
+	 * make that stale snapshot readable.  Require exact equality with the
+	 * newest sealed generation on every selection instead.
+	 */
+	sql = vex_format("SELECT p.pack_id, p.pack_key, p.idx_key, "
+			 "p.covering_generation FROM pack_envelopes AS p "
+			 "WHERE p.repo_id = %s AND p.state = 'sealed' "
+			 "AND p.idx_key IS NOT NULL AND p.covering_generation = "
+			 "(SELECT MAX(g.generation) FROM generations AS g "
+			 "WHERE g.repo_id = %s AND g.state = 'sealed') "
+			 "ORDER BY p.sealed_at DESC, p.pack_id LIMIT 1",
+			 repo, repo);
+	if (!sql) {
+		ret = set_error(db, VEX_META_MYSQL_ERR_NOMEM,
+				"could not allocate current Vex pack query");
+		goto out;
+	}
+	ret = state_query_result(db, sql, &res);
+	if (ret)
+		goto out;
+	if (mysql_num_fields(res) != 4) {
+		ret = set_error(db, VEX_META_MYSQL_ERR,
+				"MySQL returned invalid Vex current-pack metadata");
+		goto out;
+	}
+	row = mysql_fetch_row(res);
+	if (!row) {
+		ret = VEX_META_MYSQL_ERR_NOT_FOUND;
+		goto out;
+	}
+	lengths = mysql_fetch_lengths(res);
+	if (!row[0] || !row[1] || !row[2] || !row[3] || !lengths ||
+	    lengths[0] != VEX_META_MYSQL_OID_BYTES || !lengths[1] ||
+	    lengths[1] > 512 || !lengths[2] || lengths[2] > 512 ||
+	    parse_u64(row[3], &covering_generation) ||
+	    state_oid_from_binary(row[0], lengths[0], hash_algo, &checked_id)) {
+		ret = set_error(db, VEX_META_MYSQL_ERR,
+				"MySQL returned invalid Vex current-pack metadata");
+		goto out;
+	}
+	pack_key = state_row_text(row[1], lengths[1]);
+	idx_key = state_row_text(row[2], lengths[2]);
+	if (!pack_key || !idx_key) {
+		ret = set_error(db, VEX_META_MYSQL_ERR,
+				"MySQL returned unsafe Vex current-pack keys");
+		goto out;
+	}
+	memcpy(pack->pack_id, row[0], sizeof(pack->pack_id));
+	pack->covering_generation = covering_generation;
+	pack->pack_key = pack_key;
+	pack->idx_key = idx_key;
+	pack_key = NULL;
+	idx_key = NULL;
+	ret = VEX_META_MYSQL_OK;
+
+out:
+	free(idx_key);
+	free(pack_key);
+	if (res)
+		mysql_free_result(res);
+	free(sql);
+	free(repo);
+	return ret;
+}
+
+void vex_meta_mysql_pack_release(struct vex_meta_mysql_pack *pack)
+{
+	if (!pack)
+		return;
+	free(pack->pack_key);
+	free(pack->idx_key);
+	memset(pack, 0, sizeof(*pack));
+}
+
 static int state_verify_repository(struct vex_meta_mysql *db, const char *repo,
 				   const struct git_hash_algo *hash_algo)
 {
@@ -3317,6 +3440,28 @@ int vex_meta_mysql_state_save_locked(struct vex_meta_mysql *db,
 	return ret;
 }
 #else /* VEX_META_MYSQL_STORE */
+
+int vex_meta_mysql_current_sealed_pack(struct vex_meta_mysql *db,
+				       const char *repo_id,
+				       const struct git_hash_algo *hash_algo,
+				       struct vex_meta_mysql_pack *pack)
+{
+	(void)repo_id;
+	(void)hash_algo;
+	if (pack)
+		memset(pack, 0, sizeof(*pack));
+	return set_error(db, VEX_META_MYSQL_ERR_STATE,
+			 "Vex MySQL store adapter was not compiled into this binary");
+}
+
+void vex_meta_mysql_pack_release(struct vex_meta_mysql_pack *pack)
+{
+	if (!pack)
+		return;
+	free(pack->pack_key);
+	free(pack->idx_key);
+	memset(pack, 0, sizeof(*pack));
+}
 
 int vex_meta_mysql_state_lock(struct vex_meta_mysql *db, const char *repo_id)
 {

@@ -17,6 +17,7 @@
 
 #include "hash.h"
 
+#include <stddef.h>
 #include <stdint.h>
 
 struct strbuf;
@@ -77,5 +78,17 @@ int vex_blob_s3_read_final(struct vex_blob_s3 *blob,
 int vex_blob_s3_read_staging(struct vex_blob_s3 *blob, uint64_t epoch,
 			     const struct object_id *oid,
 			     void **data, unsigned long *size);
+
+/*
+ * Stream one immutable derived-pack component into an already-created local
+ * temporary file.  The key is derived from this blob handle's repository and
+ * hash algorithm rather than accepted from the caller, so metadata cannot
+ * redirect a cache read outside its own packs namespace.
+ */
+int vex_blob_s3_download_derived_pack(struct vex_blob_s3 *blob,
+				      const unsigned char *pack_id,
+				      size_t pack_id_len,
+				      int index,
+				      const char *destination);
 
 #endif /* VEX_BLOB_S3_H */

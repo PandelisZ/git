@@ -1354,6 +1354,74 @@ int vex_store_read_object_in_epoch(struct vex_store *store,
 	return read_object(store, epoch, oid, type, size, data);
 }
 
+static int current_pack_keys_match(const struct vex_store *store,
+				   const struct vex_meta_mysql_pack *pack)
+{
+	char pack_hex[GIT_MAX_HEXSZ + 1];
+	struct strbuf expected_pack = STRBUF_INIT;
+	struct strbuf expected_idx = STRBUF_INIT;
+	int matches;
+
+	if (!store || !pack || !pack->pack_key || !pack->idx_key)
+		return 0;
+	hash_to_hex_algop_r(pack_hex, pack->pack_id, store->hash_algo);
+	strbuf_addf(&expected_pack, "git/v1/%s/packs/%s.pack", store->repo_id,
+		    pack_hex);
+	strbuf_addf(&expected_idx, "git/v1/%s/packs/%s.idx", store->repo_id,
+		    pack_hex);
+	matches = !strcmp(pack->pack_key, expected_pack.buf) &&
+		!strcmp(pack->idx_key, expected_idx.buf);
+	strbuf_release(&expected_idx);
+	strbuf_release(&expected_pack);
+	return matches;
+}
+
+int vex_store_current_pack(struct vex_store *store,
+			   struct vex_pack_artifact *artifact)
+{
+	struct vex_meta_mysql_pack pack = { 0 };
+	int ret;
+
+	if (!store || !artifact)
+		return VEX_STORE_ERR_INVALID;
+	memset(artifact, 0, sizeof(*artifact));
+	if (store->backend != VEX_STORE_BACKEND_MYSQL_S3)
+		return VEX_STORE_ERR_NOT_FOUND;
+	ret = meta_mysql_result(vex_meta_mysql_current_sealed_pack(
+		store->meta_mysql, store->repo_id, store->hash_algo, &pack));
+	if (ret)
+		return ret;
+	if (!current_pack_keys_match(store, &pack)) {
+		vex_meta_mysql_pack_release(&pack);
+		return VEX_STORE_ERR_CORRUPT;
+	}
+	memcpy(artifact->pack_id.hash, pack.pack_id, store->hash_algo->rawsz);
+	artifact->covering_generation = pack.covering_generation;
+	vex_meta_mysql_pack_release(&pack);
+	return VEX_STORE_OK;
+}
+
+int vex_store_download_pack(struct vex_store *store,
+			    const struct vex_pack_artifact *artifact,
+			    const char *pack_destination,
+			    const char *idx_destination)
+{
+	int ret;
+
+	if (!store || !artifact || !pack_destination || !idx_destination)
+		return VEX_STORE_ERR_INVALID;
+	if (store->backend != VEX_STORE_BACKEND_MYSQL_S3)
+		return VEX_STORE_ERR_NOT_FOUND;
+	ret = vex_blob_s3_download_derived_pack(store->blob_s3,
+		artifact->pack_id.hash, store->hash_algo->rawsz, 0,
+		pack_destination);
+	if (ret)
+		return blob_s3_result(ret);
+	return blob_s3_result(vex_blob_s3_download_derived_pack(
+		store->blob_s3, artifact->pack_id.hash, store->hash_algo->rawsz, 1,
+		idx_destination));
+}
+
 static int compare_object_ptrs(const void *a, const void *b)
 {
 	const struct vex_meta_object *const *left = a;
