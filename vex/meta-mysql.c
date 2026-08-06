@@ -5443,6 +5443,18 @@ struct vex_meta_mysql_saved_pack_object {
 	unsigned char oid[VEX_META_MYSQL_OID_BYTES];
 };
 
+/*
+ * An offset is derived-pack metadata, not an object payload.  It must travel
+ * with its immutable envelope through the state adapter's replacement
+ * transaction, otherwise its foreign key would prevent that adapter from
+ * replacing a later receive's ordinary state.
+ */
+struct vex_meta_mysql_saved_pack_offset {
+	unsigned char pack_id[VEX_META_MYSQL_OID_BYTES];
+	unsigned char oid[VEX_META_MYSQL_OID_BYTES];
+	uint64_t pack_offset;
+};
+
 struct vex_meta_mysql_saved_packs {
 	struct vex_meta_mysql_saved_pack *items;
 	size_t nr;
@@ -5450,6 +5462,9 @@ struct vex_meta_mysql_saved_packs {
 	struct vex_meta_mysql_saved_pack_object *objects;
 	size_t objects_nr;
 	size_t objects_alloc;
+	struct vex_meta_mysql_saved_pack_offset *offsets;
+	size_t offsets_nr;
+	size_t offsets_alloc;
 };
 
 static void state_saved_pins_release(struct vex_meta_mysql_saved_pins *pins)
@@ -5494,6 +5509,7 @@ static void state_saved_packs_release(struct vex_meta_mysql_saved_packs *packs)
 	}
 	free(packs->items);
 	free(packs->objects);
+	free(packs->offsets);
 	memset(packs, 0, sizeof(*packs));
 }
 
@@ -5707,6 +5723,47 @@ static int state_load_packs(struct vex_meta_mysql *db, const char *repo,
 		object = &packs->objects[packs->objects_nr++];
 		memcpy(object->pack_id, row[0], sizeof(object->pack_id));
 		memcpy(object->oid, row[1], sizeof(object->oid));
+	}
+	mysql_free_result(res);
+	res = NULL;
+
+	/*
+	 * Preserve the offset map separately from pack_objects: a later range-read
+	 * path can use it without making MySQL hold pack bytes, and its envelope FK
+	 * requires it to be restored in this same state replacement transaction.
+	 */
+	sql = vex_format("SELECT ppo.pack_id, ppo.oid, ppo.pack_offset "
+			 "FROM pack_object_offsets AS ppo "
+			 "INNER JOIN pack_envelopes AS p "
+			 "ON p.repo_id = ppo.repo_id AND p.pack_id = ppo.pack_id "
+			 "WHERE ppo.repo_id = %s AND p.source_kind = 'derived' "
+			 "ORDER BY ppo.pack_id, ppo.oid", repo);
+	if (!sql)
+		return set_error(db, VEX_META_MYSQL_ERR_NOMEM,
+				 "could not allocate Vex pack-offset preservation query");
+	ret = state_query_result(db, sql, &res);
+	free(sql);
+	if (ret)
+		return ret;
+	while ((row = mysql_fetch_row(res))) {
+		struct vex_meta_mysql_saved_pack_offset *offset;
+		uint64_t pack_offset;
+
+		lengths = mysql_fetch_lengths(res);
+		if (!row[0] || !row[1] || !row[2] || !lengths ||
+		    lengths[0] != VEX_META_MYSQL_OID_BYTES ||
+		    lengths[1] != VEX_META_MYSQL_OID_BYTES ||
+		    parse_u64(row[2], &pack_offset)) {
+			ret = set_error(db, VEX_META_MYSQL_ERR,
+					"MySQL returned invalid Vex pack offset metadata");
+			goto out;
+		}
+		ALLOC_GROW(packs->offsets, packs->offsets_nr + 1,
+			   packs->offsets_alloc);
+		offset = &packs->offsets[packs->offsets_nr++];
+		memcpy(offset->pack_id, row[0], sizeof(offset->pack_id));
+		memcpy(offset->oid, row[1], sizeof(offset->oid));
+		offset->pack_offset = pack_offset;
 	}
 	mysql_free_result(res);
 	return VEX_META_MYSQL_OK;
@@ -6433,13 +6490,43 @@ static int state_insert_packs(struct vex_meta_mysql *db, const char *repo,
 		if (ret)
 			return ret;
 	}
+	for (i = 0; i < packs->offsets_nr; i++) {
+		const struct vex_meta_mysql_saved_pack_offset *offset =
+			&packs->offsets[i];
+		char *pack_id = sql_hex_literal(offset->pack_id,
+					       sizeof(offset->pack_id));
+		char *oid = sql_hex_literal(offset->oid, sizeof(offset->oid));
+		char *sql;
+		int ret;
+
+		if (!pack_id || !oid) {
+			free(oid);
+			free(pack_id);
+			return set_error(db, VEX_META_MYSQL_ERR_NOMEM,
+					 "could not encode preserved Vex pack offset metadata");
+		}
+		sql = vex_format("INSERT INTO pack_object_offsets "
+				 "(repo_id, pack_id, oid, pack_offset) "
+				 "VALUES (%s, %s, %s, %" PRIu64 ")",
+				 repo, pack_id, oid, offset->pack_offset);
+		free(oid);
+		free(pack_id);
+		if (!sql)
+			return set_error(db, VEX_META_MYSQL_ERR_NOMEM,
+					 "could not allocate Vex pack-offset restore query");
+		ret = mysql_exec(db, sql);
+		free(sql);
+		if (ret)
+			return ret;
+	}
 	return VEX_META_MYSQL_OK;
 }
 
 static int state_delete_rows(struct vex_meta_mysql *db, const char *repo)
 {
 	static const char *const tables[] = {
-		"commit_parents", "object_pins", "generation_objects", "pack_objects",
+		"commit_parents", "object_pins", "generation_objects",
+		"pack_object_offsets", "pack_objects",
 		"pack_envelopes", "objects",
 		"generations", "refs", "ref_updates",
 	};
@@ -6449,7 +6536,14 @@ static int state_delete_rows(struct vex_meta_mysql *db, const char *repo)
 		char *sql;
 		int ret;
 
-		if (!strcmp(tables[i], "pack_objects"))
+		if (!strcmp(tables[i], "pack_object_offsets"))
+			sql = vex_format("DELETE ppo FROM pack_object_offsets AS ppo "
+					 "INNER JOIN pack_envelopes AS p "
+					 "ON p.repo_id = ppo.repo_id "
+					 "AND p.pack_id = ppo.pack_id "
+					 "WHERE ppo.repo_id = %s "
+					 "AND p.source_kind = 'derived'", repo);
+		else if (!strcmp(tables[i], "pack_objects"))
 			sql = vex_format("DELETE po FROM pack_objects AS po "
 					 "INNER JOIN pack_envelopes AS p "
 					 "ON p.repo_id = po.repo_id AND p.pack_id = po.pack_id "

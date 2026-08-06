@@ -152,6 +152,33 @@ registered_before=$(mysql_query "
 	exit 1
 }
 
+# The pack worker persists OID-to-pack offsets independently of loose object
+# metadata. Seed one real pack/member row before the next normal receive: the
+# state replacement must preserve it as well as the envelope/membership, or
+# its FK would make the receive fail while deleting the old derived envelope.
+IFS=$'\t' read -r offset_pack_id offset_oid <<EOF
+$(mysql_query "
+	SELECT HEX(p.pack_id), HEX(po.oid)
+	  FROM pack_envelopes AS p
+	  JOIN pack_objects AS po
+	    ON po.repo_id = p.repo_id AND po.pack_id = p.pack_id
+	 WHERE p.repo_id = UNHEX('$repo_id')
+	 ORDER BY p.pack_id, po.oid
+	 LIMIT 1;")
+EOF
+case "$offset_pack_id:$offset_oid" in
+????????????????????????????????????????????????????????????????:????????????????????????????????????????????????????????????????) ;;
+*)
+	printf 'vex pack artifact E2E: could not select a derived pack offset fixture: %s:%s\n' \
+		"$offset_pack_id" "$offset_oid" >&2
+	exit 1
+	;;
+esac
+mysql_query "
+	INSERT INTO pack_object_offsets (repo_id, pack_id, oid, pack_offset)
+	VALUES (UNHEX('$repo_id'), UNHEX('$offset_pack_id'), UNHEX('$offset_oid'), 4242);" \
+	>/dev/null
+
 # This pushes through the state-replacement adapter after pack registration.
 # The immutable envelope/object map must survive, but its sealed generation is
 # no longer current and must be marked obsolete before any serving path can
@@ -166,6 +193,17 @@ registered_after=$(mysql_query "
 [ "$registered_after" = "$registered_before" ] || {
 	printf 'vex pack artifact E2E: post-pack push lost object membership (%s -> %s)\n' \
 		"$registered_before" "$registered_after" >&2
+	exit 1
+}
+offsets_after=$(mysql_query "
+	SELECT CONCAT(COUNT(*), ':', COALESCE(MAX(pack_offset), 0))
+	  FROM pack_object_offsets
+	 WHERE repo_id = UNHEX('$repo_id')
+	   AND pack_id = UNHEX('$offset_pack_id')
+	   AND oid = UNHEX('$offset_oid');")
+[ "$offsets_after" = '1:4242' ] || {
+	printf 'vex pack artifact E2E: post-pack push did not preserve pack offset metadata: %s\n' \
+		"$offsets_after" >&2
 	exit 1
 }
 envelopes_after=$(mysql_query "
