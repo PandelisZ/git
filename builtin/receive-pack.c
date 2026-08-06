@@ -2058,6 +2058,7 @@ static void execute_commands(struct command *commands,
 	struct async muxer;
 	int err_fd = 0;
 	int run_proc_receive = 0;
+	int use_vex = repo_uses_vex_storage(the_repository);
 
 	if (unpacker_error) {
 		for (cmd = commands; cmd; cmd = cmd->next)
@@ -2137,13 +2138,18 @@ static void execute_commands(struct command *commands,
 	 * Now we'll start writing out refs, which means the objects need
 	 * to be in their final positions so that other processes can see them.
 	 */
-	if (!repo_uses_vex_storage(the_repository) &&
-	    odb_transaction_commit(transaction)) {
-		for (cmd = commands; cmd; cmd = cmd->next) {
-			if (!cmd->error_string)
-				cmd->error_string = "unable to migrate objects to permanent storage";
+	if (!use_vex) {
+		int ret = odb_transaction_commit(transaction);
+
+		/* odb_transaction_commit() owns and frees classic transactions. */
+		transaction = NULL;
+		if (ret) {
+			for (cmd = commands; cmd; cmd = cmd->next) {
+				if (!cmd->error_string)
+					cmd->error_string = "unable to migrate objects to permanent storage";
+			}
+			return;
 		}
-		return;
 	}
 
 	check_aliased_updates(commands);
@@ -2161,7 +2167,8 @@ static void execute_commands(struct command *commands,
 			    (cmd->run_proc_receive || use_atomic))
 				cmd->error_string = "fail to run proc-receive hook";
 
-	if (use_atomic || odb_vex_receive_transaction_is_active(transaction))
+	if (use_atomic || (use_vex &&
+			   odb_vex_receive_transaction_is_active(transaction)))
 		execute_commands_atomic(commands, si);
 	else
 		execute_commands_non_atomic(commands, si);
