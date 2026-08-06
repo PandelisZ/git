@@ -1149,9 +1149,8 @@ static int odb_source_vex_read_object_info(struct odb_source *base,
 		return 0;
 	}
 
-	ret = vex_object_index_get(source->store, oid, &info);
-	if (ret || (info.state != VEX_OBJECT_PUBLISHED &&
-		    (!epoch || info.epoch != vex_epoch_id(epoch))))
+	ret = vex_object_index_get_visible(source->store, epoch, oid, &info);
+	if (ret)
 		return -1;
 	vex_populate_object_info(source, oi, info.type, info.size, NULL);
 	return 0;
@@ -1405,9 +1404,8 @@ static int odb_source_vex_freshen_object(struct odb_source *base,
 		return 1;
 	if (vex_source_active_epoch(source, &epoch))
 		return 0;
-	if (epoch && !vex_object_index_get(source->store, oid, &info) &&
-	    (info.state == VEX_OBJECT_PUBLISHED ||
-	     info.epoch == vex_epoch_id(epoch)))
+	if (epoch && !vex_object_index_get_visible(source->store, epoch, oid,
+						      &info))
 		return 1;
 	return vex_store_has_object(source->store, oid) > 0;
 }

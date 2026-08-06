@@ -255,6 +255,15 @@ int vex_object_index_publish(struct vex_store *store,
 int vex_object_index_get(struct vex_store *store,
 			   const struct object_id *oid,
 			   struct vex_object_info *info);
+/*
+ * Return object metadata only when it is public, or when @epoch owns its
+ * still-open quarantine claim.  This is the ODB read-side visibility
+ * boundary; it deliberately does not expose another receive's objects.
+ */
+int vex_object_index_get_visible(struct vex_store *store,
+				 const struct vex_epoch *epoch,
+				 const struct object_id *oid,
+				 struct vex_object_info *info);
 
 /* Blob-before-metadata convenience operation used by ODB write paths. */
 int vex_store_stage_object(struct vex_store *store,

@@ -2266,6 +2266,92 @@ int vex_object_index_get(struct vex_store *store, const struct object_id *oid,
 	return ret;
 }
 
+/*
+ * The MySQL/S3 backend stores object bytes only in the blob backend.  Its
+ * ordinary ODB reads must therefore not materialize the entire repository
+ * state merely to learn one object's type, size, and visibility.  The direct
+ * query is indexed by (repo_id, oid) and has the same public-or-own-open-epoch
+ * predicate as object_is_visible().
+ */
+static int mysql_object_index_get_visible(struct vex_store *store,
+					  const struct vex_epoch *epoch,
+					  const struct object_id *oid,
+					  struct vex_object_info *info)
+{
+	struct vex_meta_mysql_object object = { 0 };
+	struct strbuf expected_key = STRBUF_INIT;
+	int ret;
+
+	ret = meta_mysql_result(vex_meta_mysql_object_get_visible(
+		store->meta_mysql, store->repo_id, oid->hash,
+		store->hash_algo->rawsz, epoch ? epoch->id : 0, &object));
+	if (ret)
+		goto out;
+	/*
+	 * Current object blobs have one canonical, content-addressed key.  The S3
+	 * adapter derives that key from @oid before every read; checking the stored
+	 * metadata here preserves the old state-loader integrity boundary without
+	 * ever treating a MySQL value as an arbitrary S3 read target.
+	 */
+	if (!object.generation || object.size > ULONG_MAX ||
+	    !valid_object_type((enum object_type)object.object_type) ||
+	    vex_blob_key(store, oid, &expected_key) || !object.blob_key ||
+	    strcmp(object.blob_key, expected_key.buf)) {
+		ret = VEX_STORE_ERR_CORRUPT;
+		goto out;
+	}
+	info->type = (enum object_type)object.object_type;
+	info->size = (unsigned long)object.size;
+	info->epoch = object.generation;
+	switch (object.state) {
+	case VEX_META_MYSQL_OBJECT_QUARANTINE:
+		info->state = VEX_OBJECT_QUARANTINE;
+		break;
+	case VEX_META_MYSQL_OBJECT_PUBLISHED:
+		info->state = VEX_OBJECT_PUBLISHED;
+		break;
+	default:
+		ret = VEX_STORE_ERR_CORRUPT;
+		goto out;
+	}
+	ret = VEX_STORE_OK;
+out:
+	strbuf_release(&expected_key);
+	vex_meta_mysql_object_release(&object);
+	return ret;
+}
+
+int vex_object_index_get_visible(struct vex_store *store,
+				 const struct vex_epoch *epoch,
+				 const struct object_id *oid,
+				 struct vex_object_info *info)
+{
+	struct vex_meta_state state;
+	struct vex_meta_object *object;
+	int ret;
+
+	if (!oid || !info)
+		return VEX_STORE_ERR_INVALID;
+	if ((ret = check_optional_epoch(store, epoch)))
+		return ret;
+	if (store->backend == VEX_STORE_BACKEND_MYSQL_S3)
+		return mysql_object_index_get_visible(store, epoch, oid, info);
+	if ((ret = meta_load(store, &state)))
+		return ret;
+	object = find_object(&state, oid);
+	if (!object || !object_is_visible(&state, object, epoch)) {
+		ret = VEX_STORE_ERR_NOT_FOUND;
+	} else {
+		info->type = object->type;
+		info->size = object->size;
+		info->epoch = object->epoch;
+		info->state = object->state;
+		ret = VEX_STORE_OK;
+	}
+	vex_meta_state_release(&state);
+	return ret;
+}
+
 int vex_store_stage_object(struct vex_store *store, struct vex_epoch *epoch,
 			   const struct object_id *oid, enum object_type type,
 			   const void *data, unsigned long size)
@@ -2290,23 +2376,19 @@ int vex_store_stage_object(struct vex_store *store, struct vex_epoch *epoch,
 
 int vex_store_has_object(struct vex_store *store, const struct object_id *oid)
 {
-	struct vex_meta_state state;
-	struct vex_meta_object *object;
+	struct vex_object_info info;
 	int ret;
 
 	if (!store || !oid)
 		return VEX_STORE_ERR_INVALID;
-	if ((ret = meta_load(store, &state)))
-		return ret;
-	object = find_object(&state, oid);
-	if (!object || object->state != VEX_OBJECT_PUBLISHED) {
+	ret = vex_object_index_get_visible(store, NULL, oid, &info);
+	if (ret == VEX_STORE_ERR_NOT_FOUND) {
 		ret = 0;
-	} else {
+	} else if (!ret) {
 		ret = blob_backend_has_final(store, oid);
 		if (!ret)
 			ret = VEX_STORE_ERR_CORRUPT;
 	}
-	vex_meta_state_release(&state);
 	return ret;
 }
 
@@ -2314,8 +2396,7 @@ static int read_object(struct vex_store *store, const struct vex_epoch *epoch,
 		       const struct object_id *oid, enum object_type *type,
 		       unsigned long *size, void **data)
 {
-	struct vex_meta_state state;
-	struct vex_meta_object *object;
+	struct vex_object_info info;
 	void *contents = NULL;
 	unsigned long contents_size;
 	int ret;
@@ -2323,35 +2404,32 @@ static int read_object(struct vex_store *store, const struct vex_epoch *epoch,
 	if (!store || !oid || !type || !size || !data)
 		return VEX_STORE_ERR_INVALID;
 	*data = NULL;
-	if ((ret = meta_load(store, &state)))
-		return ret;
-	object = find_object(&state, oid);
-	if (!object || (object->state != VEX_OBJECT_PUBLISHED &&
-		(!epoch || !epoch_has_object(&state, epoch->id, oid)))) {
-		ret = VEX_STORE_ERR_NOT_FOUND;
+	if ((ret = vex_object_index_get_visible(store, epoch, oid, &info)))
 		goto out;
-	}
-	if (object->state == VEX_OBJECT_PUBLISHED) {
+	if (info.state == VEX_OBJECT_PUBLISHED) {
 		ret = blob_backend_read_final(store, oid, &contents, &contents_size);
 	} else {
+		if (!epoch) {
+			ret = VEX_STORE_ERR_CORRUPT;
+			goto out;
+		}
 		ret = blob_backend_read_staging(store, epoch->id, oid,
 						 &contents, &contents_size);
 	}
 	if (ret)
 		goto out;
-	if (contents_size != object->size ||
-	    verify_object(store, oid, object->type, contents, contents_size)) {
+	if (contents_size != info.size ||
+	    verify_object(store, oid, info.type, contents, contents_size)) {
 		ret = VEX_STORE_ERR_CORRUPT;
 		goto out;
 	}
-	*type = object->type;
-	*size = object->size;
+	*type = info.type;
+	*size = info.size;
 	*data = contents;
 	contents = NULL;
 	ret = VEX_STORE_OK;
 out:
 	free(contents);
-	vex_meta_state_release(&state);
 	return ret;
 }
 

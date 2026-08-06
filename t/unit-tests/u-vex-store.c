@@ -256,6 +256,7 @@ void test_vex_store__blob_then_metadata_and_repo_isolation(void)
 	struct vex_ref_transaction *transaction;
 	struct vex_ref_update update;
 	struct vex_ref ref;
+	struct vex_object_info info;
 	struct object_id oid;
 	struct strbuf key = STRBUF_INIT;
 	struct strbuf expected_key = STRBUF_INIT;
@@ -278,6 +279,12 @@ void test_vex_store__blob_then_metadata_and_repo_isolation(void)
 	cl_assert_equal_i(vex_store_has_object(first, &oid), 0);
 	cl_assert_equal_i(vex_store_read_object(first, &oid, &type, &size, &contents),
 			  VEX_STORE_ERR_NOT_FOUND);
+	cl_assert_equal_i(vex_object_index_get_visible(first, NULL, &oid, &info),
+			  VEX_STORE_ERR_NOT_FOUND);
+	cl_must_pass(vex_object_index_get_visible(first, epoch, &oid, &info));
+	cl_assert_equal_i(info.type, OBJ_BLOB);
+	cl_assert_equal_u(info.size, strlen(payload));
+	cl_assert_equal_i(info.state, VEX_OBJECT_QUARANTINE);
 	cl_must_pass(vex_store_read_object_in_epoch(first, epoch, &oid, &type, &size,
 						      &contents));
 	cl_assert_equal_i(type, OBJ_BLOB);
@@ -299,6 +306,8 @@ void test_vex_store__blob_then_metadata_and_repo_isolation(void)
 	vex_epoch_free(epoch);
 
 	cl_assert_equal_i(vex_store_has_object(first, &oid), 1);
+	cl_must_pass(vex_object_index_get_visible(first, NULL, &oid, &info));
+	cl_assert_equal_i(info.state, VEX_OBJECT_PUBLISHED);
 	cl_must_pass(vex_store_read_object(first, &oid, &type, &size, &contents));
 	cl_assert_equal_i(type, OBJ_BLOB);
 	cl_assert_equal_u(size, strlen(payload));
