@@ -22,7 +22,10 @@ COPY . .
 RUN make -j"$(nproc)" VEX_MYSQL=YesPlease NO_RUST=YesPlease NO_TCLTK=YesPlease NO_PERL=YesPlease \
 	git git-http-backend vex-sweep-plan vex-epoch-lease
 
-FROM debian:bookworm-slim
+# Keep the source-built Vex Git runtime reusable by non-HTTP services.  The
+# pack worker deliberately inherits this stage so it executes the same Git
+# binary and shared-library set as receive-pack and upload-pack.
+FROM debian:bookworm-slim AS vex-git-runtime
 
 RUN apt-get update \
 	&& apt-get install -y --no-install-recommends \
@@ -65,3 +68,29 @@ RUN chmod 0755 /usr/local/bin/vex-git-http-entrypoint \
 EXPOSE 8080 8443
 
 ENTRYPOINT ["/usr/local/bin/vex-git-http-entrypoint"]
+
+# The pack worker is a separate Rust program, not part of Git's optional Rust
+# library.  Building it in its own stage keeps the Git build above explicitly
+# NO_RUST while still producing one image with the Vex Git runtime available.
+# This target becomes buildable as soon as vex/pack-worker/Cargo.toml exists;
+# the default `vex-git-http` target intentionally does not depend on it.
+FROM rust:1.96-bookworm AS vex-pack-worker-build
+
+WORKDIR /src
+COPY vex/pack-worker/ /src/vex/pack-worker/
+RUN cargo build --manifest-path /src/vex/pack-worker/Cargo.toml --release
+
+FROM vex-git-runtime AS vex-pack-worker
+
+COPY --from=vex-pack-worker-build /src/vex/pack-worker/target/release/vex-pack-worker /usr/local/bin/vex-pack-worker
+
+# Let the worker invoke the source-built Vex Git commands by their normal
+# names, while retaining GIT_EXEC_PATH from the shared runtime stage.
+ENV PATH="/opt/vex-git:${PATH}"
+
+ENTRYPOINT ["/usr/local/bin/vex-pack-worker"]
+CMD ["--once"]
+
+# Preserve git-http as the Dockerfile's default target so existing `docker
+# build` and Compose workflows do not require the Rust worker crate yet.
+FROM vex-git-runtime AS vex-git-http
