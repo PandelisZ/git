@@ -1,4 +1,5 @@
 #include "git-compat-util.h"
+#include "abspath.h"
 #include "config.h"
 #include "hash.h"
 #include "hex.h"
@@ -37,6 +38,15 @@ struct odb_source_vex {
 	/* A child process's non-owning handle to the parent's receive epoch. */
 	struct vex_epoch *inherited_epoch;
 	/*
+	 * A receive-pack-local indexed WAL.  Unlike pack_cache below, this is
+	 * never selectable by a reader: it exists only while the receive epoch is
+	 * open so connectivity checks and hooks can inspect the exact incoming
+	 * pack before its S3 components and ref update are sealed.
+	 */
+	struct odb_source_packed *receive_pack_cache;
+	char *receive_pack_path;
+	char *receive_pack_id;
+	/*
 	 * A read-only, disposable cache of one S3-derived pack.  It is never an
 	 * object source of truth: cache misses and cache failures fall through to
 	 * the canonical Vex store below.
@@ -51,6 +61,15 @@ struct odb_source_vex {
 struct odb_transaction_vex {
 	struct odb_transaction base;
 	struct vex_epoch *epoch;
+	/*
+	 * One receive can carry a very large pack.  When the explicit pack-WAL
+	 * path is enabled, index-pack writes it below this trusted scratch
+	 * directory and the parent source keeps it visible until the receive
+	 * transaction reaches a terminal state.
+	 */
+	char *receive_pack_objects_path;
+	struct object_id receive_pack_id;
+	unsigned int receive_pack_ready:1;
 	/* The parent owns a receive-pack epoch and waits for the ref backend. */
 	unsigned int receive_handoff:1;
 	/* A receive helper attached its parent's epoch and must only detach. */
@@ -98,6 +117,22 @@ static int vex_env_true(const char *name)
 
 	return value && (!strcmp(value, "1") || !strcmp(value, "true") ||
 			 !strcmp(value, "yes"));
+}
+
+static char *vex_source_receive_pack_objects_path(
+		const struct odb_source_vex *source, uint64_t epoch_id)
+{
+	const char *scratch = getenv("GIT_VEX_SCRATCH");
+	const char *repo_id;
+
+	if (!source || !source->store || !epoch_id || !scratch ||
+	    !is_absolute_path(scratch) || strpbrk(scratch, "\r\n"))
+		return NULL;
+	repo_id = vex_store_repo_id(source->store);
+	if (!repo_id || !*repo_id)
+		return NULL;
+	return xstrfmt("%s/vex-receive/%s/%"PRIu64"/objects", scratch,
+		       repo_id, epoch_id);
 }
 
 static int vex_env_port(const char *name, unsigned int *port)
@@ -247,6 +282,19 @@ static void vex_source_release_pack_cache(struct odb_source_vex *source)
 	memset(&source->pack_lease, 0, sizeof(source->pack_lease));
 }
 
+static void vex_source_release_receive_pack_cache(struct odb_source_vex *source)
+{
+	if (source->receive_pack_cache) {
+		odb_source_close(&source->receive_pack_cache->base);
+		odb_source_free(&source->receive_pack_cache->base);
+	}
+	source->receive_pack_cache = NULL;
+	free(source->receive_pack_id);
+	source->receive_pack_id = NULL;
+	free(source->receive_pack_path);
+	source->receive_pack_path = NULL;
+}
+
 static unsigned int vex_source_pack_cache_lease_seconds(void)
 {
 	const char *value = getenv("GIT_VEX_TEST_PACK_LEASE_SECONDS");
@@ -345,6 +393,30 @@ static struct odb_source_packed *vex_source_open_verified_pack_cache(
 		return NULL;
 	}
 	return cache;
+}
+
+static int vex_source_install_receive_pack_cache(
+		struct odb_source_vex *source, const char *objects_path,
+		const struct object_id *pack_id)
+{
+	struct vex_pack_artifact artifact = { 0 };
+	struct odb_source_packed *cache;
+	char pack_hex[GIT_MAX_HEXSZ + 1];
+
+	if (!objects_path || !is_absolute_path(objects_path) || !pack_id)
+		return -1;
+	oidcpy(&artifact.pack_id, pack_id);
+	cache = vex_source_open_verified_pack_cache(source, objects_path,
+					      &artifact);
+	if (!cache)
+		return -1;
+	vex_source_release_receive_pack_cache(source);
+	source->receive_pack_cache = cache;
+	hash_to_hex_algop_r(pack_hex, pack_id->hash,
+			    source->base.odb->repo->hash_algo);
+	source->receive_pack_id = xstrdup(pack_hex);
+	source->receive_pack_path = xstrdup(objects_path);
+	return 0;
 }
 
 static struct tempfile *vex_source_pack_cache_tempfile(const char *pack_dir,
@@ -495,6 +567,9 @@ static int vex_source_refresh_pack_cache(struct odb_source_vex *source)
 	return ret;
 }
 
+static int vex_source_install_inherited_receive_pack(
+		struct odb_source_vex *source);
+
 static int vex_source_open(struct odb_source_vex *source)
 {
 	int ret;
@@ -506,6 +581,11 @@ static int vex_source_open(struct odb_source_vex *source)
 					    &source->store);
 	if (ret)
 		return ret;
+	if (vex_source_install_inherited_receive_pack(source)) {
+		vex_store_close(source->store);
+		source->store = NULL;
+		return error(_("unable to activate inherited Vex receive pack"));
+	}
 	/* The cache is strictly opportunistic: canonical Vex reads stay available. */
 	if (!vex_source_derived_pack_cache_enabled())
 		return 0;
@@ -554,6 +634,42 @@ static int vex_source_parse_inherited_epoch(struct odb_source_vex *source,
 		return -1;
 	*epoch_id = parsed;
 	return 1;
+}
+
+/*
+ * Hooks and connectivity helpers run as fresh Git processes.  They inherit a
+ * pack id, not a caller-controlled path: the only accepted local location is
+ * the scratch path deterministically derived from the Vex repository and the
+ * already-authenticated receive epoch.
+ */
+static int vex_source_install_inherited_receive_pack(
+		struct odb_source_vex *source)
+{
+	const char *value = getenv("GIT_VEX_RECEIVE_PACK");
+	const char *end;
+	struct object_id pack_id;
+	char *objects_path = NULL;
+	uint64_t epoch_id;
+	int ret;
+
+	if (!value || !*value)
+		return 0;
+	if (source->receive_pack_cache)
+		return 0;
+	ret = vex_source_parse_inherited_epoch(source, &epoch_id);
+	if (ret != 1)
+		return -1;
+	if (parse_oid_hex_algop(value, &pack_id, &end,
+				source->base.odb->repo->hash_algo) || *end)
+		return -1;
+	objects_path = vex_source_receive_pack_objects_path(source, epoch_id);
+	if (!objects_path || vex_source_install_receive_pack_cache(source,
+						       objects_path, &pack_id)) {
+		free(objects_path);
+		return -1;
+	}
+	free(objects_path);
+	return 0;
 }
 
 static int vex_source_inherited_epoch(struct odb_source_vex *source,
@@ -683,6 +799,10 @@ static int odb_source_vex_read_object_info(struct odb_source *base,
 			trace_printf("vex: derived pack cache refresh unavailable repo=%s (%d)",
 				     vex_store_repo_id(source->store), ret);
 	}
+	if (source->receive_pack_cache &&
+	    !odb_source_read_object_info(&source->receive_pack_cache->base, oid,
+					 oi, flags))
+		return 0;
 	if (source->pack_cache &&
 	    !odb_source_read_object_info(&source->pack_cache->base, oid, oi, flags))
 		return 0;
@@ -746,6 +866,10 @@ static int odb_source_vex_read_object_stream(struct odb_read_stream **out,
 
 	if (vex_source_open(source))
 		return -1;
+	if (source->receive_pack_cache &&
+	    !odb_source_read_object_stream(out, &source->receive_pack_cache->base,
+					   oid))
+		return 0;
 	if (source->pack_cache &&
 	    !odb_source_read_object_stream(out, &source->pack_cache->base, oid))
 		return 0;
@@ -819,6 +943,12 @@ static int odb_source_vex_for_each_object(struct odb_source *base,
 		return 0;
 	if (vex_source_open(source))
 		return -1;
+	if (source->receive_pack_cache)
+		return odb_source_for_each_object(&source->receive_pack_cache->base,
+						  request, cb, cb_data, opts);
+	if (source->pack_cache)
+		return odb_source_for_each_object(&source->pack_cache->base, request,
+						  cb, cb_data, opts);
 	if (vex_source_active_epoch(source, &epoch))
 		return -1;
 	ret = vex_store_for_each_object(source->store,
@@ -831,7 +961,7 @@ static int odb_source_vex_for_each_object(struct odb_source *base,
 }
 
 static int odb_source_vex_count_objects(struct odb_source *base,
-					  enum odb_count_objects_flags flags UNUSED,
+					  enum odb_count_objects_flags flags,
 					  unsigned long *out)
 {
 	struct odb_source_vex *source = container_of(base, struct odb_source_vex, base);
@@ -840,6 +970,11 @@ static int odb_source_vex_count_objects(struct odb_source *base,
 
 	if (vex_source_open(source))
 		return -1;
+	if (source->receive_pack_cache)
+		return odb_source_count_objects(&source->receive_pack_cache->base,
+							flags, out);
+	if (source->pack_cache)
+		return odb_source_count_objects(&source->pack_cache->base, flags, out);
 	if (vex_source_active_epoch(source, &epoch))
 		return -1;
 	ret = vex_store_count_objects(source->store,
@@ -860,6 +995,12 @@ static int odb_source_vex_find_abbrev_len(struct odb_source *base,
 
 	if (vex_source_open(source))
 		return -1;
+	if (source->receive_pack_cache)
+		return odb_source_find_abbrev_len(&source->receive_pack_cache->base,
+						  oid, min_length, out);
+	if (source->pack_cache)
+		return odb_source_find_abbrev_len(&source->pack_cache->base, oid,
+						  min_length, out);
 	if (vex_source_active_epoch(source, &epoch))
 		return -1;
 	ret = vex_store_find_abbrev_len(source->store,
@@ -872,7 +1013,7 @@ static int odb_source_vex_find_abbrev_len(struct odb_source *base,
 
 static int odb_source_vex_freshen_object(struct odb_source *base,
 					    const struct object_id *oid,
-					    const time_t *mtime UNUSED)
+					    const time_t *mtime)
 {
 	struct odb_source_vex *source = container_of(base, struct odb_source_vex, base);
 	struct vex_epoch *epoch;
@@ -880,6 +1021,11 @@ static int odb_source_vex_freshen_object(struct odb_source *base,
 
 	if (vex_source_open(source))
 		return 0;
+	if (source->receive_pack_cache)
+		return odb_source_freshen_object(&source->receive_pack_cache->base,
+						 oid, mtime);
+	if (source->pack_cache)
+		return odb_source_freshen_object(&source->pack_cache->base, oid, mtime);
 	if (vex_source_active_epoch(source, &epoch))
 		return 0;
 	if (epoch && !vex_object_index_get(source->store, oid, &info) &&
@@ -971,6 +1117,13 @@ static int odb_transaction_vex_write_object_stream(struct odb_transaction *base,
 	return odb_source_vex_write_object_stream(base->source, stream, size, oid);
 }
 
+static void vex_transaction_release_receive_pack_wal(
+		struct odb_transaction_vex *transaction)
+{
+	free(transaction->receive_pack_objects_path);
+	transaction->receive_pack_objects_path = NULL;
+}
+
 static int odb_transaction_vex_commit(struct odb_transaction *base)
 {
 	struct odb_transaction_vex *transaction =
@@ -995,6 +1148,7 @@ static int odb_transaction_vex_commit(struct odb_transaction *base)
 			error(_("unable to flush Vex receive object batch"));
 		vex_epoch_detach(transaction->epoch);
 		transaction->epoch = NULL;
+		vex_transaction_release_receive_pack_wal(transaction);
 		return ret;
 	}
 	if (transaction->receive_handoff) {
@@ -1007,6 +1161,7 @@ static int odb_transaction_vex_commit(struct odb_transaction *base)
 		}
 		vex_epoch_detach(transaction->epoch);
 		transaction->epoch = NULL;
+		vex_transaction_release_receive_pack_wal(transaction);
 		return ret;
 	}
 
@@ -1021,6 +1176,7 @@ static int odb_transaction_vex_commit(struct odb_transaction *base)
 	}
 	vex_epoch_free(transaction->epoch);
 	transaction->epoch = NULL;
+	vex_transaction_release_receive_pack_wal(transaction);
 	return ret;
 }
 
@@ -1036,6 +1192,9 @@ static int odb_transaction_vex_env(struct odb_transaction *base,
 		strvec_pushf(env, "GIT_VEX_EPOCH=v1:%s:%"PRIu64,
 			     vex_store_repo_id(source->store),
 			     vex_epoch_id(transaction->epoch));
+	if (source->receive_pack_id)
+		strvec_pushf(env, "GIT_VEX_RECEIVE_PACK=%s",
+			     source->receive_pack_id);
 	return 0;
 }
 
@@ -1097,6 +1256,78 @@ bool odb_vex_receive_transaction_is_active(
 	return transaction && transaction->receive_handoff &&
 		transaction->epoch &&
 		!transaction->handoff_finished;
+}
+
+bool odb_vex_receive_pack_wal_enabled(
+		const struct odb_transaction *base)
+{
+	return odb_vex_receive_transaction_is_active(base) &&
+		vex_env_true("GIT_VEX_RECEIVE_PACK_WAL");
+}
+
+int odb_vex_receive_transaction_prepare_pack_wal(
+		struct odb_transaction *base, struct strbuf *objects_dir)
+{
+	struct odb_transaction_vex *transaction = vex_receive_transaction(base);
+	struct odb_source_vex *source;
+	char *objects_path = NULL;
+	char *pack_dir = NULL;
+	char *pack_probe = NULL;
+	struct stat st;
+	int ret = -1;
+
+	if (!objects_dir || !odb_vex_receive_pack_wal_enabled(base) ||
+	    !transaction || transaction->receive_pack_ready)
+		return -1;
+	source = container_of(base->source, struct odb_source_vex, base);
+	objects_path = vex_source_receive_pack_objects_path(source,
+						     vex_epoch_id(transaction->epoch));
+	if (!objects_path)
+		goto out;
+	/* Creating a child makes safe_create_leading_directories create `pack`. */
+	pack_dir = xstrfmt("%s/pack", objects_path);
+	pack_probe = xstrfmt("%s/.vex-receive-pack", pack_dir);
+	if (safe_create_leading_directories_const(source->base.odb->repo,
+					    pack_probe) != SCLD_OK)
+		goto out;
+	if (lstat(pack_dir, &st) || !S_ISDIR(st.st_mode))
+		goto out;
+	strbuf_reset(objects_dir);
+	strbuf_addstr(objects_dir, objects_path);
+	ret = 0;
+out:
+	free(pack_probe);
+	free(pack_dir);
+	free(objects_path);
+	return ret;
+}
+
+int odb_vex_receive_transaction_adopt_pack(
+		struct odb_transaction *base, const char *objects_dir,
+		const struct object_id *pack_id)
+{
+	struct odb_transaction_vex *transaction = vex_receive_transaction(base);
+	struct odb_source_vex *source;
+	char *expected = NULL;
+	int ret = -1;
+
+	if (!objects_dir || !pack_id || !odb_vex_receive_pack_wal_enabled(base) ||
+	    !transaction || transaction->receive_pack_ready)
+		return -1;
+	source = container_of(base->source, struct odb_source_vex, base);
+	expected = vex_source_receive_pack_objects_path(source,
+						    vex_epoch_id(transaction->epoch));
+	if (!expected || strcmp(expected, objects_dir) ||
+	    vex_source_install_receive_pack_cache(source, expected, pack_id))
+		goto out;
+	transaction->receive_pack_objects_path = expected;
+	expected = NULL;
+	oidcpy(&transaction->receive_pack_id, pack_id);
+	transaction->receive_pack_ready = 1;
+	ret = 0;
+out:
+	free(expected);
+	return ret;
 }
 
 int odb_vex_receive_transaction_attach(struct odb_transaction *base,
@@ -1162,6 +1393,7 @@ static void odb_source_vex_close(struct odb_source *base)
 		die(_("unable to flush Vex receive object batch during source close"));
 	vex_epoch_detach(source->inherited_epoch);
 	source->inherited_epoch = NULL;
+	vex_source_release_receive_pack_cache(source);
 	vex_source_release_pack_cache(source);
 	if (source->store)
 		vex_store_close(source->store);
@@ -1183,6 +1415,8 @@ static void odb_source_vex_prepare(struct odb_source *base,
 			trace_printf("vex: derived pack cache refresh unavailable repo=%s (%d)",
 				     vex_store_repo_id(source->store), ret);
 	}
+	if (source->receive_pack_cache)
+		odb_source_prepare(&source->receive_pack_cache->base, flags);
 	if (source->pack_cache)
 		odb_source_prepare(&source->pack_cache->base, flags);
 }
@@ -1236,7 +1470,8 @@ struct odb_source_packed *odb_source_vex_packed_store(struct odb_source *base)
 	if (!odb_source_is_vex(base))
 		return NULL;
 	source = container_of(base, struct odb_source_vex, base);
-	return source->pack_cache;
+	return source->receive_pack_cache ? source->receive_pack_cache :
+		source->pack_cache;
 }
 
 bool repo_uses_vex_storage(const struct repository *repo)

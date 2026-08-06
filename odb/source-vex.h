@@ -3,6 +3,8 @@
 
 #include "odb/source.h"
 
+struct object_id;
+struct strbuf;
 struct odb_source_vex;
 struct vex_store;
 struct vex_epoch;
@@ -42,5 +44,19 @@ void odb_vex_receive_transaction_finish(struct odb_transaction *transaction);
 void odb_vex_receive_transaction_abort(struct odb_transaction *transaction);
 bool odb_vex_receive_transaction_is_active(
 		const struct odb_transaction *transaction);
+
+/*
+ * Explicit, seed-oriented pack WAL handoff.  receive-pack asks for a trusted
+ * per-epoch object directory, runs index-pack into it, then adopts the
+ * verified pack before connectivity checks and hooks run.  Children inherit
+ * only the pack id and derive the scratch location from the Vex epoch.
+ */
+bool odb_vex_receive_pack_wal_enabled(
+		const struct odb_transaction *transaction);
+int odb_vex_receive_transaction_prepare_pack_wal(
+		struct odb_transaction *transaction, struct strbuf *objects_dir);
+int odb_vex_receive_transaction_adopt_pack(
+		struct odb_transaction *transaction, const char *objects_dir,
+		const struct object_id *pack_id);
 
 #endif /* ODB_SOURCE_VEX_H */
