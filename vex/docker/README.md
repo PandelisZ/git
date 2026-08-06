@@ -36,10 +36,26 @@ Later receives coalesce into that row without moving its original
 `not_before`, so normal pushes never synchronously repack or starve a busy
 repository's builder. The default batching window is 60 seconds; set
 `GIT_VEX_PACK_REBUILD_DELAY_SECONDS` to a bounded nonzero value when starting
-the gateway. An operator or scheduler runs
-`scripts/vex/rebuild-pack.sh group/repository.git` to consume due work.
+the gateway.
+
+The standalone pack-level Vex worker consumes one due normal-path request:
+
+```sh
+docker compose -f vex/docker/compose.yaml --env-file vex/docker/.env \
+  --profile pack-worker build pack-worker
+docker compose -f vex/docker/compose.yaml --env-file vex/docker/.env \
+  --profile pack-worker run --rm --no-deps pack-worker --once
+```
+
+It builds one derived pack, performs one immutable S3 pack upload and one
+index upload (multipart above the configured part size), then bulk-loads only
+OID-to-pack-offset metadata into MySQL. It cannot change refs, ref audit rows,
+generations, or canonical object bytes. The initial worker intentionally does
+not consume the raw receive-pack WAL: that path remains synchronously sealed
+by the C receive transaction so refs never outrun durable S3 bytes.
+
 `scripts/vex/build-pack.sh group/repository.git` remains the explicit
-immediate rebuild command.
+immediate builder for maintenance and comparison.
 
 The image keeps the explicitly labelled classic-bare listener as a direct
 image fallback when `VEX_GIT_HTTP_COMMAND` is absent. Compose deliberately

@@ -393,3 +393,50 @@ and zero candidates, releases the lease, and verifies `lease_roots=0` with
 three conservative candidates. It then fresh-clones and fscks with stock Git.
 No blob or metadata deletion, direct pack serving, or L4 performance claim is
 made.
+
+## 2026-08-06 — Standalone Vex pack-level worker (normal receive path)
+
+Added an opt-in `vex-pack-worker` Compose profile for the durable derived-pack
+path. The worker claims exactly one MySQL rebuild row with `FOR UPDATE SKIP
+LOCKED`, records a UUID lease and claimed generation, builds one complete
+pack/index from the source-built Vex Git binary, uploads immutable pack/index
+keys to S3-compatible storage, and streams one trusted OID-to-offset TSV into
+a temporary MySQL table for set-based membership and offset insertion.
+
+The C receive path remains the only owner of connectivity checks, hooks, refs,
+ref audit rows, sealed generations, and canonical object bytes. Publication
+locks the repository and refuses a changed target generation; a later receive
+therefore makes an in-flight job stale rather than allowing it to publish an
+old view. `pack_object_offsets` is now also preserved through C state rewrites,
+so a normal follow-up push cannot orphan the immutable envelope.
+
+Verified locally:
+
+```sh
+cargo test --manifest-path vex/pack-worker/Cargo.toml --locked
+# PASS: 7/7
+
+cargo clippy --manifest-path vex/pack-worker/Cargo.toml --locked \
+  --all-targets --all-features -- -D warnings
+# PASS
+
+docker compose -f vex/docker/compose.yaml --env-file vex/docker/.env \
+  --profile pack-worker build pack-worker
+# PASS
+
+VEX_COMPOSE_NO_BUILD=1 VEX_STOCK_GIT=/usr/bin/git \
+  t/vex/mysql-s3-pack-worker.sh
+# PASS: 9 objects; one second worker run; S3 pack/index, matching 9/9
+# membership/offset rows, direct stock-Git pack relay with pack-objects
+# faulted, and offset preservation across a later stock-Git push
+
+cd t && VEX_COMPOSE_NO_BUILD=1 VEX_TEST_COMPOSE_MYSQL_S3=1 \
+  VEX_STOCK_GIT=/usr/bin/git ./t1532-vex-compose-mysql-s3-pack-worker.sh
+# PASS: 1/1
+```
+
+This is a correctness and operational slice, not a small-fixture performance
+claim. It intentionally does not consume the raw receive-pack WAL used by the
+`git/git` seed: that path already has pack-level C publication and must keep
+its synchronous S3-before-ref durability boundary until an explicit raw-pack
+handoff is implemented.

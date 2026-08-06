@@ -78,7 +78,7 @@ FROM rust:1.96-bookworm AS vex-pack-worker-build
 
 WORKDIR /src
 COPY vex/pack-worker/ /src/vex/pack-worker/
-RUN cargo build --manifest-path /src/vex/pack-worker/Cargo.toml --release
+RUN cargo build --locked --manifest-path /src/vex/pack-worker/Cargo.toml --release
 
 FROM vex-git-runtime AS vex-pack-worker
 
