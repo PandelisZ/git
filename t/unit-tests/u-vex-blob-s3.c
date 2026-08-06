@@ -154,6 +154,11 @@ void test_vex_blob_s3__receive_pack_keys_are_fenced_to_one_epoch_and_pair(void)
 	cl_assert_equal_i(vex_blob_s3_stage_receive_pack(
 		blob, 48, oid.hash, hash_algo->rawsz, "pack", "pack.idx"),
 		VEX_BLOB_S3_ERR_INVALID);
+	cl_assert_equal_i(vex_blob_s3_delete_final_batch(
+		blob, &oid, VEX_BLOB_S3_DELETE_OBJECTS_MAX + 1),
+		VEX_BLOB_S3_ERR_INVALID);
+	cl_assert_equal_i(vex_blob_s3_delete_staging_batch(blob, 0, &oid, 1),
+		VEX_BLOB_S3_ERR_INVALID);
 	write_test_receive_pack_pair(&pack_file, &idx_file, raw_pack_id);
 	memcpy(wrong_pack_id, raw_pack_id, hash_algo->rawsz);
 	wrong_pack_id[0] ^= 1;
@@ -267,6 +272,69 @@ void test_vex_blob_s3__minio_parallel_receive_batch_is_all_or_nothing(void)
 		cl_assert_equal_i(vex_blob_s3_read_staging(blob, 47003, &oids[i],
 							    &read_back, &size),
 				  VEX_BLOB_S3_ERR_NOT_FOUND);
+	vex_blob_s3_close(blob);
+}
+
+void test_vex_blob_s3__minio_delete_objects_batches_loose_keys(void)
+{
+	const char *run = getenv("VEX_S3_INTEGRATION");
+	struct vex_blob_s3 *blob;
+	struct object_id oids[3];
+	struct vex_blob_s3_staged_object objects[3];
+	struct object_id at_limit[VEX_BLOB_S3_DELETE_OBJECTS_MAX];
+	char payloads[3][128];
+	char at_limit_payload[128];
+	void *read_back;
+	unsigned long size;
+	size_t i;
+
+	if (!run || strcmp(run, "1")) {
+		cl_skip();
+		return;
+	}
+	for (i = 0; i < ARRAY_SIZE(objects); i++) {
+		xsnprintf(payloads[i], sizeof(payloads[i]),
+			  "Vex S3 DeleteObjects payload=%zu pid=%ld\n", i,
+			  (long)getpid());
+		hash_object_file(hash_algo, payloads[i], strlen(payloads[i]),
+				 OBJ_BLOB, &oids[i]);
+		objects[i].oid = &oids[i];
+		objects[i].data = payloads[i];
+		objects[i].size = strlen(payloads[i]);
+	}
+	blob = open_test_blob();
+	cl_must_pass(vex_blob_s3_delete_final_batch(blob, oids,
+		ARRAY_SIZE(oids)));
+	cl_must_pass(vex_blob_s3_put_staging_batch(blob, 47005, objects,
+		ARRAY_SIZE(objects)));
+	cl_must_pass(vex_blob_s3_delete_staging_batch(blob, 47005, oids,
+		ARRAY_SIZE(oids)));
+	for (i = 0; i < ARRAY_SIZE(oids); i++)
+		cl_assert_equal_i(vex_blob_s3_read_staging(blob, 47005, &oids[i],
+							    &read_back, &size),
+				  VEX_BLOB_S3_ERR_NOT_FOUND);
+	cl_must_pass(vex_blob_s3_delete_staging_batch(blob, 47005, oids,
+		ARRAY_SIZE(oids)));
+	cl_must_pass(vex_blob_s3_put_staging_batch(blob, 47005, objects,
+		ARRAY_SIZE(objects)));
+	cl_must_pass(vex_blob_s3_promote_batch(blob, 47005, oids,
+		ARRAY_SIZE(oids)));
+	cl_must_pass(vex_blob_s3_delete_final_batch(blob, oids,
+		ARRAY_SIZE(oids)));
+	for (i = 0; i < ARRAY_SIZE(oids); i++)
+		cl_assert_equal_i(vex_blob_s3_has_final(blob, &oids[i]), 0);
+	cl_must_pass(vex_blob_s3_delete_final_batch(blob, oids,
+		ARRAY_SIZE(oids)));
+	/* The protocol maximum is accepted as one 1,000-key DeleteObjects body. */
+	for (i = 0; i < ARRAY_SIZE(at_limit); i++) {
+		xsnprintf(at_limit_payload, sizeof(at_limit_payload),
+			  "Vex S3 DeleteObjects maximum=%zu pid=%ld\n", i,
+			  (long)getpid());
+		hash_object_file(hash_algo, at_limit_payload,
+				 strlen(at_limit_payload), OBJ_BLOB, &at_limit[i]);
+	}
+	cl_must_pass(vex_blob_s3_delete_final_batch(blob, at_limit,
+		ARRAY_SIZE(at_limit)));
 	vex_blob_s3_close(blob);
 }
 

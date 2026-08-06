@@ -203,9 +203,10 @@ static int curl_result(int curl_ret, const struct strbuf *output)
 	return VEX_BLOB_S3_ERR;
 }
 
-static int run_curl(struct vex_blob_s3 *blob, const char *method,
-		    const char *url, const char *input_file,
-		    const char *output_file, const char *header)
+static int run_curl_with_headers(struct vex_blob_s3 *blob, const char *method,
+				 const char *url, const char *input_file,
+				 const char *output_file,
+				 const char *const *headers, size_t headers_nr)
 {
 	struct child_process curl = CHILD_PROCESS_INIT;
 	struct strbuf config = STRBUF_INIT;
@@ -215,8 +216,11 @@ static int run_curl(struct vex_blob_s3 *blob, const char *method,
 	struct tempfile *config_file = NULL;
 	struct tempfile *status_file = NULL;
 	int status_fd = -1;
+	size_t i;
 	int ret;
 
+	if (!headers && headers_nr)
+		return VEX_BLOB_S3_ERR_INVALID;
 	if (!exists_in_PATH("curl"))
 		return VEX_BLOB_S3_ERR_UNAVAILABLE;
 	strbuf_addf(&auth, "%s:%s", blob->access_key, blob->secret_key);
@@ -226,11 +230,15 @@ static int run_curl(struct vex_blob_s3 *blob, const char *method,
 	     curl_config_add(&config, "request", method)) ||
 	    curl_config_add(&config, "user", auth.buf) ||
 	    curl_config_add(&config, "aws-sigv4", signing.buf) ||
-	    (input_file && curl_config_add(&config, "upload-file", input_file)) ||
-	    (header && curl_config_add(&config, "header", header))) {
+	    (input_file && curl_config_add(&config, "upload-file", input_file))) {
 		ret = VEX_BLOB_S3_ERR_INVALID;
 		goto done;
 	}
+	for (i = 0; i < headers_nr; i++)
+		if (curl_config_add(&config, "header", headers[i])) {
+			ret = VEX_BLOB_S3_ERR_INVALID;
+			goto done;
+		}
 	config_file = mks_tempfile_t("vex-s3-curl-XXXXXX");
 	if (!config_file ||
 	    write_in_full(config_file->fd, config.buf, config.len) < 0 ||
@@ -277,6 +285,21 @@ static int run_curl(struct vex_blob_s3 *blob, const char *method,
 	strbuf_release(&signing);
 	strbuf_release(&output);
 	return ret;
+}
+
+static int run_curl(struct vex_blob_s3 *blob, const char *method,
+		    const char *url, const char *input_file,
+		    const char *output_file, const char *header)
+{
+	const char *headers[1];
+
+	if (header) {
+		headers[0] = header;
+		return run_curl_with_headers(blob, method, url, input_file,
+					     output_file, headers, 1);
+	}
+	return run_curl_with_headers(blob, method, url, input_file, output_file,
+				     NULL, 0);
 }
 
 /*
@@ -416,6 +439,267 @@ static int delete_key(struct vex_blob_s3 *blob, const char *key)
 	if (!ret)
 		ret = run_curl(blob, "DELETE", url.buf, NULL, "/dev/null", NULL);
 	strbuf_release(&url);
+	return ret;
+}
+
+/*
+ * General-purpose S3 DeleteObjects requests require Content-MD5.  Git's core
+ * does not otherwise need MD5, so keep a tiny local implementation here
+ * rather than adding a platform crypto or libcurl linkage dependency to the
+ * Vex object driver.
+ */
+struct vex_md5_ctx {
+	uint32_t state[4];
+	uint64_t bytes;
+	unsigned char block[64];
+	size_t block_len;
+};
+
+static uint32_t vex_rotl32(uint32_t value, unsigned int bits)
+{
+	return (value << bits) | (value >> (32 - bits));
+}
+
+static uint32_t vex_le32(const unsigned char *bytes)
+{
+	return (uint32_t)bytes[0] |
+		((uint32_t)bytes[1] << 8) |
+		((uint32_t)bytes[2] << 16) |
+		((uint32_t)bytes[3] << 24);
+}
+
+static void vex_put_le32(unsigned char *out, uint32_t value)
+{
+	out[0] = value;
+	out[1] = value >> 8;
+	out[2] = value >> 16;
+	out[3] = value >> 24;
+}
+
+static void vex_md5_transform(struct vex_md5_ctx *ctx,
+			      const unsigned char block[64])
+{
+	static const uint32_t shifts[] = {
+		7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22,
+		5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20,
+		4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23,
+		6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21,
+	};
+	static const uint32_t constants[] = {
+		0xd76aa478, 0xe8c7b756, 0x242070db, 0xc1bdceee,
+		0xf57c0faf, 0x4787c62a, 0xa8304613, 0xfd469501,
+		0x698098d8, 0x8b44f7af, 0xffff5bb1, 0x895cd7be,
+		0x6b901122, 0xfd987193, 0xa679438e, 0x49b40821,
+		0xf61e2562, 0xc040b340, 0x265e5a51, 0xe9b6c7aa,
+		0xd62f105d, 0x02441453, 0xd8a1e681, 0xe7d3fbc8,
+		0x21e1cde6, 0xc33707d6, 0xf4d50d87, 0x455a14ed,
+		0xa9e3e905, 0xfcefa3f8, 0x676f02d9, 0x8d2a4c8a,
+		0xfffa3942, 0x8771f681, 0x6d9d6122, 0xfde5380c,
+		0xa4beea44, 0x4bdecfa9, 0xf6bb4b60, 0xbebfbc70,
+		0x289b7ec6, 0xeaa127fa, 0xd4ef3085, 0x04881d05,
+		0xd9d4d039, 0xe6db99e5, 0x1fa27cf8, 0xc4ac5665,
+		0xf4292244, 0x432aff97, 0xab9423a7, 0xfc93a039,
+		0x655b59c3, 0x8f0ccc92, 0xffeff47d, 0x85845dd1,
+		0x6fa87e4f, 0xfe2ce6e0, 0xa3014314, 0x4e0811a1,
+		0xf7537e82, 0xbd3af235, 0x2ad7d2bb, 0xeb86d391,
+	};
+	uint32_t words[16];
+	uint32_t a = ctx->state[0];
+	uint32_t b = ctx->state[1];
+	uint32_t c = ctx->state[2];
+	uint32_t d = ctx->state[3];
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(words); i++)
+		words[i] = vex_le32(block + i * 4);
+	for (i = 0; i < 64; i++) {
+		uint32_t f;
+		unsigned int g;
+		uint32_t previous_d = d;
+
+		if (i < 16) {
+			f = (b & c) | (~b & d);
+			g = i;
+		} else if (i < 32) {
+			f = (d & b) | (~d & c);
+			g = (5 * i + 1) % 16;
+		} else if (i < 48) {
+			f = b ^ c ^ d;
+			g = (3 * i + 5) % 16;
+		} else {
+			f = c ^ (b | ~d);
+			g = (7 * i) % 16;
+		}
+		d = c;
+		c = b;
+		b += vex_rotl32(a + f + constants[i] + words[g], shifts[i]);
+		a = previous_d;
+	}
+	ctx->state[0] += a;
+	ctx->state[1] += b;
+	ctx->state[2] += c;
+	ctx->state[3] += d;
+}
+
+static void vex_md5_init(struct vex_md5_ctx *ctx)
+{
+	ctx->state[0] = 0x67452301;
+	ctx->state[1] = 0xefcdab89;
+	ctx->state[2] = 0x98badcfe;
+	ctx->state[3] = 0x10325476;
+	ctx->bytes = 0;
+	ctx->block_len = 0;
+}
+
+static void vex_md5_update(struct vex_md5_ctx *ctx, const void *data,
+			   size_t len)
+{
+	const unsigned char *bytes = data;
+
+	ctx->bytes += len;
+	if (ctx->block_len) {
+		size_t remaining = sizeof(ctx->block) - ctx->block_len;
+		size_t take = len < remaining ? len : remaining;
+
+		memcpy(ctx->block + ctx->block_len, bytes, take);
+		ctx->block_len += take;
+		bytes += take;
+		len -= take;
+		if (ctx->block_len == sizeof(ctx->block)) {
+			vex_md5_transform(ctx, ctx->block);
+			ctx->block_len = 0;
+		}
+	}
+	while (len >= sizeof(ctx->block)) {
+		vex_md5_transform(ctx, bytes);
+		bytes += sizeof(ctx->block);
+		len -= sizeof(ctx->block);
+	}
+	if (len) {
+		memcpy(ctx->block, bytes, len);
+		ctx->block_len = len;
+	}
+}
+
+static void vex_md5_final(struct vex_md5_ctx *ctx, unsigned char digest[16])
+{
+	static const unsigned char first_padding_byte = 0x80;
+	static const unsigned char zeroes[64];
+	unsigned char length[8];
+	uint64_t bits = ctx->bytes << 3;
+	size_t padding = ctx->block_len < 56 ? 56 - ctx->block_len :
+		120 - ctx->block_len;
+	unsigned int i;
+
+	vex_md5_update(ctx, &first_padding_byte, 1);
+	if (padding > 1)
+		vex_md5_update(ctx, zeroes, padding - 1);
+	for (i = 0; i < ARRAY_SIZE(length); i++)
+		length[i] = bits >> (i * 8);
+	vex_md5_update(ctx, length, sizeof(length));
+	for (i = 0; i < ARRAY_SIZE(ctx->state); i++)
+		vex_put_le32(digest + i * 4, ctx->state[i]);
+}
+
+static void vex_base64_16(const unsigned char input[16], char output[25])
+{
+	static const char alphabet[] =
+		"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+	size_t in = 0;
+	size_t out = 0;
+
+	while (in < 16) {
+		uint32_t bits = (uint32_t)input[in++] << 16;
+		int have_second = in < 16;
+		int have_third;
+
+		if (have_second)
+			bits |= (uint32_t)input[in++] << 8;
+		have_third = in < 16;
+		if (have_third)
+			bits |= input[in++];
+		output[out++] = alphabet[(bits >> 18) & 0x3f];
+		output[out++] = alphabet[(bits >> 12) & 0x3f];
+		output[out++] = have_second ? alphabet[(bits >> 6) & 0x3f] : '=';
+		output[out++] = have_third ? alphabet[bits & 0x3f] : '=';
+	}
+	output[out] = '\0';
+}
+
+static int delete_keys_batch(struct vex_blob_s3 *blob,
+			     const char *const *keys, size_t keys_nr)
+{
+	static const char content_type[] = "Content-Type: application/xml";
+	struct vex_md5_ctx md5;
+	unsigned char digest[16];
+	char encoded_md5[25];
+	struct strbuf body = STRBUF_INIT;
+	struct strbuf content_md5 = STRBUF_INIT;
+	struct strbuf url = STRBUF_INIT;
+	struct strbuf response = STRBUF_INIT;
+	struct tempfile *body_file = NULL;
+	struct tempfile *response_file = NULL;
+	const char *headers[2];
+	size_t i;
+	int ret = VEX_BLOB_S3_ERR;
+
+	if (!blob || (!keys && keys_nr) ||
+	    keys_nr > VEX_BLOB_S3_DELETE_OBJECTS_MAX)
+		return VEX_BLOB_S3_ERR_INVALID;
+	if (!keys_nr)
+		return VEX_BLOB_S3_OK;
+	for (i = 0; i < keys_nr; i++)
+		if (!keys[i] || !*keys[i] || contains_control(keys[i]))
+			return VEX_BLOB_S3_ERR_INVALID;
+	strbuf_addstr(&body,
+		"<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+		"<Delete xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">");
+	for (i = 0; i < keys_nr; i++) {
+		strbuf_addstr(&body, "<Object><Key>");
+		strbuf_addstr_xml_quoted(&body, keys[i]);
+		strbuf_addstr(&body, "</Key></Object>");
+	}
+	strbuf_addstr(&body, "<Quiet>true</Quiet></Delete>");
+	vex_md5_init(&md5);
+	vex_md5_update(&md5, body.buf, body.len);
+	vex_md5_final(&md5, digest);
+	vex_base64_16(digest, encoded_md5);
+	strbuf_addf(&content_md5, "Content-MD5: %s", encoded_md5);
+	headers[0] = content_type;
+	headers[1] = content_md5.buf;
+	body_file = mks_tempfile_t("vex-s3-delete-objects-XXXXXX");
+	if (!body_file ||
+	    write_in_full(body_file->fd, body.buf, body.len) < 0 ||
+	    close_tempfile_gently(body_file) < 0) {
+		ret = VEX_BLOB_S3_ERR;
+		goto out;
+	}
+	response_file = mks_tempfile_t("vex-s3-delete-response-XXXXXX");
+	if (!response_file || close_tempfile_gently(response_file) < 0) {
+		ret = VEX_BLOB_S3_ERR;
+		goto out;
+	}
+	ret = make_url(blob, "", &url);
+	if (ret)
+		goto out;
+	strbuf_addstr(&url, "?delete");
+	ret = run_curl_with_headers(blob, "POST", url.buf,
+				    body_file->filename.buf,
+				    response_file->filename.buf, headers,
+				    ARRAY_SIZE(headers));
+	if (ret)
+		goto out;
+	if (strbuf_read_file(&response, response_file->filename.buf, 0) < 0 ||
+	    !strstr(response.buf, "<DeleteResult") ||
+	    strstr(response.buf, "<Error>") || strstr(response.buf, "<Error "))
+		ret = VEX_BLOB_S3_ERR;
+out:
+	delete_tempfile(&response_file);
+	delete_tempfile(&body_file);
+	strbuf_release(&response);
+	strbuf_release(&url);
+	strbuf_release(&content_md5);
+	strbuf_release(&body);
 	return ret;
 }
 
@@ -814,6 +1098,53 @@ int vex_blob_s3_staging_key(const struct vex_blob_s3 *blob, uint64_t epoch,
 	return VEX_BLOB_S3_OK;
 }
 
+static int delete_loose_object_batch(struct vex_blob_s3 *blob,
+				     uint64_t epoch, int staging,
+				     const struct object_id *oids, size_t oids_nr)
+{
+	struct strbuf *keys = NULL;
+	const char **key_ptrs = NULL;
+	size_t i;
+	int ret = VEX_BLOB_S3_ERR;
+
+	if (!blob || (!oids && oids_nr) ||
+	    oids_nr > VEX_BLOB_S3_DELETE_OBJECTS_MAX || (staging && !epoch))
+		return VEX_BLOB_S3_ERR_INVALID;
+	if (!oids_nr)
+		return VEX_BLOB_S3_OK;
+	if (!staging && blob->test_fail_final_delete)
+		return VEX_BLOB_S3_ERR;
+	CALLOC_ARRAY(keys, oids_nr);
+	CALLOC_ARRAY(key_ptrs, oids_nr);
+	for (i = 0; i < oids_nr; i++) {
+		ret = staging ? vex_blob_s3_staging_key(blob, epoch, &oids[i],
+							 &keys[i]) :
+			vex_blob_s3_final_key(blob, &oids[i], &keys[i]);
+		if (ret)
+			goto out;
+		key_ptrs[i] = keys[i].buf;
+	}
+	ret = delete_keys_batch(blob, key_ptrs, oids_nr);
+out:
+	for (i = 0; i < oids_nr; i++)
+		strbuf_release(&keys[i]);
+	free(key_ptrs);
+	free(keys);
+	return ret;
+}
+
+int vex_blob_s3_delete_staging_batch(struct vex_blob_s3 *blob, uint64_t epoch,
+				     const struct object_id *oids, size_t oids_nr)
+{
+	return delete_loose_object_batch(blob, epoch, 1, oids, oids_nr);
+}
+
+int vex_blob_s3_delete_final_batch(struct vex_blob_s3 *blob,
+				   const struct object_id *oids, size_t oids_nr)
+{
+	return delete_loose_object_batch(blob, 0, 0, oids, oids_nr);
+}
+
 int vex_blob_s3_put_staging(struct vex_blob_s3 *blob, uint64_t epoch,
 			    const struct object_id *oid,
 			    const void *data, unsigned long size)
@@ -1080,7 +1411,6 @@ struct vex_s3_batch_promotion {
 	struct strbuf staging;
 	struct strbuf final;
 	struct strbuf final_url;
-	struct strbuf staging_url;
 	struct strbuf copy_source;
 };
 
@@ -1091,7 +1421,6 @@ static void release_batch_promotions(struct vex_s3_batch_promotion *promotions,
 
 	for (i = 0; i < promotions_nr; i++) {
 		strbuf_release(&promotions[i].copy_source);
-		strbuf_release(&promotions[i].staging_url);
 		strbuf_release(&promotions[i].final_url);
 		strbuf_release(&promotions[i].final);
 		strbuf_release(&promotions[i].staging);
@@ -1130,9 +1459,6 @@ int vex_blob_s3_promote_batch(struct vex_blob_s3 *blob, uint64_t epoch,
 		ret = make_url(blob, promotion->final.buf, &promotion->final_url);
 		if (ret)
 			goto done;
-		ret = make_url(blob, promotion->staging.buf, &promotion->staging_url);
-		if (ret)
-			goto done;
 		/*
 		 * The source was hash-verified before staging.  Copying it over an
 		 * existing content-addressed key is therefore idempotent (and repairs
@@ -1150,13 +1476,16 @@ int vex_blob_s3_promote_batch(struct vex_blob_s3 *blob, uint64_t epoch,
 	ret = run_curl_parallel(blob, requests, oids_nr);
 	if (ret)
 		goto done;
-	for (i = 0; i < oids_nr; i++) {
-		requests[i].method = "DELETE";
-		requests[i].url = promotions[i].staging_url.buf;
-		requests[i].input_file = NULL;
-		requests[i].header = NULL;
+	for (i = 0; i < oids_nr; i += VEX_BLOB_S3_DELETE_OBJECTS_MAX) {
+		size_t remaining = oids_nr - i;
+		size_t count = remaining < VEX_BLOB_S3_DELETE_OBJECTS_MAX ?
+			remaining : VEX_BLOB_S3_DELETE_OBJECTS_MAX;
+
+		ret = vex_blob_s3_delete_staging_batch(blob, epoch, oids + i,
+							       count);
+		if (ret)
+			goto done;
 	}
-	ret = run_curl_parallel(blob, requests, oids_nr);
 done:
 	/* A failed copy/delete leaves no metadata visible and is retryable. */
 	free(requests);

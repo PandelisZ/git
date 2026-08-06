@@ -49,6 +49,9 @@ enum vex_blob_s3_result {
 	VEX_BLOB_S3_ERR_UNAVAILABLE = -4,
 };
 
+/* S3 DeleteObjects permits at most 1,000 keys in one request. */
+#define VEX_BLOB_S3_DELETE_OBJECTS_MAX 1000
+
 struct vex_blob_s3_options {
 	/* Path-style S3 endpoint, for example http://127.0.0.1:9000. */
 	const char *endpoint;
@@ -104,6 +107,17 @@ int vex_blob_s3_delete_staging(struct vex_blob_s3 *blob, uint64_t epoch,
 /* Idempotent compensation for an uncommitted newly-promoted final object. */
 int vex_blob_s3_delete_final(struct vex_blob_s3 *blob,
 			     const struct object_id *oid);
+/*
+ * Delete a bounded homogeneous set of loose-object keys with standard S3
+ * DeleteObjects.  Every key is derived from this blob handle; callers cannot
+ * provide an arbitrary bucket path.  A missing object is a successful,
+ * idempotent deletion.  `oids_nr` may be zero, but may not exceed
+ * VEX_BLOB_S3_DELETE_OBJECTS_MAX.
+ */
+int vex_blob_s3_delete_staging_batch(struct vex_blob_s3 *blob, uint64_t epoch,
+				     const struct object_id *oids, size_t oids_nr);
+int vex_blob_s3_delete_final_batch(struct vex_blob_s3 *blob,
+				   const struct object_id *oids, size_t oids_nr);
 
 /* Returns 1 if present, 0 if absent, or a negative VEX_BLOB_S3_ERR_* value. */
 int vex_blob_s3_has_final(struct vex_blob_s3 *blob,
