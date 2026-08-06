@@ -1260,13 +1260,170 @@ static int ensure_pack_rebuild_requests_table(struct vex_meta_mysql *db)
 		"requested_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6), "
 		"last_requested_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6), "
 		"not_before DATETIME(6) NOT NULL, "
+		"worker_lease_id BINARY(16) NULL, "
+		"claimed_target_generation BIGINT UNSIGNED NULL, "
+		"worker_lease_expires_at DATETIME(6) NULL, "
+		"worker_claimed_at DATETIME(6) NULL, "
+		"attempts INT UNSIGNED NOT NULL DEFAULT 0, "
+		"last_error VARBINARY(1024) NULL, "
 		"PRIMARY KEY (repo_id), "
 		"KEY pack_rebuild_requests_due (not_before, repo_id), "
+		"KEY pack_rebuild_requests_claimable "
+		"(not_before, worker_lease_expires_at, repo_id), "
 		"CONSTRAINT pack_rebuild_requests_repo_fk FOREIGN KEY (repo_id) "
 		"REFERENCES repositories (repo_id)"
 		") ENGINE=InnoDB";
 
 	return mysql_exec(db, create_sql);
+}
+
+static int ensure_pack_rebuild_request_column(struct vex_meta_mysql *db,
+					      const char *column_sql,
+					      const char *alter_sql,
+					      const char *column_name)
+{
+	uint64_t columns;
+	int found;
+	int ret;
+
+	ret = query_one_u64(db, column_sql, &columns, &found);
+	if (ret)
+		return ret;
+	if (!found || columns > 1)
+		return set_error(db, VEX_META_MYSQL_ERR_SCHEMA,
+				 "invalid Vex pack rebuild request %s column",
+				 column_name);
+	if (columns)
+		return VEX_META_MYSQL_OK;
+	return mysql_exec(db, alter_sql);
+}
+
+/*
+ * Existing Compose volumes predate pack-worker leases.  The worker will claim
+ * a whole rebuild request and later verify its claimed target under the
+ * repository publish lock; this migration only creates the durable fields
+ * and claimable-work index.  A MySQL advisory lock keeps concurrent gateway
+ * startups from racing individual ADD COLUMN statements.
+ */
+static int ensure_pack_rebuild_request_worker_lease_schema(
+		struct vex_meta_mysql *db)
+{
+	static const char lock_sql[] =
+		"SELECT GET_LOCK('vex-schema-pack-worker-lease-v1', 5)";
+	static const char unlock_sql[] =
+		"SELECT RELEASE_LOCK('vex-schema-pack-worker-lease-v1')";
+	static const char worker_lease_id_column_sql[] =
+		"SELECT COUNT(*) FROM information_schema.columns "
+		"WHERE table_schema = DATABASE() "
+		"AND table_name = 'pack_rebuild_requests' "
+		"AND column_name = 'worker_lease_id'";
+	static const char claimed_target_generation_column_sql[] =
+		"SELECT COUNT(*) FROM information_schema.columns "
+		"WHERE table_schema = DATABASE() "
+		"AND table_name = 'pack_rebuild_requests' "
+		"AND column_name = 'claimed_target_generation'";
+	static const char worker_lease_expires_at_column_sql[] =
+		"SELECT COUNT(*) FROM information_schema.columns "
+		"WHERE table_schema = DATABASE() "
+		"AND table_name = 'pack_rebuild_requests' "
+		"AND column_name = 'worker_lease_expires_at'";
+	static const char worker_claimed_at_column_sql[] =
+		"SELECT COUNT(*) FROM information_schema.columns "
+		"WHERE table_schema = DATABASE() "
+		"AND table_name = 'pack_rebuild_requests' "
+		"AND column_name = 'worker_claimed_at'";
+	static const char attempts_column_sql[] =
+		"SELECT COUNT(*) FROM information_schema.columns "
+		"WHERE table_schema = DATABASE() "
+		"AND table_name = 'pack_rebuild_requests' "
+		"AND column_name = 'attempts'";
+	static const char last_error_column_sql[] =
+		"SELECT COUNT(*) FROM information_schema.columns "
+		"WHERE table_schema = DATABASE() "
+		"AND table_name = 'pack_rebuild_requests' "
+		"AND column_name = 'last_error'";
+	static const char claimable_index_sql[] =
+		"SELECT COUNT(DISTINCT index_name) "
+		"FROM information_schema.statistics "
+		"WHERE table_schema = DATABASE() "
+		"AND table_name = 'pack_rebuild_requests' "
+		"AND index_name = 'pack_rebuild_requests_claimable'";
+	static const char add_worker_lease_id_sql[] =
+		"ALTER TABLE pack_rebuild_requests ADD COLUMN worker_lease_id "
+		"BINARY(16) NULL AFTER not_before";
+	static const char add_claimed_target_generation_sql[] =
+		"ALTER TABLE pack_rebuild_requests ADD COLUMN "
+		"claimed_target_generation BIGINT UNSIGNED NULL AFTER worker_lease_id";
+	static const char add_worker_lease_expires_at_sql[] =
+		"ALTER TABLE pack_rebuild_requests ADD COLUMN worker_lease_expires_at "
+		"DATETIME(6) NULL AFTER claimed_target_generation";
+	static const char add_worker_claimed_at_sql[] =
+		"ALTER TABLE pack_rebuild_requests ADD COLUMN worker_claimed_at "
+		"DATETIME(6) NULL AFTER worker_lease_expires_at";
+	static const char add_attempts_sql[] =
+		"ALTER TABLE pack_rebuild_requests ADD COLUMN attempts "
+		"INT UNSIGNED NOT NULL DEFAULT 0 AFTER worker_claimed_at";
+	static const char add_last_error_sql[] =
+		"ALTER TABLE pack_rebuild_requests ADD COLUMN last_error "
+		"VARBINARY(1024) NULL AFTER attempts";
+	static const char add_claimable_index_sql[] =
+		"ALTER TABLE pack_rebuild_requests ADD INDEX "
+		"pack_rebuild_requests_claimable "
+		"(not_before, worker_lease_expires_at, repo_id)";
+	uint64_t locked;
+	uint64_t indexes;
+	uint64_t released;
+	int found;
+	int lock_found;
+	int release_found;
+	int ret;
+	int release_ret;
+
+	ret = query_one_u64(db, lock_sql, &locked, &lock_found);
+	if (ret)
+		return ret;
+	if (!lock_found || locked != 1)
+		return set_error(db, VEX_META_MYSQL_ERR_CONFLICT,
+				 "timed out acquiring Vex pack-worker schema migration lock");
+
+	ret = ensure_pack_rebuild_request_column(db, worker_lease_id_column_sql,
+						  add_worker_lease_id_sql,
+						  "worker_lease_id");
+	if (!ret)
+		ret = ensure_pack_rebuild_request_column(
+			db, claimed_target_generation_column_sql,
+			add_claimed_target_generation_sql, "claimed_target_generation");
+	if (!ret)
+		ret = ensure_pack_rebuild_request_column(
+			db, worker_lease_expires_at_column_sql,
+			add_worker_lease_expires_at_sql, "worker_lease_expires_at");
+	if (!ret)
+		ret = ensure_pack_rebuild_request_column(db, worker_claimed_at_column_sql,
+						  add_worker_claimed_at_sql,
+						  "worker_claimed_at");
+	if (!ret)
+		ret = ensure_pack_rebuild_request_column(db, attempts_column_sql,
+						  add_attempts_sql, "attempts");
+	if (!ret)
+		ret = ensure_pack_rebuild_request_column(db, last_error_column_sql,
+						  add_last_error_sql, "last_error");
+	if (!ret)
+		ret = query_one_u64(db, claimable_index_sql, &indexes, &found);
+	if (!ret && (!found || indexes > 1))
+		ret = set_error(db, VEX_META_MYSQL_ERR_SCHEMA,
+				"invalid Vex pack rebuild request claimable index");
+	if (!ret && !indexes)
+		ret = mysql_exec(db, add_claimable_index_sql);
+
+	release_ret = query_one_u64(db, unlock_sql, &released, &release_found);
+	if (!ret && (release_ret || !release_found || released != 1)) {
+		if (release_ret)
+			ret = release_ret;
+		else
+			ret = set_error(db, VEX_META_MYSQL_ERR_STATE,
+					"lost Vex pack-worker schema migration lock");
+	}
+	return ret;
 }
 
 /*
@@ -1490,11 +1647,39 @@ int vex_meta_mysql_schema_check(struct vex_meta_mysql *db,
 		"(column_name = 'oid' AND data_type = 'binary') OR "
 		"(column_name = 'obj_type' AND data_type = 'tinyint') OR "
 		"(column_name = 'size' AND data_type = 'bigint'))";
+	static const char rebuild_request_lease_columns_sql[] =
+		"SELECT COUNT(*) FROM information_schema.columns "
+		"WHERE table_schema = DATABASE() "
+		"AND table_name = 'pack_rebuild_requests' AND ("
+		"(column_name = 'worker_lease_id' AND data_type = 'binary' "
+		"AND character_maximum_length = 16 AND is_nullable = 'YES') OR "
+		"(column_name = 'claimed_target_generation' "
+		"AND column_type = 'bigint unsigned' AND is_nullable = 'YES') OR "
+		"(column_name = 'worker_lease_expires_at' AND data_type = 'datetime' "
+		"AND datetime_precision = 6 AND is_nullable = 'YES') OR "
+		"(column_name = 'worker_claimed_at' AND data_type = 'datetime' "
+		"AND datetime_precision = 6 AND is_nullable = 'YES') OR "
+		"(column_name = 'attempts' AND column_type = 'int unsigned' "
+		"AND is_nullable = 'NO' AND column_default = '0') OR "
+		"(column_name = 'last_error' AND data_type = 'varbinary' "
+		"AND character_maximum_length = 1024 AND is_nullable = 'YES'))";
+	static const char rebuild_request_claimable_index_sql[] =
+		"SELECT COUNT(*) = 3 AND COALESCE(SUM(CASE "
+		"WHEN seq_in_index = 1 AND column_name = 'not_before' THEN 1 "
+		"WHEN seq_in_index = 2 AND column_name = 'worker_lease_expires_at' THEN 1 "
+		"WHEN seq_in_index = 3 AND column_name = 'repo_id' THEN 1 "
+		"ELSE 0 END), 0) = 3 "
+		"FROM information_schema.statistics "
+		"WHERE table_schema = DATABASE() "
+		"AND table_name = 'pack_rebuild_requests' "
+		"AND index_name = 'pack_rebuild_requests_claimable'";
 	uint64_t tables;
 	uint64_t blob_key;
 	uint64_t heartbeat;
 	uint64_t receive_columns;
 	uint64_t received_object_columns;
+	uint64_t rebuild_request_lease_columns;
+	uint64_t rebuild_request_claimable_index;
 	int found;
 	int ret;
 
@@ -1507,6 +1692,9 @@ int vex_meta_mysql_schema_check(struct vex_meta_mysql *db,
 	if (ret)
 		return ret;
 	ret = ensure_pack_rebuild_requests_table(db);
+	if (ret)
+		return ret;
+	ret = ensure_pack_rebuild_request_worker_lease_schema(db);
 	if (ret)
 		return ret;
 	ret = ensure_sweep_tombstones_table(db);
@@ -1550,6 +1738,20 @@ int vex_meta_mysql_schema_check(struct vex_meta_mysql *db,
 	if (!found || received_object_columns != 5)
 		return set_error(db, VEX_META_MYSQL_ERR_SCHEMA,
 				 "received_pack_objects metadata schema is incomplete");
+	ret = query_one_u64(db, rebuild_request_lease_columns_sql,
+				    &rebuild_request_lease_columns, &found);
+	if (ret)
+		return ret;
+	if (!found || rebuild_request_lease_columns != 6)
+		return set_error(db, VEX_META_MYSQL_ERR_SCHEMA,
+				 "pack rebuild worker lease metadata schema is incomplete");
+	ret = query_one_u64(db, rebuild_request_claimable_index_sql,
+				    &rebuild_request_claimable_index, &found);
+	if (ret)
+		return ret;
+	if (!found || rebuild_request_claimable_index != 1)
+		return set_error(db, VEX_META_MYSQL_ERR_SCHEMA,
+				 "pack rebuild worker claimable index is incomplete");
 	ret = ensure_ref_updates_id_index(db);
 	if (ret)
 		return ret;

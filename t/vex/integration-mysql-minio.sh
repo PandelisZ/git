@@ -22,7 +22,7 @@ set -a
 set +a
 compose=(docker compose -f "$docker_dir/compose.yaml" --env-file "$env_file")
 
-expected_tables=13
+expected_tables=14
 table_count=$("${compose[@]}" exec -T mysql \
 	mysql --protocol=TCP -h 127.0.0.1 -u "$MYSQL_USER" -p"$MYSQL_PASSWORD" -N -B "$MYSQL_DATABASE" \
 	-e "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name IN ('repositories','generations','objects','generation_objects','commit_parents','refs','ref_updates','object_pins','pack_envelopes','pack_objects','clone_leases','pack_rebuild_requests','object_sweep_tombstones');")
@@ -36,6 +36,22 @@ blob_key_type=$("${compose[@]}" exec -T mysql \
 	-e "SELECT DATA_TYPE FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name = 'objects' AND column_name = 'blob_key';")
 [ "$blob_key_type" = 'varbinary' ] || {
 	printf 'vex integration: objects.blob_key must be metadata (VARBINARY), got %s\n' "$blob_key_type" >&2
+	exit 1
+}
+
+pack_worker_columns=$("${compose[@]}" exec -T mysql \
+	mysql --protocol=TCP -h 127.0.0.1 -u "$MYSQL_USER" -p"$MYSQL_PASSWORD" -N -B "$MYSQL_DATABASE" \
+	-e "SELECT COUNT(*) FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name = 'pack_rebuild_requests' AND ((column_name = 'worker_lease_id' AND data_type = 'binary' AND character_maximum_length = 16 AND is_nullable = 'YES') OR (column_name = 'claimed_target_generation' AND column_type = 'bigint unsigned' AND is_nullable = 'YES') OR (column_name = 'worker_lease_expires_at' AND data_type = 'datetime' AND datetime_precision = 6 AND is_nullable = 'YES') OR (column_name = 'worker_claimed_at' AND data_type = 'datetime' AND datetime_precision = 6 AND is_nullable = 'YES') OR (column_name = 'attempts' AND column_type = 'int unsigned' AND is_nullable = 'NO' AND column_default = '0') OR (column_name = 'last_error' AND data_type = 'varbinary' AND character_maximum_length = 1024 AND is_nullable = 'YES'));" )
+[ "$pack_worker_columns" = 6 ] || {
+	printf 'vex integration: pack rebuild worker lease metadata is incomplete (%s of 6 fields)\n' "$pack_worker_columns" >&2
+	exit 1
+}
+
+pack_worker_claimable_index=$("${compose[@]}" exec -T mysql \
+	mysql --protocol=TCP -h 127.0.0.1 -u "$MYSQL_USER" -p"$MYSQL_PASSWORD" -N -B "$MYSQL_DATABASE" \
+	-e "SELECT COUNT(*) = 3 AND COALESCE(SUM(CASE WHEN seq_in_index = 1 AND column_name = 'not_before' THEN 1 WHEN seq_in_index = 2 AND column_name = 'worker_lease_expires_at' THEN 1 WHEN seq_in_index = 3 AND column_name = 'repo_id' THEN 1 ELSE 0 END), 0) = 3 FROM information_schema.statistics WHERE table_schema = DATABASE() AND table_name = 'pack_rebuild_requests' AND index_name = 'pack_rebuild_requests_claimable';")
+[ "$pack_worker_claimable_index" = 1 ] || {
+	printf '%s\n' 'vex integration: pack rebuild worker claimable index is incomplete' >&2
 	exit 1
 }
 

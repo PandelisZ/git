@@ -202,15 +202,26 @@ CREATE TABLE IF NOT EXISTS clone_leases (
 -- A receive only advances target_generation; it never builds a pack while
 -- holding the repository publish boundary.  not_before starts one bounded
 -- debounce window for a batch and is intentionally not pushed forward by
--- every later receive, so a busy repository cannot starve its builder.
+-- every later receive, so a busy repository cannot starve its builder.  The
+-- worker lease is metadata only: Git object and pack bytes remain in blob
+-- storage, and a claimed target keeps a slow worker from publishing stale
+-- work after a newer receive advances the request.
 CREATE TABLE IF NOT EXISTS pack_rebuild_requests (
 	repo_id BINARY(16) NOT NULL,
 	target_generation BIGINT UNSIGNED NOT NULL,
 	requested_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
 	last_requested_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
 	not_before DATETIME(6) NOT NULL,
+	worker_lease_id BINARY(16) NULL,
+	claimed_target_generation BIGINT UNSIGNED NULL,
+	worker_lease_expires_at DATETIME(6) NULL,
+	worker_claimed_at DATETIME(6) NULL,
+	attempts INT UNSIGNED NOT NULL DEFAULT 0,
+	last_error VARBINARY(1024) NULL,
 	PRIMARY KEY (repo_id),
 	KEY pack_rebuild_requests_due (not_before, repo_id),
+	KEY pack_rebuild_requests_claimable
+		(not_before, worker_lease_expires_at, repo_id),
 	CONSTRAINT pack_rebuild_requests_repo_fk FOREIGN KEY (repo_id)
 		REFERENCES repositories (repo_id)
 ) ENGINE=InnoDB;
