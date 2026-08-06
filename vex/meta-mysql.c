@@ -3821,7 +3821,10 @@ int vex_meta_mysql_current_sealed_pack(struct vex_meta_mysql *db,
 	 * A build can sample a generation before a concurrent push seals a newer
 	 * one, then insert its row afterwards.  Selecting by state alone would
 	 * make that stale snapshot readable.  Require exact equality with the
-	 * newest sealed generation on every selection instead.
+	 * newest sealed generation on every selection instead.  A compact derived
+	 * artifact may coexist with the canonical raw receive pack at that same
+	 * generation; prefer the derived artifact deterministically for relay while
+	 * retaining the raw map as the canonical membership and recovery anchor.
 	 */
 	sql = vex_format("SELECT p.pack_id, p.pack_key, p.idx_key, "
 			 "p.covering_generation FROM pack_envelopes AS p "
@@ -3830,7 +3833,8 @@ int vex_meta_mysql_current_sealed_pack(struct vex_meta_mysql *db,
 			 "AND p.covering_generation = "
 			 "(SELECT MAX(g.generation) FROM generations AS g "
 			 "WHERE g.repo_id = %s AND g.state = 'sealed') "
-			 "ORDER BY p.sealed_at DESC, p.pack_id LIMIT 1",
+			 "ORDER BY (p.source_kind = 'derived') DESC, p.sealed_at DESC, "
+			 "p.pack_id LIMIT 1",
 			 repo, repo);
 	if (!sql) {
 		ret = set_error(db, VEX_META_MYSQL_ERR_NOMEM,

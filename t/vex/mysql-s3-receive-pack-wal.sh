@@ -266,6 +266,12 @@ done
 "$stock_git" -C "$fixture" branch side HEAD~1
 "$stock_git" -C "$fixture" tag -a -m 'Vex receive-pack WAL annotated fixture tag' fixture-v1
 "$stock_git" clone --mirror --no-local -q "$fixture" "$mirror"
+# Keep the pushed raw pack intentionally non-delta so the post-seed compactor
+# must produce a distinct, smaller full snapshot rather than reusing this
+# fixture's source representation.  These settings belong only to the source
+# mirror; the Vex repository retains its normal pack defaults.
+"$stock_git" --git-dir="$mirror" config pack.window 0
+"$stock_git" --git-dir="$mirror" config pack.depth 0
 "$stock_git" --git-dir="$mirror" repack -adf --write-bitmap-index
 
 shopt -s nullglob
@@ -312,10 +318,10 @@ receive_rows=$(mysql_query "SELECT COUNT(*) FROM pack_envelopes WHERE repo_id = 
 	printf 'vex receive-pack WAL E2E: expected one raw receive envelope, found %s\n' "$receive_rows" >&2
 	exit 1
 }
-IFS=$'\t' read -r pack_id pack_state pack_source_kind full_snapshot pack_key idx_key <<EOF
-$(mysql_query "SELECT LOWER(LEFT(HEX(pack_id), $oid_hex_len)), state, source_kind, is_full_snapshot, pack_key, idx_key FROM pack_envelopes WHERE repo_id = UNHEX('$repo_id') AND source_kind = 'receive';")
+IFS=$'\t' read -r pack_id covering_generation pack_state pack_source_kind full_snapshot pack_key idx_key <<EOF
+$(mysql_query "SELECT LOWER(LEFT(HEX(pack_id), $oid_hex_len)), covering_generation, state, source_kind, is_full_snapshot, pack_key, idx_key FROM pack_envelopes WHERE repo_id = UNHEX('$repo_id') AND source_kind = 'receive';")
 EOF
-[ -n "$pack_id" ] && [ "$pack_state" = sealed ] &&
+[ -n "$pack_id" ] && [ "$covering_generation" -gt 0 ] && [ "$pack_state" = sealed ] &&
 	[ "$pack_source_kind" = receive ] && [ "$full_snapshot" = 1 ] || {
 	printf '%s\n' 'vex receive-pack WAL E2E: raw receive envelope is not sealed full-snapshot metadata' >&2
 	exit 1
@@ -358,6 +364,67 @@ assert_minio_object_exists "$idx_key"
 assert_minio_object_missing "git/v1/$repo_id/objects/$main_oid"
 assert_minio_staging_prefix_empty "git/v1/$repo_id/staging/"
 
+# The raw pack remains canonical for recovery and membership, but an explicit
+# post-seed compactor may publish a second, smaller complete S3 pack for clone
+# relay.  This path must not materialize legacy loose-object metadata merely
+# to satisfy `pack_objects`.
+compact_output=$(VEX_COMPOSE_NO_BUILD=1 VEX_COMPOSE_ALREADY_UP=1 \
+	"$root/scripts/vex/build-pack.sh" --from-receive "$repo_name")
+case "$compact_output" in
+*"vex build-pack: PASS repository=$repo_name"*' pack='*' objects='*' pack_key='*' idx_key='*) ;;
+*)
+	printf 'vex receive-pack WAL E2E: unexpected raw compact-builder output: %s\n' \
+		"$compact_output" >&2
+	exit 1
+	;;
+esac
+derived_rows=$(mysql_query "SELECT COUNT(*) FROM pack_envelopes WHERE repo_id = UNHEX('$repo_id') AND source_kind = 'derived' AND state = 'sealed' AND covering_generation = (SELECT MAX(generation) FROM generations WHERE repo_id = UNHEX('$repo_id') AND state = 'sealed');")
+[ "$derived_rows" = 1 ] || {
+	printf 'vex receive-pack WAL E2E: expected one current compact derived envelope, found %s\n' \
+		"$derived_rows" >&2
+	exit 1
+}
+IFS=$'\t' read -r compact_pack_id compact_generation compact_full compact_pack_key compact_idx_key <<EOF
+$(mysql_query "SELECT LOWER(LEFT(HEX(pack_id), $oid_hex_len)), covering_generation, is_full_snapshot, pack_key, idx_key FROM pack_envelopes WHERE repo_id = UNHEX('$repo_id') AND source_kind = 'derived' AND state = 'sealed' ORDER BY sealed_at DESC, pack_id LIMIT 1;")
+EOF
+[ -n "$compact_pack_id" ] && [ "$compact_generation" = "$covering_generation" ] &&
+	[ "$compact_full" = 1 ] || {
+	printf 'vex receive-pack WAL E2E: compact derived envelope metadata is invalid: %s:%s:%s\n' \
+		"$compact_pack_id" "$compact_generation" "$compact_full" >&2
+	exit 1
+}
+[ "$compact_pack_id" != "$pack_id" ] || {
+	printf '%s\n' 'vex receive-pack WAL E2E: compact fixture unexpectedly reused the raw pack checksum' >&2
+	exit 1
+}
+[ "$compact_pack_key" = "git/v1/$repo_id/packs/$compact_pack_id.pack" ] &&
+	[ "$compact_idx_key" = "git/v1/$repo_id/packs/$compact_pack_id.idx" ] || {
+	printf 'vex receive-pack WAL E2E: compact derived keys are non-canonical: %s %s\n' \
+		"$compact_pack_key" "$compact_idx_key" >&2
+	exit 1
+}
+compact_pack_mysql_id=$(mysql_oid "$compact_pack_id")
+compact_members=$(mysql_query "SELECT COUNT(*) FROM pack_objects WHERE repo_id = UNHEX('$repo_id') AND pack_id = UNHEX('$compact_pack_mysql_id');")
+[ "$compact_members" = 0 ] || {
+	printf 'vex receive-pack WAL E2E: compact raw-derived envelope unexpectedly has %s legacy pack-object rows\n' \
+		"$compact_members" >&2
+	exit 1
+}
+raw_members_after_compaction=$(mysql_query "SELECT COUNT(*) FROM received_pack_objects WHERE repo_id = UNHEX('$repo_id') AND pack_id = UNHEX('$pack_mysql_id');")
+[ "$raw_members_after_compaction" = "$expected_members" ] || {
+	printf 'vex receive-pack WAL E2E: compact publication changed raw membership (%s != %s)\n' \
+		"$raw_members_after_compaction" "$expected_members" >&2
+	exit 1
+}
+selection_kind=$(mysql_query "SELECT source_kind FROM pack_envelopes AS p WHERE p.repo_id = UNHEX('$repo_id') AND p.state = 'sealed' AND p.is_full_snapshot = TRUE AND p.idx_key IS NOT NULL AND p.covering_generation = (SELECT MAX(generation) FROM generations AS g WHERE g.repo_id = UNHEX('$repo_id') AND g.state = 'sealed') ORDER BY (p.source_kind = 'derived') DESC, p.sealed_at DESC, p.pack_id LIMIT 1;")
+[ "$selection_kind" = derived ] || {
+	printf 'vex receive-pack WAL E2E: compact derived envelope is not the deterministic current selection (%s)\n' \
+		"$selection_kind" >&2
+	exit 1
+}
+assert_minio_object_exists "$compact_pack_key"
+assert_minio_object_exists "$compact_idx_key"
+
 local_refs=$("$stock_git" --git-dir="$mirror" \
 	for-each-ref --format='%(objectname)%09%(refname)' | LC_ALL=C sort)
 remote_refs=$(git_https ls-remote --refs "$origin" | LC_ALL=C sort)
@@ -376,13 +443,32 @@ remote_head=$(git_https ls-remote "$origin" HEAD |
 }
 
 clone_and_verify_relay() {
-	local protocol clone_path trace
+	local protocol clone_path trace expected_pack
+	local -a cloned_packs
 
 	protocol=$1
 	clone_path=$2
 	trace=$3
-	GIT_TRACE_PACKET="$trace" git_https -c "protocol.version=$protocol" \
+	expected_pack=$4
+	# Small fixtures are normally unpacked by the stock client (the default
+	# fetch.unpackLimit is 100), which would erase the received pack checksum
+	# before this test can assert the relay artifact.  Keep any multi-object
+	# response as a pack solely for this wire-level assertion.
+	GIT_TRACE_PACKET="$trace" git_https -c fetch.unpackLimit=1 -c "protocol.version=$protocol" \
 		clone -q "$origin" "$clone_path"
+	shopt -s nullglob
+	cloned_packs=("$clone_path"/.git/objects/pack/pack-*.pack)
+	shopt -u nullglob
+	[ "${#cloned_packs[@]}" -eq 1 ] || {
+		printf 'vex receive-pack WAL E2E: protocol-v%s clone has %s packed object files, expected one compact relay pack\n' \
+			"$protocol" "${#cloned_packs[@]}" >&2
+		return 1
+	}
+	[ "${cloned_packs[0]##*/}" = "pack-$expected_pack.pack" ] || {
+		printf 'vex receive-pack WAL E2E: protocol-v%s clone received %s instead of compact pack-%s.pack\n' \
+			"$protocol" "${cloned_packs[0]##*/}" "$expected_pack" >&2
+		return 1
+	}
 	[ "$("$stock_git" -C "$clone_path" rev-parse HEAD)" = "$main_oid" ] || {
 		printf 'vex receive-pack WAL E2E: protocol-v%s clone HEAD differs from sealed main\n' "$protocol" >&2
 		return 1
@@ -398,22 +484,23 @@ clone_and_verify_relay() {
 	"$stock_git" -C "$clone_path" fsck --no-progress >/dev/null
 }
 
-# The raw WAL seed is now fully sealed and MySQL/S3-verified.  Turn the seed
-# gate off, then use the same fault seam as the direct-pack test: passing the
-# following clones proves upload-pack did not invoke git-pack-objects.  The
-# annotated tag makes protocol-v0's include-tag negotiation part of this
-# raw-pack relay contract too.
+# The raw WAL seed and compact derived snapshot are now MySQL/S3-verified.
+# Turn the seed gate off, then use the same fault seam as the direct-pack test:
+# passing the following clones proves upload-pack did not invoke git-pack-objects
+# and the received client pack checksum proves it selected the compact artifact.
+# The annotated tag makes protocol-v0's include-tag negotiation part of this
+# relay contract too.
 restore_gateway
 clone_v0="$scratch/clone-v0"
 clone_v2="$scratch/clone-v2"
 activate_gateway_relay_fault
-clone_and_verify_relay 0 "$clone_v0" "$scratch/v0.trace"
-clone_and_verify_relay 2 "$clone_v2" "$scratch/v2.trace"
+clone_and_verify_relay 0 "$clone_v0" "$scratch/v0.trace" "$compact_pack_id"
+clone_and_verify_relay 2 "$clone_v2" "$scratch/v2.trace" "$compact_pack_id"
 grep -Eq 'clone< version 2$' "$scratch/v2.trace" || {
 	printf '%s\n' 'vex receive-pack WAL E2E: stock clone did not negotiate protocol v2' >&2
 	exit 1
 }
 
 restore_gateway
-printf 'vex receive-pack WAL E2E: PASS stock non-thin initial mirror refs=%s objects=%s pack=%s; sealed MySQL map and canonical S3 pack/idx verified; protocol-v0/v2 raw-pack relay clones with annotated tag and fsck passed without git-pack-objects for %s\n' \
-	"$expected_refs" "$expected_members" "$pack_id" "$origin"
+printf 'vex receive-pack WAL E2E: PASS stock non-thin initial mirror refs=%s objects=%s raw_pack=%s compact_pack=%s; raw MySQL map retained, compact S3 pack/idx selected, and protocol-v0/v2 annotated-tag fsck clones received the compact pack without git-pack-objects for %s\n' \
+	"$expected_refs" "$expected_members" "$pack_id" "$compact_pack_id" "$origin"
