@@ -2,6 +2,7 @@
 
 #ifdef VEX_META_MYSQL_STORE
 #include "git-compat-util.h"
+#include "refs.h"
 #include "strbuf.h"
 #include "trace.h"
 #include "vex/store-internal.h"
@@ -3950,6 +3951,60 @@ static int receive_pack_manifest_count(struct vex_meta_mysql *db,
 }
 
 /*
+ * `git init --ref-format=vex` persists HEAD before the first object exists.
+ * It is a harmless discovery scaffold, not evidence of an existing Git
+ * history.  Keep the raw full-seed boundary narrow: this is the only
+ * pre-existing ref we ever admit, its symbolic target must be a valid unborn
+ * branch, and it remains untouched while the seed creates real refs below
+ * refs/.
+ */
+static int receive_pack_require_unborn_head_scaffold_locked(
+		struct vex_meta_mysql *db, const char *repo)
+{
+	char *sql = NULL;
+	char symref_target[1025];
+	uint64_t refs;
+	int found;
+	int ret;
+
+	sql = vex_format("SELECT COUNT(*) FROM refs WHERE repo_id = %s", repo);
+	if (!sql)
+		return set_error(db, VEX_META_MYSQL_ERR_NOMEM,
+				 "could not allocate Vex full-seed ref count");
+	ret = query_one_u64(db, sql, &refs, &found);
+	free(sql);
+	if (ret)
+		return ret;
+	if (!found)
+		return set_error(db, VEX_META_MYSQL_ERR,
+				 "MySQL did not return Vex full-seed ref count");
+
+	sql = vex_format("SELECT h.symref_target FROM refs AS h WHERE h.repo_id = %s "
+			 "AND h.refname = _binary'HEAD' AND h.is_symbolic = TRUE "
+			 "AND h.target_oid IS NULL AND h.peeled_oid IS NULL "
+			 "AND h.symref_target IS NOT NULL AND INSTR(h.symref_target, X'00') = 0 "
+			 "AND NOT EXISTS (SELECT 1 FROM refs AS target "
+			 "WHERE target.repo_id = h.repo_id "
+			 "AND target.refname = h.symref_target)", repo);
+	if (!sql)
+		return set_error(db, VEX_META_MYSQL_ERR_NOMEM,
+				 "could not allocate Vex unborn HEAD scaffold check");
+	ret = query_one_text(db, sql, symref_target, sizeof(symref_target), &found);
+	free(sql);
+	if (ret)
+		return ret;
+	if (!found)
+		return set_error(db, VEX_META_MYSQL_ERR,
+				 "MySQL did not return Vex unborn HEAD scaffold");
+	if (refs != 1 || !starts_with(symref_target, "refs/heads/") ||
+	    check_refname_format(symref_target, 0))
+		return set_error(db, VEX_META_MYSQL_ERR_CONFLICT,
+				 "raw receive-pack full snapshot requires only the unborn "
+				 "HEAD -> refs/heads/* scaffold");
+	return VEX_META_MYSQL_OK;
+}
+
+/*
  * Import the metadata-only object map for a first full mirror.  The local
  * pack/idx pair has already been validated and staged in S3; this method
  * receives only a trusted TSV manifest and never reads Git payload bytes.
@@ -3968,7 +4023,7 @@ int vex_meta_mysql_receive_pack_stage_manifest(
 		"PRIMARY KEY (oid_hex)"
 		") ENGINE=InnoDB";
 	static const char *const seed_tables[] = {
-		"refs", "objects", "pack_envelopes",
+		"objects", "pack_envelopes",
 	};
 	char *repo = NULL;
 	char *pack_id = NULL;
@@ -4137,7 +4192,7 @@ int vex_meta_mysql_receive_pack_stage_manifest(
 		goto out;
 	}
 
-	/* First-seed gate: no existing ref/object/pack may make this incomplete. */
+	/* First-seed gate: only init's unborn HEAD may pre-exist. */
 	sql = vex_format("SELECT COUNT(*) FROM generations WHERE repo_id = %s "
 			 "AND generation = %" PRIu64 " AND state = 'open'", repo, generation);
 	if (!sql) {
@@ -4155,6 +4210,8 @@ int vex_meta_mysql_receive_pack_stage_manifest(
 				"cannot stage a raw pack in a non-open Vex generation");
 		goto out;
 	}
+	if ((ret = receive_pack_require_unborn_head_scaffold_locked(db, repo)))
+		goto out;
 	for (table_i = 0; table_i < ARRAY_SIZE(seed_tables); table_i++) {
 		sql = vex_format("SELECT COUNT(*) FROM %s WHERE repo_id = %s", seed_tables[table_i],
 				 repo);
@@ -5736,31 +5793,6 @@ int vex_meta_mysql_receive_pack_get_building_locked(
 	return ret;
 }
 
-static int receive_pack_require_empty_refs_locked(struct vex_meta_mysql *db,
-						    const char *repo)
-{
-	char *sql;
-	uint64_t refs;
-	int found;
-	int ret;
-
-	sql = vex_format("SELECT COUNT(*) FROM refs WHERE repo_id = %s", repo);
-	if (!sql)
-		return set_error(db, VEX_META_MYSQL_ERR_NOMEM,
-				 "could not allocate Vex full-seed ref check");
-	ret = query_one_u64(db, sql, &refs, &found);
-	free(sql);
-	if (ret)
-		return ret;
-	if (!found)
-		return set_error(db, VEX_META_MYSQL_ERR,
-				 "MySQL did not return Vex full-seed ref count");
-	if (refs)
-		return set_error(db, VEX_META_MYSQL_ERR_CONFLICT,
-				 "raw receive-pack full snapshot requires zero existing refs");
-	return VEX_META_MYSQL_OK;
-}
-
 static int receive_pack_require_member_locked(struct vex_meta_mysql *db,
 					       const char *repo,
 					       const unsigned char pack_id[VEX_META_MYSQL_OID_BYTES],
@@ -5807,6 +5839,7 @@ static int receive_pack_seed_update_valid(struct vex_meta_mysql *db,
 {
 	if (!update || !update->refname || !*update->refname ||
 	    strlen(update->refname) > 1024 ||
+	    !strcmp(update->refname, "HEAD") ||
 	    update->old_target.type != VEX_REF_TARGET_NONE ||
 	    update->expected_version || update->new_target.type != VEX_REF_TARGET_OID ||
 	    (update->actor && strlen(update->actor) > 255) ||
@@ -5815,7 +5848,7 @@ static int receive_pack_seed_update_valid(struct vex_meta_mysql *db,
 	    (update->is_fast_forward != -1 && update->is_fast_forward != 0 &&
 	     update->is_fast_forward != 1))
 		return set_error(db, VEX_META_MYSQL_ERR_INVALID,
-				 "raw receive-pack seed supports only new OID refs");
+				 "raw receive-pack seed supports only new OID refs and preserves HEAD");
 	return VEX_META_MYSQL_OK;
 }
 
@@ -5931,7 +5964,7 @@ int vex_meta_mysql_receive_pack_seal_locked(
 		goto out;
 	}
 	if ((ret = receive_pack_find_building_sql_locked(db, repo, generation, pack_id)) ||
-	    (ret = receive_pack_require_empty_refs_locked(db, repo)))
+	    (ret = receive_pack_require_unborn_head_scaffold_locked(db, repo)))
 		goto out;
 	for (i = 0; i < updates_nr; i++) {
 		if ((ret = receive_pack_seed_update_valid(db, &updates[i])) ||
