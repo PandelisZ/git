@@ -1,0 +1,1145 @@
+{
+  "benchmark": "vex-stock-git-https-clone-controls",
+  "benchmark_id": "vex-clone-74b445d0-3193-4a2a-b7b5-b806e5a0aa1f",
+  "disk_control": {
+    "cv_percent": 1.3477,
+    "max_ms": 12098.692,
+    "mean_ms": 11853.599,
+    "min_ms": 11619.534,
+    "n": 5,
+    "p50_ms": 11844.713,
+    "p90_ms": 12098.692,
+    "p95_ms": 12098.692,
+    "p99_ms": 12098.692,
+    "raw_trial_ids": [
+      "measured-disk_control-1",
+      "measured-disk_control-2",
+      "measured-disk_control-3",
+      "measured-disk_control-4",
+      "measured-disk_control-5"
+    ],
+    "samples": [
+      {
+        "argv": [
+          "/usr/bin/git",
+          "clone",
+          "--quiet",
+          "--no-checkout",
+          "--branch",
+          "master",
+          "https://localhost:8443/__vex_bench_disk__/git-git-disk.git",
+          "/var/folders/qs/t9tw9znd54zdkdp00bdlbh6h0000gn/T/vex-clone-bench.omAWNm/measured-disk_control-1"
+        ],
+        "completed_at_utc": "2026-08-06T05:00:51.246Z",
+        "elapsed_ms": 11844.713,
+        "fsck": "clean",
+        "iteration": 1,
+        "object_store_bytes": 167467853,
+        "operation": "clone",
+        "phase": "measured",
+        "series": "disk_control",
+        "source": "https://localhost:8443/__vex_bench_disk__/git-git-disk.git",
+        "started_at_utc": "2026-08-06T05:00:14.169Z",
+        "status": "passed",
+        "tip": "2c78326f810173a4f3aefd8021f1e07575412481",
+        "trial_id": "measured-disk_control-1"
+      },
+      {
+        "argv": [
+          "/usr/bin/git",
+          "clone",
+          "--quiet",
+          "--no-checkout",
+          "--branch",
+          "master",
+          "https://localhost:8443/__vex_bench_disk__/git-git-disk.git",
+          "/var/folders/qs/t9tw9znd54zdkdp00bdlbh6h0000gn/T/vex-clone-bench.omAWNm/measured-disk_control-2"
+        ],
+        "completed_at_utc": "2026-08-06T05:02:11.788Z",
+        "elapsed_ms": 12098.692,
+        "fsck": "clean",
+        "iteration": 2,
+        "object_store_bytes": 167383258,
+        "operation": "clone",
+        "phase": "measured",
+        "series": "disk_control",
+        "source": "https://localhost:8443/__vex_bench_disk__/git-git-disk.git",
+        "started_at_utc": "2026-08-06T05:01:35.423Z",
+        "status": "passed",
+        "tip": "2c78326f810173a4f3aefd8021f1e07575412481",
+        "trial_id": "measured-disk_control-2"
+      },
+      {
+        "argv": [
+          "/usr/bin/git",
+          "clone",
+          "--quiet",
+          "--no-checkout",
+          "--branch",
+          "master",
+          "https://localhost:8443/__vex_bench_disk__/git-git-disk.git",
+          "/var/folders/qs/t9tw9znd54zdkdp00bdlbh6h0000gn/T/vex-clone-bench.omAWNm/measured-disk_control-3"
+        ],
+        "completed_at_utc": "2026-08-06T05:05:29.010Z",
+        "elapsed_ms": 11772.97,
+        "fsck": "clean",
+        "iteration": 3,
+        "object_store_bytes": 167470706,
+        "operation": "clone",
+        "phase": "measured",
+        "series": "disk_control",
+        "source": "https://localhost:8443/__vex_bench_disk__/git-git-disk.git",
+        "started_at_utc": "2026-08-06T05:04:52.665Z",
+        "status": "passed",
+        "tip": "2c78326f810173a4f3aefd8021f1e07575412481",
+        "trial_id": "measured-disk_control-3"
+      },
+      {
+        "argv": [
+          "/usr/bin/git",
+          "clone",
+          "--quiet",
+          "--no-checkout",
+          "--branch",
+          "master",
+          "https://localhost:8443/__vex_bench_disk__/git-git-disk.git",
+          "/var/folders/qs/t9tw9znd54zdkdp00bdlbh6h0000gn/T/vex-clone-bench.omAWNm/measured-disk_control-4"
+        ],
+        "completed_at_utc": "2026-08-06T05:06:41.417Z",
+        "elapsed_ms": 11932.087,
+        "fsck": "clean",
+        "iteration": 4,
+        "object_store_bytes": 167552356,
+        "operation": "clone",
+        "phase": "measured",
+        "series": "disk_control",
+        "source": "https://localhost:8443/__vex_bench_disk__/git-git-disk.git",
+        "started_at_utc": "2026-08-06T05:06:05.078Z",
+        "status": "passed",
+        "tip": "2c78326f810173a4f3aefd8021f1e07575412481",
+        "trial_id": "measured-disk_control-4"
+      },
+      {
+        "argv": [
+          "/usr/bin/git",
+          "clone",
+          "--quiet",
+          "--no-checkout",
+          "--branch",
+          "master",
+          "https://localhost:8443/__vex_bench_disk__/git-git-disk.git",
+          "/var/folders/qs/t9tw9znd54zdkdp00bdlbh6h0000gn/T/vex-clone-bench.omAWNm/measured-disk_control-5"
+        ],
+        "completed_at_utc": "2026-08-06T05:08:01.333Z",
+        "elapsed_ms": 11619.534,
+        "fsck": "clean",
+        "iteration": 5,
+        "object_store_bytes": 167456923,
+        "operation": "clone",
+        "phase": "measured",
+        "series": "disk_control",
+        "source": "https://localhost:8443/__vex_bench_disk__/git-git-disk.git",
+        "started_at_utc": "2026-08-06T05:07:25.530Z",
+        "status": "passed",
+        "tip": "2c78326f810173a4f3aefd8021f1e07575412481",
+        "trial_id": "measured-disk_control-5"
+      }
+    ],
+    "stdev_ms": 159.748
+  },
+  "fixture": {
+    "name": "git-git",
+    "seed_manifest": {
+      "declared": {
+        "commit_count": 203031,
+        "created_at": "2026-08-06T04:45:24.437357Z",
+        "default_branch": "master",
+        "head": "2c78326f810173a4f3aefd8021f1e07575412481",
+        "object_count": 847120,
+        "pack_bytes": 596057242,
+        "upstream": "https://github.com/git/git"
+      },
+      "path": "t/vex/out/seed-manifest.json",
+      "sha256": "8321819f0a036c8c7b9b5b5810b4ec132ce2503b3b8e0252b63d1bfa53c84035"
+    }
+  },
+  "gates": {
+    "disk_control": {
+      "disk_transport": "https",
+      "evaluated": true,
+      "fixed_l4_path": true,
+      "l4_eligible_control": true,
+      "name": "vex_p50_le_1.5x_disk_p50",
+      "observed_ratio_p50": 0.9992,
+      "pass": true,
+      "required": true,
+      "same_https_frontend": true,
+      "threshold_pass": true,
+      "threshold_ratio": 1.5
+    },
+    "fetch_after_push": {
+      "evaluated": false,
+      "name": "vex_fetch_p50_le_2x_disk_fetch_p50",
+      "pass": null,
+      "required": false
+    },
+    "github": {
+      "evaluated": true,
+      "name": "vex_p50_le_1.5x_github_p50",
+      "observed_ratio_p50": 0.7217,
+      "pass": true,
+      "required": true,
+      "threshold_ratio": 1.5
+    },
+    "stability": {
+      "evaluated": true,
+      "max_cv_percent": 15.0,
+      "minimum_trials": 5,
+      "name": "coefficient_of_variation",
+      "pass": true,
+      "required": true,
+      "series": {
+        "disk_control": {
+          "cv_percent": 1.3477,
+          "n": 5,
+          "pass": true
+        },
+        "github": {
+          "cv_percent": 2.9847,
+          "n": 5,
+          "pass": true
+        },
+        "vex_https": {
+          "cv_percent": 3.1952,
+          "n": 5,
+          "pass": true
+        }
+      }
+    }
+  },
+  "github": {
+    "cv_percent": 2.9847,
+    "max_ms": 16600.932,
+    "mean_ms": 16147.131,
+    "min_ms": 15242.013,
+    "n": 5,
+    "p50_ms": 16398.417,
+    "p90_ms": 16600.932,
+    "p95_ms": 16600.932,
+    "p99_ms": 16600.932,
+    "raw_trial_ids": [
+      "measured-github-1",
+      "measured-github-2",
+      "measured-github-3",
+      "measured-github-4",
+      "measured-github-5"
+    ],
+    "samples": [
+      {
+        "argv": [
+          "/usr/bin/git",
+          "clone",
+          "--quiet",
+          "--no-checkout",
+          "--branch",
+          "master",
+          "https://github.com/git/git",
+          "/var/folders/qs/t9tw9znd54zdkdp00bdlbh6h0000gn/T/vex-clone-bench.omAWNm/measured-github-1"
+        ],
+        "completed_at_utc": "2026-08-06T05:01:35.408Z",
+        "elapsed_ms": 16398.417,
+        "fsck": "clean",
+        "iteration": 1,
+        "object_store_bytes": 330024324,
+        "operation": "clone",
+        "phase": "measured",
+        "series": "github",
+        "source": "https://github.com/git/git",
+        "started_at_utc": "2026-08-06T05:00:51.255Z",
+        "status": "passed",
+        "tip": "2c78326f810173a4f3aefd8021f1e07575412481",
+        "trial_id": "measured-github-1"
+      },
+      {
+        "argv": [
+          "/usr/bin/git",
+          "clone",
+          "--quiet",
+          "--no-checkout",
+          "--branch",
+          "master",
+          "https://github.com/git/git",
+          "/var/folders/qs/t9tw9znd54zdkdp00bdlbh6h0000gn/T/vex-clone-bench.omAWNm/measured-github-2"
+        ],
+        "completed_at_utc": "2026-08-06T05:02:55.548Z",
+        "elapsed_ms": 16084.324,
+        "fsck": "clean",
+        "iteration": 2,
+        "object_store_bytes": 330024324,
+        "operation": "clone",
+        "phase": "measured",
+        "series": "github",
+        "source": "https://github.com/git/git",
+        "started_at_utc": "2026-08-06T05:02:11.796Z",
+        "status": "passed",
+        "tip": "2c78326f810173a4f3aefd8021f1e07575412481",
+        "trial_id": "measured-github-2"
+      },
+      {
+        "argv": [
+          "/usr/bin/git",
+          "clone",
+          "--quiet",
+          "--no-checkout",
+          "--branch",
+          "master",
+          "https://github.com/git/git",
+          "/var/folders/qs/t9tw9znd54zdkdp00bdlbh6h0000gn/T/vex-clone-bench.omAWNm/measured-github-3"
+        ],
+        "completed_at_utc": "2026-08-06T05:04:15.743Z",
+        "elapsed_ms": 16600.932,
+        "fsck": "clean",
+        "iteration": 3,
+        "object_store_bytes": 330024324,
+        "operation": "clone",
+        "phase": "measured",
+        "series": "github",
+        "source": "https://github.com/git/git",
+        "started_at_utc": "2026-08-06T05:03:31.473Z",
+        "status": "passed",
+        "tip": "2c78326f810173a4f3aefd8021f1e07575412481",
+        "trial_id": "measured-github-3"
+      },
+      {
+        "argv": [
+          "/usr/bin/git",
+          "clone",
+          "--quiet",
+          "--no-checkout",
+          "--branch",
+          "master",
+          "https://github.com/git/git",
+          "/var/folders/qs/t9tw9znd54zdkdp00bdlbh6h0000gn/T/vex-clone-bench.omAWNm/measured-github-4"
+        ],
+        "completed_at_utc": "2026-08-06T05:07:25.514Z",
+        "elapsed_ms": 16409.971,
+        "fsck": "clean",
+        "iteration": 4,
+        "object_store_bytes": 330246130,
+        "operation": "clone",
+        "phase": "measured",
+        "series": "github",
+        "source": "https://github.com/git/git",
+        "started_at_utc": "2026-08-06T05:06:41.426Z",
+        "status": "passed",
+        "tip": "2c78326f810173a4f3aefd8021f1e07575412481",
+        "trial_id": "measured-github-4"
+      },
+      {
+        "argv": [
+          "/usr/bin/git",
+          "clone",
+          "--quiet",
+          "--no-checkout",
+          "--branch",
+          "master",
+          "https://github.com/git/git",
+          "/var/folders/qs/t9tw9znd54zdkdp00bdlbh6h0000gn/T/vex-clone-bench.omAWNm/measured-github-5"
+        ],
+        "completed_at_utc": "2026-08-06T05:08:44.223Z",
+        "elapsed_ms": 15242.013,
+        "fsck": "clean",
+        "iteration": 5,
+        "object_store_bytes": 330024324,
+        "operation": "clone",
+        "phase": "measured",
+        "series": "github",
+        "source": "https://github.com/git/git",
+        "started_at_utc": "2026-08-06T05:08:01.341Z",
+        "status": "passed",
+        "tip": "2c78326f810173a4f3aefd8021f1e07575412481",
+        "trial_id": "measured-github-5"
+      }
+    ],
+    "stdev_ms": 481.944
+  },
+  "identity": {
+    "compose": {
+      "file": "vex/docker/compose.yaml",
+      "project": "vex",
+      "sha256": "22c64627dd794b152401419dd275ba2c0fd91ccba9223b43ada52a976c335e70"
+    },
+    "environment": {
+      "cpu_count": 14,
+      "docker_compose_version": "5.1.2",
+      "git_version": "git version 2.50.1 (Apple Git-155)",
+      "host": "Pandeliss-MacBook-Pro.local",
+      "platform": "macOS-26.5.2-arm64-arm-64bit-Mach-O",
+      "python": "3.14.6"
+    },
+    "source": {
+      "dirty": null,
+      "git_commit": "abe3b56fc196d87ede640fe62069ec130dd1a36f",
+      "repository_root": "git"
+    }
+  },
+  "l4_claim_reason": "numeric benchmark evidence is necessary but not sufficient for L4",
+  "l4_success_claim": false,
+  "measurement_only": false,
+  "policy": {
+    "clone_trials": 5,
+    "max_cv_percent": 15.0,
+    "max_disk_ratio": 1.5,
+    "max_fetch_ratio": 2.0,
+    "max_github_ratio": 1.5,
+    "minimum_trials_for_stability": 5,
+    "require_disk_gate": true,
+    "require_fetch_after_push_gate": false,
+    "require_github": true,
+    "require_stable": true,
+    "warmups_per_source": 1
+  },
+  "ratio_vex_to_disk_control": {
+    "p50": 0.9992,
+    "p90": 1.0508,
+    "p95": 1.0508
+  },
+  "ratio_vex_to_github": {
+    "p50": 0.7217,
+    "p90": 0.7658,
+    "p95": 0.7658
+  },
+  "ref": {
+    "name": "refs/heads/master",
+    "oid": "2c78326f810173a4f3aefd8021f1e07575412481",
+    "stable_across_clone_measurement": true
+  },
+  "result": {
+    "enforced_failures": [],
+    "status": "measured"
+  },
+  "sample_order": [
+    [
+      "vex_https",
+      "disk_control",
+      "github"
+    ],
+    [
+      "disk_control",
+      "github",
+      "vex_https"
+    ],
+    [
+      "github",
+      "vex_https",
+      "disk_control"
+    ],
+    [
+      "vex_https",
+      "disk_control",
+      "github"
+    ],
+    [
+      "disk_control",
+      "github",
+      "vex_https"
+    ]
+  ],
+  "schema_version": 2,
+  "sources": {
+    "disk_control": {
+      "fixed_l4_path": true,
+      "ref_oid": "2c78326f810173a4f3aefd8021f1e07575412481",
+      "same_https_frontend": true,
+      "source": "https://localhost:8443/__vex_bench_disk__/git-git-disk.git",
+      "transport": "https"
+    },
+    "github": {
+      "included": true,
+      "ref_oid": "2c78326f810173a4f3aefd8021f1e07575412481",
+      "url": "https://github.com/git/git"
+    },
+    "vex_https": {
+      "ref_oid": "2c78326f810173a4f3aefd8021f1e07575412481",
+      "transport": "https",
+      "url": "https://localhost:8443/git/git.git"
+    }
+  },
+  "stock_git": "/usr/bin/git",
+  "timestamp_utc": "2026-08-06T04:57:38.582Z",
+  "trials": [
+    {
+      "argv": [
+        "/usr/bin/git",
+        "clone",
+        "--quiet",
+        "--no-checkout",
+        "--branch",
+        "master",
+        "https://localhost:8443/git/git.git",
+        "/var/folders/qs/t9tw9znd54zdkdp00bdlbh6h0000gn/T/vex-clone-bench.omAWNm/warmup-vex_https-1"
+      ],
+      "completed_at_utc": "2026-08-06T04:58:18.549Z",
+      "elapsed_ms": 11444.053,
+      "fsck": "clean",
+      "iteration": 1,
+      "object_store_bytes": 156669186,
+      "operation": "clone",
+      "phase": "warmup",
+      "series": "vex_https",
+      "source": "https://localhost:8443/git/git.git",
+      "started_at_utc": "2026-08-06T04:57:42.868Z",
+      "status": "passed",
+      "tip": "2c78326f810173a4f3aefd8021f1e07575412481",
+      "trial_id": "warmup-vex_https-1"
+    },
+    {
+      "argv": [
+        "/usr/bin/git",
+        "clone",
+        "--quiet",
+        "--no-checkout",
+        "--branch",
+        "master",
+        "https://localhost:8443/__vex_bench_disk__/git-git-disk.git",
+        "/var/folders/qs/t9tw9znd54zdkdp00bdlbh6h0000gn/T/vex-clone-bench.omAWNm/warmup-disk_control-1"
+      ],
+      "completed_at_utc": "2026-08-06T04:58:54.519Z",
+      "elapsed_ms": 11709.556,
+      "fsck": "clean",
+      "iteration": 1,
+      "object_store_bytes": 167445437,
+      "operation": "clone",
+      "phase": "warmup",
+      "series": "disk_control",
+      "source": "https://localhost:8443/__vex_bench_disk__/git-git-disk.git",
+      "started_at_utc": "2026-08-06T04:58:18.556Z",
+      "status": "passed",
+      "tip": "2c78326f810173a4f3aefd8021f1e07575412481",
+      "trial_id": "warmup-disk_control-1"
+    },
+    {
+      "argv": [
+        "/usr/bin/git",
+        "clone",
+        "--quiet",
+        "--no-checkout",
+        "--branch",
+        "master",
+        "https://github.com/git/git",
+        "/var/folders/qs/t9tw9znd54zdkdp00bdlbh6h0000gn/T/vex-clone-bench.omAWNm/warmup-github-1"
+      ],
+      "completed_at_utc": "2026-08-06T04:59:37.924Z",
+      "elapsed_ms": 15723.214,
+      "fsck": "clean",
+      "iteration": 1,
+      "object_store_bytes": 330024324,
+      "operation": "clone",
+      "phase": "warmup",
+      "series": "github",
+      "source": "https://github.com/git/git",
+      "started_at_utc": "2026-08-06T04:58:54.527Z",
+      "status": "passed",
+      "tip": "2c78326f810173a4f3aefd8021f1e07575412481",
+      "trial_id": "warmup-github-1"
+    },
+    {
+      "argv": [
+        "/usr/bin/git",
+        "clone",
+        "--quiet",
+        "--no-checkout",
+        "--branch",
+        "master",
+        "https://localhost:8443/git/git.git",
+        "/var/folders/qs/t9tw9znd54zdkdp00bdlbh6h0000gn/T/vex-clone-bench.omAWNm/measured-vex_https-1"
+      ],
+      "completed_at_utc": "2026-08-06T05:00:14.160Z",
+      "elapsed_ms": 11928.24,
+      "fsck": "clean",
+      "iteration": 1,
+      "object_store_bytes": 156669186,
+      "operation": "clone",
+      "phase": "measured",
+      "series": "vex_https",
+      "source": "https://localhost:8443/git/git.git",
+      "started_at_utc": "2026-08-06T04:59:37.940Z",
+      "status": "passed",
+      "tip": "2c78326f810173a4f3aefd8021f1e07575412481",
+      "trial_id": "measured-vex_https-1"
+    },
+    {
+      "argv": [
+        "/usr/bin/git",
+        "clone",
+        "--quiet",
+        "--no-checkout",
+        "--branch",
+        "master",
+        "https://localhost:8443/__vex_bench_disk__/git-git-disk.git",
+        "/var/folders/qs/t9tw9znd54zdkdp00bdlbh6h0000gn/T/vex-clone-bench.omAWNm/measured-disk_control-1"
+      ],
+      "completed_at_utc": "2026-08-06T05:00:51.246Z",
+      "elapsed_ms": 11844.713,
+      "fsck": "clean",
+      "iteration": 1,
+      "object_store_bytes": 167467853,
+      "operation": "clone",
+      "phase": "measured",
+      "series": "disk_control",
+      "source": "https://localhost:8443/__vex_bench_disk__/git-git-disk.git",
+      "started_at_utc": "2026-08-06T05:00:14.169Z",
+      "status": "passed",
+      "tip": "2c78326f810173a4f3aefd8021f1e07575412481",
+      "trial_id": "measured-disk_control-1"
+    },
+    {
+      "argv": [
+        "/usr/bin/git",
+        "clone",
+        "--quiet",
+        "--no-checkout",
+        "--branch",
+        "master",
+        "https://github.com/git/git",
+        "/var/folders/qs/t9tw9znd54zdkdp00bdlbh6h0000gn/T/vex-clone-bench.omAWNm/measured-github-1"
+      ],
+      "completed_at_utc": "2026-08-06T05:01:35.408Z",
+      "elapsed_ms": 16398.417,
+      "fsck": "clean",
+      "iteration": 1,
+      "object_store_bytes": 330024324,
+      "operation": "clone",
+      "phase": "measured",
+      "series": "github",
+      "source": "https://github.com/git/git",
+      "started_at_utc": "2026-08-06T05:00:51.255Z",
+      "status": "passed",
+      "tip": "2c78326f810173a4f3aefd8021f1e07575412481",
+      "trial_id": "measured-github-1"
+    },
+    {
+      "argv": [
+        "/usr/bin/git",
+        "clone",
+        "--quiet",
+        "--no-checkout",
+        "--branch",
+        "master",
+        "https://localhost:8443/__vex_bench_disk__/git-git-disk.git",
+        "/var/folders/qs/t9tw9znd54zdkdp00bdlbh6h0000gn/T/vex-clone-bench.omAWNm/measured-disk_control-2"
+      ],
+      "completed_at_utc": "2026-08-06T05:02:11.788Z",
+      "elapsed_ms": 12098.692,
+      "fsck": "clean",
+      "iteration": 2,
+      "object_store_bytes": 167383258,
+      "operation": "clone",
+      "phase": "measured",
+      "series": "disk_control",
+      "source": "https://localhost:8443/__vex_bench_disk__/git-git-disk.git",
+      "started_at_utc": "2026-08-06T05:01:35.423Z",
+      "status": "passed",
+      "tip": "2c78326f810173a4f3aefd8021f1e07575412481",
+      "trial_id": "measured-disk_control-2"
+    },
+    {
+      "argv": [
+        "/usr/bin/git",
+        "clone",
+        "--quiet",
+        "--no-checkout",
+        "--branch",
+        "master",
+        "https://github.com/git/git",
+        "/var/folders/qs/t9tw9znd54zdkdp00bdlbh6h0000gn/T/vex-clone-bench.omAWNm/measured-github-2"
+      ],
+      "completed_at_utc": "2026-08-06T05:02:55.548Z",
+      "elapsed_ms": 16084.324,
+      "fsck": "clean",
+      "iteration": 2,
+      "object_store_bytes": 330024324,
+      "operation": "clone",
+      "phase": "measured",
+      "series": "github",
+      "source": "https://github.com/git/git",
+      "started_at_utc": "2026-08-06T05:02:11.796Z",
+      "status": "passed",
+      "tip": "2c78326f810173a4f3aefd8021f1e07575412481",
+      "trial_id": "measured-github-2"
+    },
+    {
+      "argv": [
+        "/usr/bin/git",
+        "clone",
+        "--quiet",
+        "--no-checkout",
+        "--branch",
+        "master",
+        "https://localhost:8443/git/git.git",
+        "/var/folders/qs/t9tw9znd54zdkdp00bdlbh6h0000gn/T/vex-clone-bench.omAWNm/measured-vex_https-2"
+      ],
+      "completed_at_utc": "2026-08-06T05:03:31.467Z",
+      "elapsed_ms": 11829.741,
+      "fsck": "clean",
+      "iteration": 2,
+      "object_store_bytes": 156669186,
+      "operation": "clone",
+      "phase": "measured",
+      "series": "vex_https",
+      "source": "https://localhost:8443/git/git.git",
+      "started_at_utc": "2026-08-06T05:02:55.562Z",
+      "status": "passed",
+      "tip": "2c78326f810173a4f3aefd8021f1e07575412481",
+      "trial_id": "measured-vex_https-2"
+    },
+    {
+      "argv": [
+        "/usr/bin/git",
+        "clone",
+        "--quiet",
+        "--no-checkout",
+        "--branch",
+        "master",
+        "https://github.com/git/git",
+        "/var/folders/qs/t9tw9znd54zdkdp00bdlbh6h0000gn/T/vex-clone-bench.omAWNm/measured-github-3"
+      ],
+      "completed_at_utc": "2026-08-06T05:04:15.743Z",
+      "elapsed_ms": 16600.932,
+      "fsck": "clean",
+      "iteration": 3,
+      "object_store_bytes": 330024324,
+      "operation": "clone",
+      "phase": "measured",
+      "series": "github",
+      "source": "https://github.com/git/git",
+      "started_at_utc": "2026-08-06T05:03:31.473Z",
+      "status": "passed",
+      "tip": "2c78326f810173a4f3aefd8021f1e07575412481",
+      "trial_id": "measured-github-3"
+    },
+    {
+      "argv": [
+        "/usr/bin/git",
+        "clone",
+        "--quiet",
+        "--no-checkout",
+        "--branch",
+        "master",
+        "https://localhost:8443/git/git.git",
+        "/var/folders/qs/t9tw9znd54zdkdp00bdlbh6h0000gn/T/vex-clone-bench.omAWNm/measured-vex_https-3"
+      ],
+      "completed_at_utc": "2026-08-06T05:04:52.656Z",
+      "elapsed_ms": 12713.606,
+      "fsck": "clean",
+      "iteration": 3,
+      "object_store_bytes": 156669186,
+      "operation": "clone",
+      "phase": "measured",
+      "series": "vex_https",
+      "source": "https://localhost:8443/git/git.git",
+      "started_at_utc": "2026-08-06T05:04:15.757Z",
+      "status": "passed",
+      "tip": "2c78326f810173a4f3aefd8021f1e07575412481",
+      "trial_id": "measured-vex_https-3"
+    },
+    {
+      "argv": [
+        "/usr/bin/git",
+        "clone",
+        "--quiet",
+        "--no-checkout",
+        "--branch",
+        "master",
+        "https://localhost:8443/__vex_bench_disk__/git-git-disk.git",
+        "/var/folders/qs/t9tw9znd54zdkdp00bdlbh6h0000gn/T/vex-clone-bench.omAWNm/measured-disk_control-3"
+      ],
+      "completed_at_utc": "2026-08-06T05:05:29.010Z",
+      "elapsed_ms": 11772.97,
+      "fsck": "clean",
+      "iteration": 3,
+      "object_store_bytes": 167470706,
+      "operation": "clone",
+      "phase": "measured",
+      "series": "disk_control",
+      "source": "https://localhost:8443/__vex_bench_disk__/git-git-disk.git",
+      "started_at_utc": "2026-08-06T05:04:52.665Z",
+      "status": "passed",
+      "tip": "2c78326f810173a4f3aefd8021f1e07575412481",
+      "trial_id": "measured-disk_control-3"
+    },
+    {
+      "argv": [
+        "/usr/bin/git",
+        "clone",
+        "--quiet",
+        "--no-checkout",
+        "--branch",
+        "master",
+        "https://localhost:8443/git/git.git",
+        "/var/folders/qs/t9tw9znd54zdkdp00bdlbh6h0000gn/T/vex-clone-bench.omAWNm/measured-vex_https-4"
+      ],
+      "completed_at_utc": "2026-08-06T05:06:05.071Z",
+      "elapsed_ms": 11835.342,
+      "fsck": "clean",
+      "iteration": 4,
+      "object_store_bytes": 156669186,
+      "operation": "clone",
+      "phase": "measured",
+      "series": "vex_https",
+      "source": "https://localhost:8443/git/git.git",
+      "started_at_utc": "2026-08-06T05:05:29.019Z",
+      "status": "passed",
+      "tip": "2c78326f810173a4f3aefd8021f1e07575412481",
+      "trial_id": "measured-vex_https-4"
+    },
+    {
+      "argv": [
+        "/usr/bin/git",
+        "clone",
+        "--quiet",
+        "--no-checkout",
+        "--branch",
+        "master",
+        "https://localhost:8443/__vex_bench_disk__/git-git-disk.git",
+        "/var/folders/qs/t9tw9znd54zdkdp00bdlbh6h0000gn/T/vex-clone-bench.omAWNm/measured-disk_control-4"
+      ],
+      "completed_at_utc": "2026-08-06T05:06:41.417Z",
+      "elapsed_ms": 11932.087,
+      "fsck": "clean",
+      "iteration": 4,
+      "object_store_bytes": 167552356,
+      "operation": "clone",
+      "phase": "measured",
+      "series": "disk_control",
+      "source": "https://localhost:8443/__vex_bench_disk__/git-git-disk.git",
+      "started_at_utc": "2026-08-06T05:06:05.078Z",
+      "status": "passed",
+      "tip": "2c78326f810173a4f3aefd8021f1e07575412481",
+      "trial_id": "measured-disk_control-4"
+    },
+    {
+      "argv": [
+        "/usr/bin/git",
+        "clone",
+        "--quiet",
+        "--no-checkout",
+        "--branch",
+        "master",
+        "https://github.com/git/git",
+        "/var/folders/qs/t9tw9znd54zdkdp00bdlbh6h0000gn/T/vex-clone-bench.omAWNm/measured-github-4"
+      ],
+      "completed_at_utc": "2026-08-06T05:07:25.514Z",
+      "elapsed_ms": 16409.971,
+      "fsck": "clean",
+      "iteration": 4,
+      "object_store_bytes": 330246130,
+      "operation": "clone",
+      "phase": "measured",
+      "series": "github",
+      "source": "https://github.com/git/git",
+      "started_at_utc": "2026-08-06T05:06:41.426Z",
+      "status": "passed",
+      "tip": "2c78326f810173a4f3aefd8021f1e07575412481",
+      "trial_id": "measured-github-4"
+    },
+    {
+      "argv": [
+        "/usr/bin/git",
+        "clone",
+        "--quiet",
+        "--no-checkout",
+        "--branch",
+        "master",
+        "https://localhost:8443/__vex_bench_disk__/git-git-disk.git",
+        "/var/folders/qs/t9tw9znd54zdkdp00bdlbh6h0000gn/T/vex-clone-bench.omAWNm/measured-disk_control-5"
+      ],
+      "completed_at_utc": "2026-08-06T05:08:01.333Z",
+      "elapsed_ms": 11619.534,
+      "fsck": "clean",
+      "iteration": 5,
+      "object_store_bytes": 167456923,
+      "operation": "clone",
+      "phase": "measured",
+      "series": "disk_control",
+      "source": "https://localhost:8443/__vex_bench_disk__/git-git-disk.git",
+      "started_at_utc": "2026-08-06T05:07:25.530Z",
+      "status": "passed",
+      "tip": "2c78326f810173a4f3aefd8021f1e07575412481",
+      "trial_id": "measured-disk_control-5"
+    },
+    {
+      "argv": [
+        "/usr/bin/git",
+        "clone",
+        "--quiet",
+        "--no-checkout",
+        "--branch",
+        "master",
+        "https://github.com/git/git",
+        "/var/folders/qs/t9tw9znd54zdkdp00bdlbh6h0000gn/T/vex-clone-bench.omAWNm/measured-github-5"
+      ],
+      "completed_at_utc": "2026-08-06T05:08:44.223Z",
+      "elapsed_ms": 15242.013,
+      "fsck": "clean",
+      "iteration": 5,
+      "object_store_bytes": 330024324,
+      "operation": "clone",
+      "phase": "measured",
+      "series": "github",
+      "source": "https://github.com/git/git",
+      "started_at_utc": "2026-08-06T05:08:01.341Z",
+      "status": "passed",
+      "tip": "2c78326f810173a4f3aefd8021f1e07575412481",
+      "trial_id": "measured-github-5"
+    },
+    {
+      "argv": [
+        "/usr/bin/git",
+        "clone",
+        "--quiet",
+        "--no-checkout",
+        "--branch",
+        "master",
+        "https://localhost:8443/git/git.git",
+        "/var/folders/qs/t9tw9znd54zdkdp00bdlbh6h0000gn/T/vex-clone-bench.omAWNm/measured-vex_https-5"
+      ],
+      "completed_at_utc": "2026-08-06T05:09:19.881Z",
+      "elapsed_ms": 11594.886,
+      "fsck": "clean",
+      "iteration": 5,
+      "object_store_bytes": 156669186,
+      "operation": "clone",
+      "phase": "measured",
+      "series": "vex_https",
+      "source": "https://localhost:8443/git/git.git",
+      "started_at_utc": "2026-08-06T05:08:44.234Z",
+      "status": "passed",
+      "tip": "2c78326f810173a4f3aefd8021f1e07575412481",
+      "trial_id": "measured-vex_https-5"
+    }
+  ],
+  "vex_https": {
+    "cv_percent": 3.1952,
+    "max_ms": 12713.606,
+    "mean_ms": 11980.363,
+    "min_ms": 11594.886,
+    "n": 5,
+    "p50_ms": 11835.342,
+    "p90_ms": 12713.606,
+    "p95_ms": 12713.606,
+    "p99_ms": 12713.606,
+    "raw_trial_ids": [
+      "measured-vex_https-1",
+      "measured-vex_https-2",
+      "measured-vex_https-3",
+      "measured-vex_https-4",
+      "measured-vex_https-5"
+    ],
+    "samples": [
+      {
+        "argv": [
+          "/usr/bin/git",
+          "clone",
+          "--quiet",
+          "--no-checkout",
+          "--branch",
+          "master",
+          "https://localhost:8443/git/git.git",
+          "/var/folders/qs/t9tw9znd54zdkdp00bdlbh6h0000gn/T/vex-clone-bench.omAWNm/measured-vex_https-1"
+        ],
+        "completed_at_utc": "2026-08-06T05:00:14.160Z",
+        "elapsed_ms": 11928.24,
+        "fsck": "clean",
+        "iteration": 1,
+        "object_store_bytes": 156669186,
+        "operation": "clone",
+        "phase": "measured",
+        "series": "vex_https",
+        "source": "https://localhost:8443/git/git.git",
+        "started_at_utc": "2026-08-06T04:59:37.940Z",
+        "status": "passed",
+        "tip": "2c78326f810173a4f3aefd8021f1e07575412481",
+        "trial_id": "measured-vex_https-1"
+      },
+      {
+        "argv": [
+          "/usr/bin/git",
+          "clone",
+          "--quiet",
+          "--no-checkout",
+          "--branch",
+          "master",
+          "https://localhost:8443/git/git.git",
+          "/var/folders/qs/t9tw9znd54zdkdp00bdlbh6h0000gn/T/vex-clone-bench.omAWNm/measured-vex_https-2"
+        ],
+        "completed_at_utc": "2026-08-06T05:03:31.467Z",
+        "elapsed_ms": 11829.741,
+        "fsck": "clean",
+        "iteration": 2,
+        "object_store_bytes": 156669186,
+        "operation": "clone",
+        "phase": "measured",
+        "series": "vex_https",
+        "source": "https://localhost:8443/git/git.git",
+        "started_at_utc": "2026-08-06T05:02:55.562Z",
+        "status": "passed",
+        "tip": "2c78326f810173a4f3aefd8021f1e07575412481",
+        "trial_id": "measured-vex_https-2"
+      },
+      {
+        "argv": [
+          "/usr/bin/git",
+          "clone",
+          "--quiet",
+          "--no-checkout",
+          "--branch",
+          "master",
+          "https://localhost:8443/git/git.git",
+          "/var/folders/qs/t9tw9znd54zdkdp00bdlbh6h0000gn/T/vex-clone-bench.omAWNm/measured-vex_https-3"
+        ],
+        "completed_at_utc": "2026-08-06T05:04:52.656Z",
+        "elapsed_ms": 12713.606,
+        "fsck": "clean",
+        "iteration": 3,
+        "object_store_bytes": 156669186,
+        "operation": "clone",
+        "phase": "measured",
+        "series": "vex_https",
+        "source": "https://localhost:8443/git/git.git",
+        "started_at_utc": "2026-08-06T05:04:15.757Z",
+        "status": "passed",
+        "tip": "2c78326f810173a4f3aefd8021f1e07575412481",
+        "trial_id": "measured-vex_https-3"
+      },
+      {
+        "argv": [
+          "/usr/bin/git",
+          "clone",
+          "--quiet",
+          "--no-checkout",
+          "--branch",
+          "master",
+          "https://localhost:8443/git/git.git",
+          "/var/folders/qs/t9tw9znd54zdkdp00bdlbh6h0000gn/T/vex-clone-bench.omAWNm/measured-vex_https-4"
+        ],
+        "completed_at_utc": "2026-08-06T05:06:05.071Z",
+        "elapsed_ms": 11835.342,
+        "fsck": "clean",
+        "iteration": 4,
+        "object_store_bytes": 156669186,
+        "operation": "clone",
+        "phase": "measured",
+        "series": "vex_https",
+        "source": "https://localhost:8443/git/git.git",
+        "started_at_utc": "2026-08-06T05:05:29.019Z",
+        "status": "passed",
+        "tip": "2c78326f810173a4f3aefd8021f1e07575412481",
+        "trial_id": "measured-vex_https-4"
+      },
+      {
+        "argv": [
+          "/usr/bin/git",
+          "clone",
+          "--quiet",
+          "--no-checkout",
+          "--branch",
+          "master",
+          "https://localhost:8443/git/git.git",
+          "/var/folders/qs/t9tw9znd54zdkdp00bdlbh6h0000gn/T/vex-clone-bench.omAWNm/measured-vex_https-5"
+        ],
+        "completed_at_utc": "2026-08-06T05:09:19.881Z",
+        "elapsed_ms": 11594.886,
+        "fsck": "clean",
+        "iteration": 5,
+        "object_store_bytes": 156669186,
+        "operation": "clone",
+        "phase": "measured",
+        "series": "vex_https",
+        "source": "https://localhost:8443/git/git.git",
+        "started_at_utc": "2026-08-06T05:08:44.234Z",
+        "status": "passed",
+        "tip": "2c78326f810173a4f3aefd8021f1e07575412481",
+        "trial_id": "measured-vex_https-5"
+      }
+    ],
+    "stdev_ms": 382.798
+  },
+  "warmups": [
+    {
+      "argv": [
+        "/usr/bin/git",
+        "clone",
+        "--quiet",
+        "--no-checkout",
+        "--branch",
+        "master",
+        "https://localhost:8443/git/git.git",
+        "/var/folders/qs/t9tw9znd54zdkdp00bdlbh6h0000gn/T/vex-clone-bench.omAWNm/warmup-vex_https-1"
+      ],
+      "completed_at_utc": "2026-08-06T04:58:18.549Z",
+      "elapsed_ms": 11444.053,
+      "fsck": "clean",
+      "iteration": 1,
+      "object_store_bytes": 156669186,
+      "operation": "clone",
+      "phase": "warmup",
+      "series": "vex_https",
+      "source": "https://localhost:8443/git/git.git",
+      "started_at_utc": "2026-08-06T04:57:42.868Z",
+      "status": "passed",
+      "tip": "2c78326f810173a4f3aefd8021f1e07575412481",
+      "trial_id": "warmup-vex_https-1"
+    },
+    {
+      "argv": [
+        "/usr/bin/git",
+        "clone",
+        "--quiet",
+        "--no-checkout",
+        "--branch",
+        "master",
+        "https://localhost:8443/__vex_bench_disk__/git-git-disk.git",
+        "/var/folders/qs/t9tw9znd54zdkdp00bdlbh6h0000gn/T/vex-clone-bench.omAWNm/warmup-disk_control-1"
+      ],
+      "completed_at_utc": "2026-08-06T04:58:54.519Z",
+      "elapsed_ms": 11709.556,
+      "fsck": "clean",
+      "iteration": 1,
+      "object_store_bytes": 167445437,
+      "operation": "clone",
+      "phase": "warmup",
+      "series": "disk_control",
+      "source": "https://localhost:8443/__vex_bench_disk__/git-git-disk.git",
+      "started_at_utc": "2026-08-06T04:58:18.556Z",
+      "status": "passed",
+      "tip": "2c78326f810173a4f3aefd8021f1e07575412481",
+      "trial_id": "warmup-disk_control-1"
+    },
+    {
+      "argv": [
+        "/usr/bin/git",
+        "clone",
+        "--quiet",
+        "--no-checkout",
+        "--branch",
+        "master",
+        "https://github.com/git/git",
+        "/var/folders/qs/t9tw9znd54zdkdp00bdlbh6h0000gn/T/vex-clone-bench.omAWNm/warmup-github-1"
+      ],
+      "completed_at_utc": "2026-08-06T04:59:37.924Z",
+      "elapsed_ms": 15723.214,
+      "fsck": "clean",
+      "iteration": 1,
+      "object_store_bytes": 330024324,
+      "operation": "clone",
+      "phase": "warmup",
+      "series": "github",
+      "source": "https://github.com/git/git",
+      "started_at_utc": "2026-08-06T04:58:54.527Z",
+      "status": "passed",
+      "tip": "2c78326f810173a4f3aefd8021f1e07575412481",
+      "trial_id": "warmup-github-1"
+    }
+  ]
+}
