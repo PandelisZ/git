@@ -1,0 +1,66 @@
+{
+  "caveat": {
+    "client_timed_raw_ingest_seconds": null,
+    "reason": "The initial seed completed before the raw-gate sidecar receipt existed. This record must not be read as an exact client-timed five-minute gate result."
+  },
+  "evidence_kind": "historical-vex-git-git-raw-pack-seed",
+  "observed_at_utc": "2026-08-06T02:56:23Z",
+  "schema_version": 1,
+  "source": {
+    "commit_count": 203031,
+    "head": {
+      "oid": "2c78326f810173a4f3aefd8021f1e07575412481",
+      "ref": "refs/heads/master"
+    },
+    "object_count": 847120,
+    "refs": {
+      "count": 4271,
+      "sha256": "0442b9dd5921756b6febffdfe75ebf5da62aa876480130d9406a49545bbec1e6"
+    }
+  },
+  "target": {
+    "head": {
+      "oid": "2c78326f810173a4f3aefd8021f1e07575412481",
+      "ref": "refs/heads/master"
+    },
+    "refs": {
+      "count": 4271,
+      "sha256": "0442b9dd5921756b6febffdfe75ebf5da62aa876480130d9406a49545bbec1e6"
+    },
+    "refs_match_source": true
+  },
+  "timing": {
+    "raw_ingest_budget_seconds": 300,
+    "server_generation_allocation_to_seal": {
+      "elapsed_seconds": 248.00811,
+      "end_utc": "2026-08-06T02:00:57.749508Z",
+      "start_utc": "2026-08-06T01:56:49.741398Z",
+      "within_budget": true
+    }
+  },
+  "vex": {
+    "raw_receive_pack": {
+      "covering_generation": 10,
+      "id": "36fe99600eecb12df2ebc58107150bb052c13768",
+      "idx": {
+        "bytes": 23720432,
+        "key": "git/v1/61a7611225b1c39958a4e8c508683156/packs/36fe99600eecb12df2ebc58107150bb052c13768.idx",
+        "s3_stat_verified": true
+      },
+      "is_full_snapshot": true,
+      "object_map": {
+        "count": 847120,
+        "table": "received_pack_objects"
+      },
+      "pack": {
+        "bytes": 596057242,
+        "key": "git/v1/61a7611225b1c39958a4e8c508683156/packs/36fe99600eecb12df2ebc58107150bb052c13768.pack",
+        "s3_stat_verified": true
+      },
+      "source_kind": "receive",
+      "state": "sealed"
+    },
+    "repository": "git/git.git",
+    "repository_id": "61a7611225b1c39958a4e8c508683156"
+  }
+}
