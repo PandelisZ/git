@@ -46,11 +46,18 @@ COPY vex/docker/git-http/vex_mysql_s3_http.py /usr/local/lib/vex-git-http/vex_my
 COPY vex/docker/git-http/vex-init-repo /usr/local/bin/vex-init-repo
 COPY vex/docker/git-http/vex-init-mysql-s3-repo /usr/local/bin/vex-init-mysql-s3-repo
 
+ENV GIT_EXEC_PATH=/opt/vex-git
+
 RUN chmod 0755 /usr/local/bin/vex-git-http-entrypoint \
 		/usr/local/bin/vex-init-repo \
 		/usr/local/bin/vex-init-mysql-s3-repo \
 		/usr/local/lib/vex-git-http/vex_mysql_s3_http.py \
 	&& mkdir -p /srv/git /var/git-scratch /usr/local/lib/vex-git-http/bin \
+	&& ln -s git /opt/vex-git/git-upload-pack \
+	&& ln -s git /opt/vex-git/git-receive-pack \
+	&& ln -s git /opt/vex-git/git-refs \
+	&& ln -s git /opt/vex-git/git-commit-graph \
+	&& ln -s git /opt/vex-git/git-multi-pack-index \
 	&& ln -s /opt/vex-git/git /usr/local/lib/vex-git-http/bin/git \
 	&& ln -s /opt/vex-git/git /usr/local/lib/vex-git-http/bin/git-upload-pack \
 	&& ln -s /opt/vex-git/git /usr/local/lib/vex-git-http/bin/git-receive-pack
