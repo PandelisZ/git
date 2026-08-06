@@ -2,6 +2,7 @@
 
 import importlib.util
 import io
+import gzip
 import os
 import socket
 import stat
@@ -133,6 +134,25 @@ def request_chunked(port: int, payload: bytes) -> bytes:
         client.close()
 
 
+def request_gzip(port: int, payload: bytes) -> bytes:
+    encoded = gzip.compress(payload)
+    client = socket.create_connection(("127.0.0.1", port), timeout=5)
+    client.settimeout(5)
+    try:
+        client.sendall(
+            b"POST /relay.git/git-upload-pack HTTP/1.1\r\n"
+            b"Host: localhost\r\n"
+            + f"Content-Length: {len(encoded)}\r\n".encode("ascii")
+            + b"Content-Encoding: gzip\r\n"
+            + b"Content-Type: application/x-git-upload-pack-request\r\n\r\n"
+            + encoded
+        )
+        client.shutdown(socket.SHUT_WR)
+        return recv_all(client)
+    finally:
+        client.close()
+
+
 def main() -> int:
     if len(sys.argv) != 2:
         raise SystemExit("usage: test-gateway-streaming.py GATEWAY")
@@ -187,6 +207,8 @@ def main() -> int:
             assert response.endswith(f"late:{len(payload)}".encode("ascii"))
             chunked_response = request_chunked(server.server_address[1], payload[:65537])
             assert chunked_response.endswith(b"late:65537")
+            gzip_response = request_gzip(server.server_address[1], payload[:65537])
+            assert gzip_response.endswith(b"late:65537")
             assert len(captured_stderr.buffer.getvalue()) >= 2 * 256 * 1024
         finally:
             server.shutdown()

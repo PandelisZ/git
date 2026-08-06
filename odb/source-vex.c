@@ -457,15 +457,22 @@ static int vex_source_install_pack_cache(struct odb_source_vex *source,
 	if (safe_create_leading_directories_const(source->base.odb->repo,
 						  pack_path) < 0)
 		goto out;
+	cache = vex_source_open_verified_pack_cache(source, objects_path, artifact);
 	/*
-	 * The index is the pack discovery point.  Serialize installers and publish
-	 * the .pack before the .idx so readers see either a verified old pair or a
-	 * complete new pair, never an index pointing at an absent pack.
+	 * The index is the pack discovery point. A reader can adopt an immutable,
+	 * verified pair without contending on the installer lock: the installer
+	 * publishes .pack before .idx, so it either sees the old complete pair or
+	 * the new complete pair. This also keeps a stale lock left by an interrupted
+	 * installer from delaying every request after a cache was already published.
 	 */
-	if (hold_lock_file_for_update_timeout(&lock, lock_path, LOCK_NO_DEREF,
+	if (!cache &&
+	    hold_lock_file_for_update_timeout(&lock, lock_path, LOCK_NO_DEREF,
 					      30000) < 0)
 		goto out;
-	cache = vex_source_open_verified_pack_cache(source, objects_path, artifact);
+	/* An installer may have completed while this process waited for its lock. */
+	if (!cache)
+		cache = vex_source_open_verified_pack_cache(source, objects_path,
+						      artifact);
 	if (!cache) {
 		unlink(pack_path);
 		unlink(idx_path);

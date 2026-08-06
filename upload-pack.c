@@ -355,9 +355,15 @@ static int vex_precomputed_pack_eligible(struct upload_pack_data *data,
 	    data->depth || data->deepen_since || data->deepen_rev_list ||
 	    data->deepen_relative || data->filter_options.choice ||
 	    data->uri_protocols.nr || strmap_get_size(&data->wanted_refs) ||
-	    data->use_include_tag)
+	    !data->use_ofs_delta)
 		return vex_precomputed_pack_fallback("request is not a complete public clone");
-	/* A client advertising thin-pack may always accept the complete pack. */
+	/*
+	 * A client advertising thin-pack may always accept the complete pack.
+	 * include-tag is also safe here: this immutable full snapshot already
+	 * contains the public annotated tags which pack-objects would add.
+	 * A received pack can use OFS_DELTA, so retain the regular pack-objects
+	 * path for clients which did not advertise ofs-delta.
+	 */
 
 	/*
 	 * A Vex repository owns the primary source.  Refuse alternates: their

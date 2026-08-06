@@ -1,7 +1,6 @@
 """Focused bounded-health-inventory checks for the Vex smart-HTTP gateway."""
 
 import importlib.util
-import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -42,7 +41,7 @@ def main() -> int:
         gateway.HEALTH_SCAN_MAX_DIRECTORIES,
         gateway.HEALTH_SCAN_MAX_DIRECTORY_ENTRIES,
         gateway.HEALTH_SCAN_MAX_DEPTH,
-        gateway.HEALTH_SCAN_MAX_CONFIG_BYTES,
+        gateway.REPOSITORY_CONFIG_MAX_BYTES,
     )
     try:
         with tempfile.TemporaryDirectory(prefix="vex-health-repository-discovery-") as directory:
@@ -104,13 +103,13 @@ def main() -> int:
                 direct_uri,
                 "[extensions]\n\trefStorage = \"" + direct_uri + "\"\n",
             )
-            assert gateway.health_repository_uri(ambiguous) is None
-            assert gateway.health_repository_uri(duplicate) is None
-            assert gateway.health_repository_uri(quoted) is None
+            assert gateway.vex_repository_uri_from_config(ambiguous) is None
+            assert gateway.vex_repository_uri_from_config(duplicate) is None
+            assert gateway.vex_repository_uri_from_config(quoted) is None
 
-            gateway.HEALTH_SCAN_MAX_CONFIG_BYTES = 8
-            assert gateway.health_repository_uri(direct) is None
-            gateway.HEALTH_SCAN_MAX_CONFIG_BYTES = previous_limits[4]
+            gateway.REPOSITORY_CONFIG_MAX_BYTES = 8
+            assert gateway.vex_repository_uri_from_config(direct) is None
+            gateway.REPOSITORY_CONFIG_MAX_BYTES = previous_limits[4]
 
             # A directory cap stops recursion before a nested repository can
             # turn the health response into an unbounded filesystem walk.
@@ -119,19 +118,15 @@ def main() -> int:
                 "healthy.git": direct_uri.removeprefix("vex://"),
             }
 
-            # Normal request routing retains the authoritative Git config
-            # validation; health's filesystem-only fast path never replaces
-            # it.
-            def routing_git(command, **_kwargs):
-                calls.append(command)
-                return subprocess.CompletedProcess(command, 0, stdout=direct_uri + "\n", stderr="")
-
-            gateway.subprocess.run = routing_git
+            # Smart-HTTP routing uses the same bounded local parser. It must
+            # not initialize custom Git merely to discover refstorage: that
+            # can hydrate a large Vex pack cache before the CGI starts.
             routed = gateway.repository_for_path("/healthy.git/info/refs")
             assert routed is not None
             assert routed.name == "healthy.git"
             assert routed.uri == direct_uri
-            assert len(calls) == 1
+            assert calls == []
+            assert gateway.repository_for_path("/ambiguous.git/info/refs") is None
     finally:
         gateway.ROOT = previous_root
         gateway.subprocess.run = previous_run
@@ -140,7 +135,7 @@ def main() -> int:
             gateway.HEALTH_SCAN_MAX_DIRECTORIES,
             gateway.HEALTH_SCAN_MAX_DIRECTORY_ENTRIES,
             gateway.HEALTH_SCAN_MAX_DEPTH,
-            gateway.HEALTH_SCAN_MAX_CONFIG_BYTES,
+            gateway.REPOSITORY_CONFIG_MAX_BYTES,
         ) = previous_limits
     return 0
 

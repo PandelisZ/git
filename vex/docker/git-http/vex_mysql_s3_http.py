@@ -12,6 +12,7 @@ classic bare repository when a path is not Vex-configured.
 from __future__ import annotations
 
 import base64
+import gzip
 import hmac
 import json
 import os
@@ -75,12 +76,22 @@ HELPER_PATH = os.environ.get("VEX_GIT_HELPER_PATH", "/usr/local/lib/vex-git-http
 INIT_REPOSITORY = os.environ.get("VEX_NATIVE_REPO_INIT", "/usr/local/bin/vex-init-mysql-s3-repo")
 READY_REPOSITORY = os.environ.get("VEX_STORAGE_READY_REPO", "vex-health.git")
 
+# Vex thin repositories write one canonical local ``extensions.refstorage``
+# value. Read that small file directly for both routing and the health
+# inventory. Invoking custom Git merely to discover the URI initializes the
+# Vex object store; for a large raw pack that can hydrate its pack cache before
+# the request has even reached git-http-backend.
+REPOSITORY_CONFIG_MAX_BYTES = max(
+    1,
+    int(
+        os.environ.get(
+            "VEX_HTTP_REPOSITORY_CONFIG_MAX_BYTES",
+            os.environ.get("VEX_HTTP_HEALTH_SCAN_MAX_CONFIG_BYTES", str(64 * 1024)),
+        )
+    ),
+)
 # ``/healthz`` exposes a convenience inventory, but it must never turn that
-# observability detail into a second, unbounded Git workload.  In particular,
-# a large repository can contain many object directories and an interrupted
-# receive can make a custom-Git config lookup wait for recovery.  These bounds
-# apply only to the health inventory; normal smart-HTTP routing below retains
-# its authoritative custom-Git validation.
+# observability detail into an unbounded filesystem walk.
 HEALTH_SCAN_MAX_REPOSITORIES = max(
     1, int(os.environ.get("VEX_HTTP_HEALTH_SCAN_MAX_REPOSITORIES", "64"))
 )
@@ -91,9 +102,6 @@ HEALTH_SCAN_MAX_DIRECTORY_ENTRIES = max(
     1, int(os.environ.get("VEX_HTTP_HEALTH_SCAN_MAX_DIRECTORY_ENTRIES", "1024"))
 )
 HEALTH_SCAN_MAX_DEPTH = max(1, int(os.environ.get("VEX_HTTP_HEALTH_SCAN_MAX_DEPTH", "8")))
-HEALTH_SCAN_MAX_CONFIG_BYTES = max(
-    1, int(os.environ.get("VEX_HTTP_HEALTH_SCAN_MAX_CONFIG_BYTES", str(64 * 1024)))
-)
 
 REPO_COMPONENT_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 VEX_URI_RE = re.compile(r"vex://([0-9a-fA-F]{32})\Z")
@@ -146,6 +154,27 @@ class RequestBody:
     def close(self) -> None:
         if self.close_source:
             self.source.close()
+
+
+class LimitedReader:
+    """Expose exactly one HTTP body to a decoder without over-reading CGI data."""
+
+    def __init__(self, source: BinaryIO, length: int) -> None:
+        self.source = source
+        self.remaining = length
+
+    def read(self, size: int = -1) -> bytes:
+        if not self.remaining or size == 0:
+            return b""
+        if size < 0 or size > self.remaining:
+            size = self.remaining
+        chunk = self.source.read(size)
+        if not chunk:
+            raise RequestBodyError("truncated request body")
+        if len(chunk) > size:
+            raise RequestBodyError("invalid request body")
+        self.remaining -= len(chunk)
+        return chunk
 
 
 @dataclass
@@ -386,17 +415,10 @@ def repository_for_path(path: str) -> VexRepository | None:
     if not candidate.is_dir() or not (candidate / "HEAD").is_file():
         return None
 
-    completed = subprocess.run(
-        [GIT, f"--git-dir={candidate}", "config", "--get", "extensions.refstorage"],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        check=False,
-        timeout=30,
-    )
-    if completed.returncode:
+    uri = vex_repository_uri_from_config(candidate)
+    if uri is None:
         return None
-    match = VEX_URI_RE.fullmatch(completed.stdout.strip())
+    match = VEX_URI_RE.fullmatch(uri)
     if not match:
         return None
     repo_id = match.group(1).lower()
@@ -594,19 +616,19 @@ def _read_bounded_regular_file(path: Path, maximum_bytes: int) -> bytes | None:
         os.close(descriptor)
 
 
-def health_repository_uri(repository: Path) -> str | None:
-    """Read one canonical local Vex URI for the bounded health inventory.
+def vex_repository_uri_from_config(repository: Path) -> str | None:
+    """Read one canonical local Vex URI without initializing custom Git.
 
-    This compact parser intentionally recognizes only the plain local config
-    spelling emitted by ``git config``.  It rejects includes, duplicate or
-    non-canonical values, and anything which would need Git's full config
-    semantics.  Omission from a health response is harmless; accepting an
-    ambiguous repository would be misleading.  Request routing continues to
-    call :func:`repository_for_path`, which remains the authoritative check.
+    This compact parser intentionally recognizes only the plain local
+    spelling emitted by Vex repository creation. It rejects includes,
+    duplicate or non-canonical values, and anything which would need Git's
+    full config semantics. Smart-HTTP routing fails closed for those forms;
+    that is safer than initializing an arbitrary repository just to inspect
+    configuration and avoids a pack-cache read before the CGI starts.
     """
     if not _regular_file(repository / "HEAD"):
         return None
-    config = _read_bounded_regular_file(repository / "config", HEALTH_SCAN_MAX_CONFIG_BYTES)
+    config = _read_bounded_regular_file(repository / "config", REPOSITORY_CONFIG_MAX_BYTES)
     if config is None:
         return None
 
@@ -706,7 +728,7 @@ def known_repositories() -> dict[str, str]:
     """
     result: dict[str, str] = {}
     for name, candidate in health_repository_candidates():
-        uri = health_repository_uri(candidate)
+        uri = vex_repository_uri_from_config(candidate)
         if uri is None:
             continue
         match = VEX_URI_RE.fullmatch(uri)
@@ -884,10 +906,61 @@ class VexMySQLS3HTTPRequestHandler(BaseHTTPRequestHandler):
             self._request_error(400, str(error))
             return None
 
+    def _decode_gzip_body(self, body: RequestBody) -> RequestBody | None:
+        """Inflate a gzip CGI request into a bounded disk-backed source.
+
+        Git's HTTP client compresses large protocol-v2 fetch negotiations. The
+        CGI contract still needs a concrete, *uncompressed* CONTENT_LENGTH, so
+        retain the existing streaming path for identity bodies and spool only
+        this encoded form. LimitedReader prevents gzip from consuming bytes
+        beyond the declared request body on a keep-alive connection.
+        """
+        spool = tempfile.TemporaryFile(mode="w+b")
+        decoded_length = 0
+        limited = LimitedReader(body.source, body.length)
+        try:
+            with gzip.GzipFile(fileobj=limited, mode="rb") as decoder:
+                while True:
+                    chunk = decoder.read(STREAM_CHUNK_BYTES)
+                    if not chunk:
+                        break
+                    if len(chunk) > MAX_REQUEST_BYTES - decoded_length:
+                        spool.close()
+                        self._request_error(413, "decoded request exceeds Vex HTTP limit")
+                        return None
+                    spool.write(chunk)
+                    decoded_length += len(chunk)
+            # gzip consumes concatenated members, too. Any remaining bytes
+            # therefore are neither a complete member nor valid request data.
+            if limited.remaining:
+                raise RequestBodyError("invalid gzip request body")
+            spool.seek(0)
+            return RequestBody(decoded_length, spool, close_source=True)
+        except (EOFError, OSError, RequestBodyError):
+            spool.close()
+            self._request_error(400, "invalid gzip request body")
+            return None
+        finally:
+            body.close()
+
     def _request_body(self) -> RequestBody | None:
         """Return a validated source rather than reading a whole POST body."""
         if self.command != "POST":
             return RequestBody(0, self.rfile)
+
+        content_encoding_values = self.headers.get_all("Content-Encoding", [])
+        content_codings = [
+            coding.strip().lower()
+            for value in content_encoding_values
+            for coding in value.split(",")
+            if coding.strip()
+        ]
+        if content_encoding_values and not content_codings:
+            self._request_error(400, "invalid Content-Encoding")
+            return None
+        if content_codings not in ([], ["gzip"]):
+            self._request_error(415, "unsupported Content-Encoding")
+            return None
 
         transfer_values = self.headers.get_all("Transfer-Encoding", [])
         transfer_codings = [
@@ -904,20 +977,26 @@ class VexMySQLS3HTTPRequestHandler(BaseHTTPRequestHandler):
             if transfer_codings != ["chunked"]:
                 self._request_error(501, "unsupported Transfer-Encoding")
                 return None
-            return self._read_chunked_body()
+            body = self._read_chunked_body()
+        else:
+            if len(content_lengths) != 1:
+                self._request_error(411, "Content-Length is required")
+                return None
+            raw_length = content_lengths[0].strip()
+            if not raw_length.isdecimal():
+                self._request_error(400, "invalid Content-Length")
+                return None
+            length = int(raw_length)
+            if length > MAX_REQUEST_BYTES:
+                self._request_error(413, "request exceeds Vex HTTP limit")
+                return None
+            body = RequestBody(length, self.rfile)
 
-        if len(content_lengths) != 1:
-            self._request_error(411, "Content-Length is required")
+        if body is None:
             return None
-        raw_length = content_lengths[0].strip()
-        if not raw_length.isdecimal():
-            self._request_error(400, "invalid Content-Length")
-            return None
-        length = int(raw_length)
-        if length > MAX_REQUEST_BYTES:
-            self._request_error(413, "request exceeds Vex HTTP limit")
-            return None
-        return RequestBody(length, self.rfile)
+        if content_codings == ["gzip"]:
+            return self._decode_gzip_body(body)
+        return body
 
     def _send_backend_error(self, status: int, message: str) -> None:
         body = (message + "\n").encode("utf-8")
