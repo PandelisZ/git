@@ -370,8 +370,9 @@ static int run_curl_parallel(struct vex_blob_s3 *blob,
 	 * storage failure from the transaction.
 	 */
 	strvec_pushl(&curl.args, "curl", "--silent", "--show-error", "--fail",
-		     "--stderr", "/dev/null", "--parallel", "--parallel-max",
-		     parallel, "--config", config_file->filename.buf, NULL);
+		     "--stderr", "/dev/null", "--parallel", "--parallel-immediate",
+		     "--parallel-max", parallel, "--config", config_file->filename.buf,
+		     NULL);
 	if (blob->ca_file)
 		strvec_pushl(&curl.args, "--cacert", blob->ca_file, NULL);
 	if (blob->insecure_tls)
