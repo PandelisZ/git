@@ -9,6 +9,8 @@ use clap::Parser;
 const MEBIBYTE: u64 = 1024 * 1024;
 const MIN_MULTIPART_PART_BYTES: u64 = 5 * MEBIBYTE;
 const DEFAULT_MULTIPART_PART_BYTES: u64 = 64 * MEBIBYTE;
+const DEFAULT_MULTIPART_CONCURRENCY: u64 = 8;
+const MAX_MULTIPART_CONCURRENCY: u64 = 33;
 const DEFAULT_LEASE_SECONDS: u64 = 15 * 60;
 const DEFAULT_POLL_SECONDS: u64 = 5;
 const DEFAULT_RETRY_SECONDS: u64 = 30;
@@ -43,6 +45,8 @@ pub struct WorkerConfig {
     pub retry_seconds: u64,
     pub poll_seconds: u64,
     pub multipart_part_bytes: u64,
+    /// Maximum number of streaming S3 multipart part uploads per artifact.
+    pub multipart_concurrency: usize,
 }
 
 impl WorkerConfig {
@@ -54,6 +58,13 @@ impl WorkerConfig {
             MIN_MULTIPART_PART_BYTES,
             5 * 1024 * 1024 * 1024,
         )?;
+        let multipart_concurrency = usize::try_from(read_u64(
+            "VEX_PACK_WORKER_MULTIPART_CONCURRENCY",
+            DEFAULT_MULTIPART_CONCURRENCY,
+            1,
+            MAX_MULTIPART_CONCURRENCY,
+        )?)
+        .context("VEX_PACK_WORKER_MULTIPART_CONCURRENCY does not fit this platform")?;
         let s3_endpoint = required_env("GIT_VEX_S3_ENDPOINT")?;
         if !(s3_endpoint.starts_with("http://") || s3_endpoint.starts_with("https://")) {
             bail!("GIT_VEX_S3_ENDPOINT must be an http(s) endpoint");
@@ -95,6 +106,7 @@ impl WorkerConfig {
             )?,
             poll_seconds,
             multipart_part_bytes,
+            multipart_concurrency,
         })
     }
 }
