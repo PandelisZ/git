@@ -39,7 +39,12 @@ struct vex_blob_s3 {
 	int test_fail_stage_batch_once;
 };
 
-#define VEX_S3_BATCH_PARALLEL 16
+/*
+ * A git/git-scale receive is mostly tiny immutable objects.  128 in-flight
+ * S3 transfers keeps a bounded 256-object queue to two waves, instead of
+ * making the gateway wait through sixteen 16-transfer waves for every batch.
+ */
+#define VEX_S3_BATCH_PARALLEL 128
 
 static int contains_control(const char *value)
 {
