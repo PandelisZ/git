@@ -376,10 +376,13 @@ if [ "$from_receive" -eq 1 ]; then
 	# membership map.  Validate the compact pack's *index* against that map in
 	# MySQL, then publish only a derived envelope.  In particular, do not insert
 	# `pack_objects`: that table's FK would incorrectly claim loose S3 payloads.
+	# A full git/git snapshot has hundreds of thousands of OIDs, which exceeds
+	# the bounded max_heap_table_size of a MEMORY temporary table.  This is
+	# transient metadata, so let InnoDB spill it safely to the local MySQL disk.
 	registered_count=$(mysql_admin_query "
 		CREATE TEMPORARY TABLE vex_pack_input (
 			oid_hex CHAR($oid_hex_length) BINARY NOT NULL PRIMARY KEY
-		) ENGINE=MEMORY;
+		) ENGINE=InnoDB;
 		LOAD DATA INFILE '$mysql_manifest'
 			INTO TABLE vex_pack_input
 			LINES TERMINATED BY '\\n' (oid_hex);
@@ -451,7 +454,7 @@ else
 	registered_count=$(mysql_admin_query "
 		CREATE TEMPORARY TABLE vex_pack_input (
 			oid_hex CHAR($oid_hex_length) BINARY NOT NULL PRIMARY KEY
-		) ENGINE=MEMORY;
+		) ENGINE=InnoDB;
 		LOAD DATA INFILE '$mysql_manifest'
 			INTO TABLE vex_pack_input
 			LINES TERMINATED BY '\\n' (oid_hex);
