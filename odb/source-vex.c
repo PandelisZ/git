@@ -268,7 +268,7 @@ int vex_store_open_for_repository(struct repository *repo, const char *gitdir,
 
 	ret = vex_store_open(out, &opts);
 	if (!ret)
-		ret = vex_repo_ensure(*out);
+		ret = vex_store_ensure_metadata(*out);
 	if (ret && *out) {
 		if (opts.backend == VEX_STORE_BACKEND_MYSQL_S3)
 			error(_("unable to initialize Vex MySQL metadata: %s"),
@@ -872,6 +872,18 @@ static int vex_source_open(struct odb_source_vex *source)
 					    &source->store);
 	if (ret)
 		return ret;
+	/*
+	 * The ref backend needs only the durable metadata namespace for an
+	 * advertisement.  An actual ODB operation restores the complete store
+	 * readiness boundary here: direct callers and writers check S3 plus stale
+	 * epoch recovery, while a gateway read child may use its startup witness.
+	 */
+	ret = vex_repo_ensure(source->store);
+	if (ret) {
+		vex_store_close(source->store);
+		source->store = NULL;
+		return ret;
+	}
 	if (vex_source_install_inherited_receive_pack(source)) {
 		vex_store_close(source->store);
 		source->store = NULL;
@@ -1841,9 +1853,11 @@ struct odb_source *odb_source_vex_new(struct object_database *odb,
 	struct odb_source_vex *source = xcalloc(1, sizeof(*source));
 
 	odb_source_init(&source->base, odb, ODB_SOURCE_VEX, path, local);
-	if (vex_source_open(source))
-		die(_("unable to open Vex object store for '%s'"),
-		    odb->repo->ref_storage_payload ? odb->repo->ref_storage_payload : "");
+	/*
+	 * Ref advertisement does not read objects.  Defer the S3/cache setup until
+	 * an ODB operation actually needs it so protocol-v2 ls-refs does not pay
+	 * for a 596 MiB raw-base cache activation on every RPC.
+	 */
 
 	source->base.free = odb_source_vex_free;
 	source->base.close = odb_source_vex_close;
@@ -1875,6 +1889,8 @@ struct odb_source_packed *odb_source_vex_packed_store(struct odb_source *base)
 	if (!odb_source_is_vex(base))
 		return NULL;
 	source = container_of(base, struct odb_source_vex, base);
+	if (vex_source_open(source))
+		return NULL;
 	return source->receive_pack_cache ? source->receive_pack_cache :
 		source->pack_cache ? source->pack_cache : source->raw_base_cache;
 }
@@ -1887,6 +1903,8 @@ struct odb_source_packed *odb_source_vex_precomputed_relay_store(
 	if (!odb_source_is_vex(base))
 		return NULL;
 	source = container_of(base, struct odb_source_vex, base);
+	if (vex_source_open(source))
+		return NULL;
 	/* A raw base is a lookup layer, never a whole-pack relay after overlays. */
 	return source->pack_cache;
 }
@@ -1909,6 +1927,8 @@ int odb_source_vex_open_default_clone_pack(
 	if (!odb_source_is_vex(base))
 		return VEX_STORE_ERR_INVALID;
 	source = container_of(base, struct odb_source_vex, base);
+	if ((ret = vex_source_open(source)))
+		return ret;
 	/* A closed source cannot safely own a request-scoped lease or cache. */
 	if (!source->store)
 		return VEX_STORE_ERR_STATE;

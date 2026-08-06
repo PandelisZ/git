@@ -1723,31 +1723,54 @@ void vex_store_close(struct vex_store *store)
 	free(store);
 }
 
-int vex_repo_ensure(struct vex_store *store)
+int vex_store_ensure_metadata(struct vex_store *store)
 {
 	int ret;
 
 	if (!store)
 		return VEX_STORE_ERR_INVALID;
-	if ((ret = meta_ensure(store)))
+	ret = meta_ensure(store);
+	return ret;
+}
+
+int vex_repo_ensure(struct vex_store *store)
+{
+	int gateway_read_ready;
+	int ret;
+
+	if ((ret = vex_store_ensure_metadata(store)))
 		return ret;
 	if (store->backend == VEX_STORE_BACKEND_FS)
 		return vex_blob_fs_ensure(store->blob_fs);
 	if (store->backend != VEX_STORE_BACKEND_FS_S3 &&
 	    store->backend != VEX_STORE_BACKEND_MYSQL_S3)
 		return VEX_STORE_ERR_INVALID;
+	/*
+	 * The long-lived Vex gateway validates the global schema and S3 bucket
+	 * before it accepts requests.  Its read-only upload-pack children still
+	 * verify the repository row above and fail on their actual S3 reads, but
+	 * need not repeat a bucket probe or stale-receive sweep for every smart-HTTP
+	 * RPC.  Writers and every direct caller leave this unset and retain the
+	 * complete durability/recovery boundary.
+	 */
+	gateway_read_ready = store->backend == VEX_STORE_BACKEND_MYSQL_S3 &&
+		git_env_bool("GIT_VEX_GATEWAY_READ_READY", 0);
 	if (!store->blob_s3_checked) {
-		ret = blob_s3_result(vex_blob_s3_check_bucket(store->blob_s3));
-		if (ret)
-			return ret;
+		if (!gateway_read_ready) {
+			ret = blob_s3_result(vex_blob_s3_check_bucket(store->blob_s3));
+			if (ret)
+				return ret;
+		}
 		store->blob_s3_checked = 1;
 	}
 	if (store->backend == VEX_STORE_BACKEND_MYSQL_S3 &&
 	    !store->epoch_recovery_checked) {
-		ret = vex_store_recover_expired_epochs(store,
-						vex_epoch_recovery_seconds(), NULL);
-		if (ret)
-			return ret;
+		if (!gateway_read_ready) {
+			ret = vex_store_recover_expired_epochs(store,
+							vex_epoch_recovery_seconds(), NULL);
+			if (ret)
+				return ret;
+		}
 		store->epoch_recovery_checked = 1;
 	}
 	return VEX_STORE_OK;

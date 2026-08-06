@@ -178,6 +178,8 @@ int vex_store_open(struct vex_store **store,
 		     const struct vex_store_options *opts);
 void vex_store_close(struct vex_store *store);
 
+/* Verify/create only the durable metadata namespace for this repository. */
+int vex_store_ensure_metadata(struct vex_store *store);
 /* Verify/create the metadata row and on-disk namespace for this repository. */
 int vex_repo_ensure(struct vex_store *store);
 const char *vex_store_repo_id(const struct vex_store *store);

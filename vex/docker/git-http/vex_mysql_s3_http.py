@@ -541,6 +541,7 @@ def cgi_environment_for_repository(
         "GIT_OBJECT_DIRECTORY",
         "GIT_ALTERNATE_OBJECT_DIRECTORIES",
         "GIT_REFERENCE_BACKEND",
+        "GIT_VEX_GATEWAY_READ_READY",
     ):
         environ.pop(key, None)
 
@@ -548,6 +549,19 @@ def cgi_environment_for_repository(
         project_root = ROOT
         path_info = unquote(path)
         environ["GIT_REFERENCE_BACKEND"] = repository.uri
+        # The gateway completed its schema/bucket readiness check before this
+        # listener started.  A read-only upload-pack child may reuse that fact;
+        # C retains metadata verification and direct callers/writers retain
+        # their full recovery checks.
+        if (
+            (path_info.endswith("/git-upload-pack") and method == "POST" and not query)
+            or (
+                path_info.endswith("/info/refs")
+                and method in {"GET", "HEAD"}
+                and query == "service=git-upload-pack"
+            )
+        ):
+            environ["GIT_VEX_GATEWAY_READ_READY"] = "1"
     else:
         project_root = BENCH_DISK_ROOT
         path_info = repository.path_info
