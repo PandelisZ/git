@@ -70,37 +70,64 @@ fi
 }
 
 gateway_wal_active=0
+gateway_fault_active=0
 restore_gateway() {
-	local actual
+	local actual_wal actual_fault
 
-	if [ "$gateway_wal_active" -eq 0 ]; then
+	if [ "$gateway_wal_active" -eq 0 ] && [ "$gateway_fault_active" -eq 0 ]; then
 		return 0
 	fi
-	env GIT_VEX_RECEIVE_PACK_WAL= \
+	env GIT_VEX_RECEIVE_PACK_WAL= GIT_VEX_TEST_FAIL_PACK_OBJECTS= \
 		"${compose[@]}" up -d --no-build --no-deps --force-recreate git-http >/dev/null
 	wait_for_storage
-	actual=$("${compose[@]}" exec -T git-http /bin/sh -c \
+	actual_wal=$("${compose[@]}" exec -T git-http /bin/sh -c \
 		'printf %s "${GIT_VEX_RECEIVE_PACK_WAL:-}"')
-	[ -z "$actual" ] || {
-		printf '%s\n' 'vex receive-pack WAL E2E: gateway retained the test-only WAL gate' >&2
+	actual_fault=$("${compose[@]}" exec -T git-http /bin/sh -c \
+		'printf %s "${GIT_VEX_TEST_FAIL_PACK_OBJECTS:-}"')
+	[ -z "$actual_wal" ] && [ -z "$actual_fault" ] || {
+		printf '%s\n' 'vex receive-pack WAL E2E: gateway retained a test-only gate' >&2
 		return 1
 	}
 	gateway_wal_active=0
+	gateway_fault_active=0
 }
 
 activate_gateway_wal() {
-	local actual
+	local actual_wal actual_fault
 
-	env GIT_VEX_RECEIVE_PACK_WAL=1 \
+	env GIT_VEX_RECEIVE_PACK_WAL=1 GIT_VEX_TEST_FAIL_PACK_OBJECTS= \
 		"${compose[@]}" up -d --no-build --no-deps --force-recreate git-http >/dev/null
 	wait_for_storage
-	actual=$("${compose[@]}" exec -T git-http /bin/sh -c \
+	actual_wal=$("${compose[@]}" exec -T git-http /bin/sh -c \
 		'printf %s "${GIT_VEX_RECEIVE_PACK_WAL:-}"')
-	[ "$actual" = 1 ] || {
+	actual_fault=$("${compose[@]}" exec -T git-http /bin/sh -c \
+		'printf %s "${GIT_VEX_TEST_FAIL_PACK_OBJECTS:-}"')
+	[ "$actual_wal" = 1 ] && [ -z "$actual_fault" ] || {
 		printf '%s\n' 'vex receive-pack WAL E2E: gateway was not recreated with the WAL gate' >&2
 		return 1
 	}
 	gateway_wal_active=1
+}
+
+activate_gateway_relay_fault() {
+	local actual_wal actual_fault
+
+	# The raw pack has already been sealed before this point.  Disable the
+	# seed-only receive path and make any upload-pack fallback fail instead, so
+	# both following stock-client clones must relay the verified raw pack.
+	env GIT_VEX_RECEIVE_PACK_WAL= GIT_VEX_TEST_FAIL_PACK_OBJECTS=1 \
+		"${compose[@]}" up -d --no-build --no-deps --force-recreate git-http >/dev/null
+	wait_for_storage
+	actual_wal=$("${compose[@]}" exec -T git-http /bin/sh -c \
+		'printf %s "${GIT_VEX_RECEIVE_PACK_WAL:-}"')
+	actual_fault=$("${compose[@]}" exec -T git-http /bin/sh -c \
+		'printf %s "${GIT_VEX_TEST_FAIL_PACK_OBJECTS:-}"')
+	[ -z "$actual_wal" ] && [ "$actual_fault" = 1 ] || {
+		printf '%s\n' 'vex receive-pack WAL E2E: gateway was not recreated with the raw-pack relay fault gate' >&2
+		return 1
+	}
+	gateway_wal_active=0
+	gateway_fault_active=1
 }
 
 scratch=$(mktemp -d "${TMPDIR:-/tmp}/vex-mysql-s3-receive-pack-wal.XXXXXX")
@@ -226,7 +253,6 @@ other_ref_rows=$(mysql_query "SELECT COUNT(*) FROM refs WHERE repo_id = UNHEX('$
 # repacking this mirror also gives the test a local full-pack member count.
 fixture="$scratch/fixture"
 mirror="$scratch/fixture.git"
-clone="$scratch/clone"
 "$stock_git" init -q "$fixture"
 "$stock_git" -C "$fixture" config user.name vex-receive-pack-wal-e2e
 "$stock_git" -C "$fixture" config user.email vex-receive-pack-wal-e2e@example.invalid
@@ -272,6 +298,12 @@ expected_members=$("$stock_git" verify-pack -v "${pack_indexes[0]}" |
 }
 expected_refs=$("$stock_git" --git-dir="$mirror" for-each-ref --format='%(refname)' | wc -l | tr -d ' ')
 main_oid=$("$stock_git" --git-dir="$mirror" rev-parse refs/heads/main)
+tag_oid=$("$stock_git" --git-dir="$mirror" rev-parse refs/tags/fixture-v1)
+tag_target=$("$stock_git" --git-dir="$mirror" rev-parse refs/tags/fixture-v1^{})
+[ "$tag_target" = "$main_oid" ] || {
+	printf 'vex receive-pack WAL E2E: annotated fixture tag target %s differs from main %s\n' "$tag_target" "$main_oid" >&2
+	exit 1
+}
 
 git_https --git-dir="$mirror" push --no-thin --mirror "$origin"
 
@@ -343,13 +375,45 @@ remote_head=$(git_https ls-remote "$origin" HEAD |
 	exit 1
 }
 
-git_https clone -q "$origin" "$clone"
-[ "$("$stock_git" -C "$clone" rev-parse HEAD)" = "$main_oid" ] || {
-	printf '%s\n' 'vex receive-pack WAL E2E: clone HEAD differs from sealed main' >&2
+clone_and_verify_relay() {
+	local protocol clone_path trace
+
+	protocol=$1
+	clone_path=$2
+	trace=$3
+	GIT_TRACE_PACKET="$trace" git_https -c "protocol.version=$protocol" \
+		clone -q "$origin" "$clone_path"
+	[ "$("$stock_git" -C "$clone_path" rev-parse HEAD)" = "$main_oid" ] || {
+		printf 'vex receive-pack WAL E2E: protocol-v%s clone HEAD differs from sealed main\n' "$protocol" >&2
+		return 1
+	}
+	[ "$("$stock_git" -C "$clone_path" rev-parse refs/tags/fixture-v1)" = "$tag_oid" ] || {
+		printf 'vex receive-pack WAL E2E: protocol-v%s clone lost the annotated tag object\n' "$protocol" >&2
+		return 1
+	}
+	[ "$("$stock_git" -C "$clone_path" rev-parse refs/tags/fixture-v1^{})" = "$main_oid" ] || {
+		printf 'vex receive-pack WAL E2E: protocol-v%s clone annotated tag does not peel to main\n' "$protocol" >&2
+		return 1
+	}
+	"$stock_git" -C "$clone_path" fsck --no-progress >/dev/null
+}
+
+# The raw WAL seed is now fully sealed and MySQL/S3-verified.  Turn the seed
+# gate off, then use the same fault seam as the direct-pack test: passing the
+# following clones proves upload-pack did not invoke git-pack-objects.  The
+# annotated tag makes protocol-v0's include-tag negotiation part of this
+# raw-pack relay contract too.
+restore_gateway
+clone_v0="$scratch/clone-v0"
+clone_v2="$scratch/clone-v2"
+activate_gateway_relay_fault
+clone_and_verify_relay 0 "$clone_v0" "$scratch/v0.trace"
+clone_and_verify_relay 2 "$clone_v2" "$scratch/v2.trace"
+grep -Eq 'clone< version 2$' "$scratch/v2.trace" || {
+	printf '%s\n' 'vex receive-pack WAL E2E: stock clone did not negotiate protocol v2' >&2
 	exit 1
 }
-"$stock_git" -C "$clone" fsck --no-progress >/dev/null
 
 restore_gateway
-printf 'vex receive-pack WAL E2E: PASS stock non-thin initial mirror refs=%s objects=%s pack=%s; sealed MySQL map and canonical S3 pack/idx verified; clone+fsck passed for %s\n' \
+printf 'vex receive-pack WAL E2E: PASS stock non-thin initial mirror refs=%s objects=%s pack=%s; sealed MySQL map and canonical S3 pack/idx verified; protocol-v0/v2 raw-pack relay clones with annotated tag and fsck passed without git-pack-objects for %s\n' \
 	"$expected_refs" "$expected_members" "$pack_id" "$origin"

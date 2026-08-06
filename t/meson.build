@@ -276,6 +276,7 @@ integration_tests = [
   't1528-vex-compose-mysql-s3-sweep.sh',
   't1529-vex-compose-mysql-s3-receive-heartbeat.sh',
   't1530-vex-bench-disk-control-url.sh',
+  't1531-vex-compose-mysql-s3-receive-pack-wal.sh',
   't1600-index.sh',
   't1601-index-bogus.sh',
   't1700-split-index.sh',
