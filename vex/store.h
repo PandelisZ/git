@@ -304,6 +304,14 @@ int vex_store_read_object_in_epoch(struct vex_store *store,
  */
 int vex_store_current_pack(struct vex_store *store,
 			   struct vex_pack_artifact *artifact);
+
+/*
+ * Find the current-generation derived artifact for the narrowly defined
+ * default-clone relay.  Unlike vex_store_current_pack(), this is explicitly
+ * not a complete object snapshot and must never become an ODB fallback.
+ */
+int vex_store_current_default_clone_pack(struct vex_store *store,
+					 struct vex_pack_artifact *artifact);
 int vex_store_download_pack(struct vex_store *store,
 			    const struct vex_pack_artifact *artifact,
 			    const char *pack_destination,

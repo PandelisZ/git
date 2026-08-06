@@ -59,6 +59,20 @@ struct odb_source_vex {
 	struct vex_pack_lease pack_lease;
 };
 
+/*
+ * A request-scoped default-clone relay cache.  This deliberately does not
+ * live in odb_source_vex: the ordinary complete-snapshot cache remains the
+ * only cache used by generic ODB reads.  The caller owns this handle and
+ * closes it before its source, releasing both the packed source and lease.
+ */
+struct odb_vex_default_clone_pack {
+	struct odb_source_vex *source;
+	struct odb_source_packed *packed;
+	char *pack_id;
+	char *cache_path;
+	struct vex_pack_lease lease;
+};
+
 struct odb_transaction_vex {
 	struct odb_transaction base;
 	struct vex_epoch *epoch;
@@ -258,29 +272,44 @@ int vex_store_open_for_repository(struct repository *repo, const char *gitdir,
 	return ret;
 }
 
-static void vex_source_release_pack_cache(struct odb_source_vex *source)
+static void vex_source_release_cached_pack(
+	struct odb_source_vex *source, struct odb_source_packed **cache,
+	char **pack_id, char **cache_path, struct vex_pack_lease *lease)
 {
 	int ret;
 
-	if (source->pack_cache) {
-		odb_source_close(&source->pack_cache->base);
-		odb_source_free(&source->pack_cache->base);
+	if (cache && *cache) {
+		odb_source_close(&(*cache)->base);
+		odb_source_free(&(*cache)->base);
+		*cache = NULL;
 	}
-	source->pack_cache = NULL;
-	free(source->pack_cache_id);
-	source->pack_cache_id = NULL;
-	free(source->pack_cache_path);
-	source->pack_cache_path = NULL;
-	if (!source->pack_lease.active)
+	if (pack_id) {
+		free(*pack_id);
+		*pack_id = NULL;
+	}
+	if (cache_path) {
+		free(*cache_path);
+		*cache_path = NULL;
+	}
+	if (!lease || !lease->active)
 		return;
-	ret = source->store ?
-		vex_store_pack_lease_release(source->store, &source->pack_lease) :
+	ret = source && source->store ?
+		vex_store_pack_lease_release(source->store, lease) :
 		VEX_STORE_ERR_INVALID;
 	if (ret)
 		trace_printf("vex: could not release derived pack lease repo=%s (%d)",
-			     source->store ? vex_store_repo_id(source->store) : "unknown", ret);
+			     source && source->store ? vex_store_repo_id(source->store) : "unknown",
+			     ret);
 	/* A failed release is safely bounded by the durable lease TTL. */
-	memset(&source->pack_lease, 0, sizeof(source->pack_lease));
+	memset(lease, 0, sizeof(*lease));
+}
+
+static void vex_source_release_pack_cache(struct odb_source_vex *source)
+{
+	vex_source_release_cached_pack(source, &source->pack_cache,
+				       &source->pack_cache_id,
+				       &source->pack_cache_path,
+				       &source->pack_lease);
 }
 
 static void vex_source_release_receive_pack_cache(struct odb_source_vex *source)
@@ -430,9 +459,16 @@ static struct tempfile *vex_source_pack_cache_tempfile(const char *pack_dir,
 	return temp;
 }
 
-static int vex_source_install_pack_cache(struct odb_source_vex *source,
-					 const struct vex_pack_artifact *artifact,
-					 const char *pack_id)
+/*
+ * Materialize one immutable artifact without changing the Vex source's
+ * selected complete snapshot.  Both the normal ODB cache and the narrowly
+ * scoped default-clone relay use this installer, but own their packed source
+ * and lease independently.
+ */
+static int vex_source_materialize_pack_cache(
+	struct odb_source_vex *source, const struct vex_pack_artifact *artifact,
+	const char *pack_id, struct odb_source_packed **out_cache,
+	char **out_objects_path)
 {
 	struct lock_file lock = LOCK_INIT;
 	struct tempfile *pack_temp = NULL;
@@ -446,6 +482,10 @@ static int vex_source_install_pack_cache(struct odb_source_vex *source,
 	char *lock_path = NULL;
 	int ret = -1;
 
+	if (!source || !artifact || !pack_id || !out_cache || !out_objects_path)
+		return -1;
+	*out_cache = NULL;
+	*out_objects_path = NULL;
 	root = vex_source_pack_cache_root(source);
 	if (!root)
 		goto out;
@@ -499,11 +539,10 @@ static int vex_source_install_pack_cache(struct odb_source_vex *source,
 			goto out;
 		}
 	}
-	vex_source_release_pack_cache(source);
-	source->pack_cache = cache;
+	*out_cache = cache;
 	cache = NULL;
-	source->pack_cache_id = xstrdup(pack_id);
-	source->pack_cache_path = xstrdup(objects_path);
+	*out_objects_path = objects_path;
+	objects_path = NULL;
 	ret = 0;
 
 out:
@@ -521,6 +560,26 @@ out:
 	free(objects_path);
 	free(root);
 	return ret;
+}
+
+static int vex_source_install_pack_cache(struct odb_source_vex *source,
+					 const struct vex_pack_artifact *artifact,
+					 const char *pack_id)
+{
+	struct odb_source_packed *cache = NULL;
+	char *objects_path = NULL;
+	int ret;
+
+	ret = vex_source_materialize_pack_cache(source, artifact, pack_id,
+						 &cache, &objects_path);
+	if (ret)
+		return ret;
+	/* Only replace the normal cache after its replacement is fully verified. */
+	vex_source_release_pack_cache(source);
+	source->pack_cache = cache;
+	source->pack_cache_id = xstrdup(pack_id);
+	source->pack_cache_path = objects_path;
+	return 0;
 }
 
 static int vex_source_refresh_pack_cache(struct odb_source_vex *source)
@@ -1515,6 +1574,77 @@ struct odb_source_packed *odb_source_vex_packed_store(struct odb_source *base)
 	source = container_of(base, struct odb_source_vex, base);
 	return source->receive_pack_cache ? source->receive_pack_cache :
 		source->pack_cache;
+}
+
+int odb_source_vex_open_default_clone_pack(
+	struct odb_source *base, struct odb_vex_default_clone_pack **out)
+{
+	struct odb_source_vex *source;
+	struct vex_pack_artifact artifact = { 0 };
+	struct vex_pack_lease lease = { 0 };
+	struct odb_source_packed *cache = NULL;
+	struct odb_vex_default_clone_pack *handle;
+	char *cache_path = NULL;
+	char pack_id[GIT_MAX_HEXSZ + 1];
+	int ret;
+
+	if (!out)
+		return VEX_STORE_ERR_INVALID;
+	*out = NULL;
+	if (!odb_source_is_vex(base))
+		return VEX_STORE_ERR_INVALID;
+	source = container_of(base, struct odb_source_vex, base);
+	/* A closed source cannot safely own a request-scoped lease or cache. */
+	if (!source->store)
+		return VEX_STORE_ERR_STATE;
+	ret = vex_store_current_default_clone_pack(source->store, &artifact);
+	if (ret)
+		return ret;
+	hash_to_hex_algop_r(pack_id, artifact.pack_id.hash,
+			    source->base.odb->repo->hash_algo);
+	/*
+	 * Acquire before downloading so sweep never sees the local relay source
+	 * without a durable root.  This lease belongs solely to `handle`; it does
+	 * not refresh, replace, or otherwise affect source->pack_cache.
+	 */
+	ret = vex_store_pack_lease_acquire(source->store, &artifact,
+					 vex_source_pack_cache_lease_seconds(), &lease);
+	if (ret)
+		return ret;
+	ret = vex_source_materialize_pack_cache(source, &artifact, pack_id,
+						 &cache, &cache_path);
+	if (ret) {
+		vex_source_release_cached_pack(source, &cache, NULL, &cache_path,
+					       &lease);
+		return ret;
+	}
+	handle = xcalloc(1, sizeof(*handle));
+	handle->source = source;
+	handle->packed = cache;
+	handle->pack_id = xstrdup(pack_id);
+	handle->cache_path = cache_path;
+	handle->lease = lease;
+	*out = handle;
+	trace_printf("vex: activated default-clone pack cache repo=%s pack=%s generation=%"PRIu64,
+		     vex_store_repo_id(source->store), pack_id,
+		     artifact.covering_generation);
+	return VEX_STORE_OK;
+}
+
+struct odb_source_packed *odb_source_vex_default_clone_pack_packed(
+	const struct odb_vex_default_clone_pack *pack)
+{
+	return pack ? pack->packed : NULL;
+}
+
+void odb_source_vex_close_default_clone_pack(
+	struct odb_vex_default_clone_pack *pack)
+{
+	if (!pack)
+		return;
+	vex_source_release_cached_pack(pack->source, &pack->packed,
+				       &pack->pack_id, &pack->cache_path, &pack->lease);
+	free(pack);
 }
 
 bool repo_uses_vex_storage(const struct repository *repo)

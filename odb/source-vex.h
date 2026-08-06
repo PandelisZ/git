@@ -10,6 +10,7 @@ struct vex_store;
 struct vex_epoch;
 struct odb_transaction;
 struct odb_source_packed;
+struct odb_vex_default_clone_pack;
 struct repository;
 
 /*
@@ -30,6 +31,20 @@ int vex_store_open_for_repository(struct repository *repo, const char *gitdir,
 bool odb_source_is_vex(const struct odb_source *source);
 struct odb_source_packed *odb_source_vex_packed_store(struct odb_source *source);
 bool repo_uses_vex_storage(const struct repository *repo);
+
+/*
+ * Materialize the current, policy-scoped default-clone artifact into an
+ * independent verified packed source.  The returned handle owns both that
+ * cache and its metadata lease; close it before closing `source`.  It never
+ * replaces the Vex source's complete-snapshot cache or its ordinary ODB
+ * lookup path.
+ */
+int odb_source_vex_open_default_clone_pack(
+	struct odb_source *source, struct odb_vex_default_clone_pack **out);
+struct odb_source_packed *odb_source_vex_default_clone_pack_packed(
+	const struct odb_vex_default_clone_pack *pack);
+void odb_source_vex_close_default_clone_pack(
+	struct odb_vex_default_clone_pack *pack);
 
 /*
  * Receive-pack starts its Vex ODB transaction in the parent process.  These

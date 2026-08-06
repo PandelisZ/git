@@ -393,6 +393,18 @@ int vex_meta_mysql_current_sealed_pack(struct vex_meta_mysql *db,
 	return mysql_unavailable();
 }
 
+int vex_meta_mysql_current_sealed_default_clone_pack(
+	struct vex_meta_mysql *db, const char *repo_id,
+	const struct git_hash_algo *hash_algo, struct vex_meta_mysql_pack *pack)
+{
+	(void)db;
+	(void)repo_id;
+	(void)hash_algo;
+	if (pack)
+		memset(pack, 0, sizeof(*pack));
+	return mysql_unavailable();
+}
+
 void vex_meta_mysql_pack_release(struct vex_meta_mysql_pack *pack)
 {
 	if (!pack)
@@ -3792,10 +3804,10 @@ static int state_query_result(struct vex_meta_mysql *db, const char *sql,
 	return VEX_META_MYSQL_OK;
 }
 
-int vex_meta_mysql_current_sealed_pack(struct vex_meta_mysql *db,
-				       const char *repo_id,
-				       const struct git_hash_algo *hash_algo,
-				       struct vex_meta_mysql_pack *pack)
+static int vex_meta_mysql_current_sealed_pack_by_shape(
+	struct vex_meta_mysql *db, const char *repo_id,
+	const struct git_hash_algo *hash_algo, struct vex_meta_mysql_pack *pack,
+	int default_clone)
 {
 	char *repo = NULL;
 	char *sql = NULL;
@@ -3803,6 +3815,8 @@ int vex_meta_mysql_current_sealed_pack(struct vex_meta_mysql *db,
 	MYSQL_ROW row;
 	unsigned long *lengths;
 	struct object_id checked_id;
+	const char *shape_sql;
+	const char *order_sql;
 	char *pack_key = NULL;
 	char *idx_key = NULL;
 	uint64_t covering_generation;
@@ -3825,17 +3839,29 @@ int vex_meta_mysql_current_sealed_pack(struct vex_meta_mysql *db,
 	 * artifact may coexist with the canonical raw receive pack at that same
 	 * generation; prefer the derived artifact deterministically for relay while
 	 * retaining the raw map as the canonical membership and recovery anchor.
+	 *
+	 * The default-clone artifact has a deliberately different shape.  It is
+	 * selected only by its dedicated API and can never satisfy the complete
+	 * snapshot lookup, even when both artifacts cover the same generation.
 	 */
+	if (default_clone) {
+		shape_sql = "p.source_kind = 'derived' AND "
+			"p.is_full_snapshot = FALSE AND p.idx_key IS NOT NULL";
+		order_sql = "p.sealed_at DESC, p.pack_id";
+	} else {
+		shape_sql = "p.is_full_snapshot = TRUE AND p.idx_key IS NOT NULL";
+		order_sql = "(p.source_kind = 'derived') DESC, p.sealed_at DESC, "
+			"p.pack_id";
+	}
 	sql = vex_format("SELECT p.pack_id, p.pack_key, p.idx_key, "
 			 "p.covering_generation FROM pack_envelopes AS p "
 			 "WHERE p.repo_id = %s AND p.state = 'sealed' "
-			 "AND p.is_full_snapshot = TRUE AND p.idx_key IS NOT NULL "
+			 "AND %s "
 			 "AND p.covering_generation = "
 			 "(SELECT MAX(g.generation) FROM generations AS g "
 			 "WHERE g.repo_id = %s AND g.state = 'sealed') "
-			 "ORDER BY (p.source_kind = 'derived') DESC, p.sealed_at DESC, "
-			 "p.pack_id LIMIT 1",
-			 repo, repo);
+			 "ORDER BY %s LIMIT 1",
+			 repo, shape_sql, repo, order_sql);
 	if (!sql) {
 		ret = set_error(db, VEX_META_MYSQL_ERR_NOMEM,
 				"could not allocate current Vex pack query");
@@ -3887,6 +3913,23 @@ out:
 	free(sql);
 	free(repo);
 	return ret;
+}
+
+int vex_meta_mysql_current_sealed_pack(struct vex_meta_mysql *db,
+				       const char *repo_id,
+				       const struct git_hash_algo *hash_algo,
+				       struct vex_meta_mysql_pack *pack)
+{
+	return vex_meta_mysql_current_sealed_pack_by_shape(db, repo_id, hash_algo,
+						       pack, 0);
+}
+
+int vex_meta_mysql_current_sealed_default_clone_pack(
+	struct vex_meta_mysql *db, const char *repo_id,
+	const struct git_hash_algo *hash_algo, struct vex_meta_mysql_pack *pack)
+{
+	return vex_meta_mysql_current_sealed_pack_by_shape(db, repo_id, hash_algo,
+						       pack, 1);
 }
 
 void vex_meta_mysql_pack_release(struct vex_meta_mysql_pack *pack)
@@ -6331,6 +6374,18 @@ int vex_meta_mysql_current_sealed_pack(struct vex_meta_mysql *db,
 				       const char *repo_id,
 				       const struct git_hash_algo *hash_algo,
 				       struct vex_meta_mysql_pack *pack)
+{
+	(void)repo_id;
+	(void)hash_algo;
+	if (pack)
+		memset(pack, 0, sizeof(*pack));
+	return set_error(db, VEX_META_MYSQL_ERR_STATE,
+			 "Vex MySQL store adapter was not compiled into this binary");
+}
+
+int vex_meta_mysql_current_sealed_default_clone_pack(
+	struct vex_meta_mysql *db, const char *repo_id,
+	const struct git_hash_algo *hash_algo, struct vex_meta_mysql_pack *pack)
 {
 	(void)repo_id;
 	(void)hash_algo;

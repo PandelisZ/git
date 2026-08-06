@@ -2294,8 +2294,9 @@ static int current_pack_keys_match(const struct vex_store *store,
 	return matches;
 }
 
-int vex_store_current_pack(struct vex_store *store,
-			   struct vex_pack_artifact *artifact)
+static int vex_store_current_pack_by_shape(struct vex_store *store,
+					   struct vex_pack_artifact *artifact,
+					   int default_clone)
 {
 	struct vex_meta_mysql_pack pack = { 0 };
 	int ret;
@@ -2305,8 +2306,12 @@ int vex_store_current_pack(struct vex_store *store,
 	memset(artifact, 0, sizeof(*artifact));
 	if (store->backend != VEX_STORE_BACKEND_MYSQL_S3)
 		return VEX_STORE_ERR_NOT_FOUND;
-	ret = meta_mysql_result(vex_meta_mysql_current_sealed_pack(
-		store->meta_mysql, store->repo_id, store->hash_algo, &pack));
+	if (default_clone)
+		ret = meta_mysql_result(vex_meta_mysql_current_sealed_default_clone_pack(
+			store->meta_mysql, store->repo_id, store->hash_algo, &pack));
+	else
+		ret = meta_mysql_result(vex_meta_mysql_current_sealed_pack(
+			store->meta_mysql, store->repo_id, store->hash_algo, &pack));
 	if (ret)
 		return ret;
 	if (!current_pack_keys_match(store, &pack)) {
@@ -2317,6 +2322,18 @@ int vex_store_current_pack(struct vex_store *store,
 	artifact->covering_generation = pack.covering_generation;
 	vex_meta_mysql_pack_release(&pack);
 	return VEX_STORE_OK;
+}
+
+int vex_store_current_pack(struct vex_store *store,
+			   struct vex_pack_artifact *artifact)
+{
+	return vex_store_current_pack_by_shape(store, artifact, 0);
+}
+
+int vex_store_current_default_clone_pack(struct vex_store *store,
+					 struct vex_pack_artifact *artifact)
+{
+	return vex_store_current_pack_by_shape(store, artifact, 1);
 }
 
 int vex_store_download_pack(struct vex_store *store,

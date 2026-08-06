@@ -347,6 +347,17 @@ int vex_meta_mysql_current_sealed_pack(struct vex_meta_mysql *db,
 				       const char *repo_id,
 				       const struct git_hash_algo *hash_algo,
 				       struct vex_meta_mysql_pack *pack);
+
+/*
+ * Select the deliberately partial, derived artifact for a default clone.
+ * It has the same current-generation equality guard as a complete snapshot,
+ * but can never be returned by vex_meta_mysql_current_sealed_pack().  The
+ * caller must retain the ordinary pack-objects path for requests outside the
+ * partial artifact's advertised policy.
+ */
+int vex_meta_mysql_current_sealed_default_clone_pack(
+	struct vex_meta_mysql *db, const char *repo_id,
+	const struct git_hash_algo *hash_algo, struct vex_meta_mysql_pack *pack);
 void vex_meta_mysql_pack_release(struct vex_meta_mysql_pack *pack);
 
 /* Store only commit-graph edge metadata; neither object contains Git bytes. */
