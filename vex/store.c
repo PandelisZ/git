@@ -10,11 +10,12 @@
 
 /*
  * Bound receive memory and SQL statement size while amortizing S3 process and
- * connection setup across enough small immutable objects to matter.  The
- * high-concurrency seed gate keeps the count finite while allowing one
- * git/git-scale batch to exercise a four-figure S3 transfer window.
+ * connection setup across enough small immutable objects to matter.  Keep
+ * this below the direct MySQL staging transaction's verified bound; large
+ * receives use the pack-WAL path rather than making an unbounded number of
+ * individual S3 object requests.
  */
-#define VEX_RECEIVE_STAGE_BATCH_OBJECTS 4096
+#define VEX_RECEIVE_STAGE_BATCH_OBJECTS 256
 #define VEX_RECEIVE_STAGE_BATCH_BYTES (32UL * 1024UL * 1024UL)
 
 static int normalize_repo_id(const char *repo_id, struct strbuf *normalized)

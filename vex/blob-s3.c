@@ -40,12 +40,11 @@ struct vex_blob_s3 {
 };
 
 /*
- * The seed performance gate gives one 4,096-object receive batch one S3
- * transfer window.  Byte pressure remains bounded by the store's 32 MiB
- * batch cap; this is an explicit local stress setting, not an unbounded
- * transfer queue.
+ * Individual object staging remains a bounded fallback path. Large receives
+ * use immutable pack components instead of trying to turn one receive into
+ * thousands of simultaneous S3 object operations.
  */
-#define VEX_S3_BATCH_PARALLEL 4096
+#define VEX_S3_BATCH_PARALLEL 128
 
 static int contains_control(const char *value)
 {
