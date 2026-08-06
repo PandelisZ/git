@@ -4089,13 +4089,14 @@ int vex_meta_mysql_receive_pack_stage_manifest(
 		goto out;
 	}
 
-	/* Reject loose parsing: accepted rows are exact canonical Git metadata. */
+	/* Reject loose parsing: accepted rows are canonical OID membership facts. */
 	sql = vex_format("SELECT COUNT(*) FROM vex_receive_pack_manifest WHERE "
 			 "LENGTH(oid_hex) <> %u OR NOT REGEXP_LIKE("
 			 "CONVERT(oid_hex USING utf8mb4), '^[0-9a-f]+$', 'c') OR "
 			 "NOT REGEXP_LIKE(CONVERT(obj_type_text USING utf8mb4), "
-			 "'^[1-4]$', 'c') OR NOT REGEXP_LIKE("
+			 "'^[0-4]$', 'c') OR NOT REGEXP_LIKE("
 			 "CONVERT(size_text USING utf8mb4), '^[0-9]+$', 'c') OR "
+			 "(obj_type_text = _binary'0' AND size_text <> _binary'0') OR "
 			 "LENGTH(size_text) > 20 OR "
 			 "(LENGTH(size_text) = 20 AND size_text > '18446744073709551615')",
 			 hash_algo->hexsz);
@@ -4346,7 +4347,7 @@ int vex_meta_mysql_receive_pack_object_get_visible(
 	if (!row[0] || !row[1] || !row[2] || !row[3] || !row[4] || !row[5] ||
 	    !lengths || lengths[2] != VEX_META_MYSQL_OID_BYTES ||
 	    !lengths[3] || lengths[3] > 512 || !lengths[4] || lengths[4] > 512 ||
-	    parse_u64(row[0], &object_type) || object_type < 1 || object_type > 4 ||
+	    parse_u64(row[0], &object_type) || object_type > 4 ||
 	    parse_u64(row[1], &size) || parse_u64(row[5], &generation) || !generation) {
 		ret = set_error(db, VEX_META_MYSQL_ERR,
 				"MySQL returned malformed Vex received-pack object metadata");

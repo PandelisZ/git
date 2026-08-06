@@ -801,6 +801,120 @@ static void release_expired_epochs(struct vex_expired_epoch_list *epochs)
 	epochs->nr = epochs->alloc = 0;
 }
 
+/*
+ * A raw receive-pack has no loose-object rows in the legacy state snapshot.
+ * Recover it before that snapshot is loaded/saved: otherwise the generic
+ * recovery path could neither see the pack payload nor safely rewrite its
+ * immutable mapping.  We hold the repository metadata lock across S3
+ * deletion and the abort so a stale worker cannot seal refs between those
+ * two durable actions.
+ */
+struct vex_expired_receive_pack {
+	uint64_t id;
+	unsigned char pack_id[GIT_MAX_RAWSZ];
+};
+
+struct vex_expired_receive_pack_list {
+	struct vex_expired_receive_pack *items;
+	size_t nr;
+	size_t alloc;
+};
+
+static int collect_expired_receive_pack(uint64_t id, void *cb_data)
+{
+	struct vex_expired_receive_pack_list *packs = cb_data;
+	struct vex_expired_receive_pack *pack;
+
+	ALLOC_GROW(packs->items, packs->nr + 1, packs->alloc);
+	pack = &packs->items[packs->nr++];
+	memset(pack, 0, sizeof(*pack));
+	pack->id = id;
+	return VEX_META_MYSQL_OK;
+}
+
+static void release_expired_receive_packs(
+		struct vex_expired_receive_pack_list *packs)
+{
+	free(packs->items);
+	packs->items = NULL;
+	packs->nr = packs->alloc = 0;
+}
+
+static int vex_store_recover_expired_receive_packs(
+		struct vex_store *store, unsigned int min_age_seconds,
+		unsigned int *recovered)
+{
+	struct vex_meta_lock lock;
+	struct vex_expired_receive_pack_list candidates = { 0 };
+	size_t i;
+	int ret;
+
+	if (!store || store->backend != VEX_STORE_BACKEND_MYSQL_S3 ||
+	    min_age_seconds > 86400)
+		return VEX_STORE_ERR_INVALID;
+	if (recovered)
+		*recovered = 0;
+	if ((ret = meta_lock(store, &lock)))
+		goto out;
+	ret = meta_mysql_result(vex_meta_mysql_state_for_each_expired_open_locked(
+		store->meta_mysql, store->repo_id, min_age_seconds,
+		collect_expired_receive_pack, &candidates));
+	meta_unlock(store, &lock);
+	if (ret)
+		goto out;
+
+	for (i = 0; i < candidates.nr; i++) {
+		unsigned char raw_pack_id[VEX_META_MYSQL_OID_BYTES];
+		unsigned char aborted_pack_id[VEX_META_MYSQL_OID_BYTES];
+		char pack_hex[GIT_MAX_HEXSZ + 1];
+
+		if ((ret = meta_lock(store, &lock)))
+			goto out;
+		ret = meta_mysql_result(vex_meta_mysql_receive_pack_get_building_locked(
+			store->meta_mysql, store->repo_id, candidates.items[i].id,
+			raw_pack_id));
+		if (ret == VEX_STORE_ERR_NOT_FOUND) {
+			meta_unlock(store, &lock);
+			continue;
+		}
+		if (ret)
+			goto out;
+		memcpy(candidates.items[i].pack_id, raw_pack_id,
+		       store->hash_algo->rawsz);
+		hash_to_hex_algop_r(pack_hex, candidates.items[i].pack_id,
+				    store->hash_algo);
+		ret = blob_s3_result(vex_blob_s3_delete_receive_pack_staging(
+			store->blob_s3, candidates.items[i].id,
+			candidates.items[i].pack_id, store->hash_algo->rawsz));
+		if (!ret)
+			ret = blob_s3_result(vex_blob_s3_delete_receive_pack_final(
+				store->blob_s3, candidates.items[i].pack_id,
+				store->hash_algo->rawsz));
+		if (ret)
+			goto out;
+		ret = meta_mysql_result(vex_meta_mysql_receive_pack_abort_locked(
+			store->meta_mysql, store->repo_id, candidates.items[i].id,
+			aborted_pack_id));
+		if (!ret && memcmp(aborted_pack_id, candidates.items[i].pack_id,
+				   store->hash_algo->rawsz))
+			ret = VEX_STORE_ERR_CORRUPT;
+		if (!ret)
+			ret = meta_commit_locked(store, &lock);
+		if (ret)
+			goto out;
+		if (recovered)
+			(*recovered)++;
+		trace_printf("vex: recovered stale raw receive pack repo=%s epoch=%"PRIu64" pack=%s",
+			     store->repo_id, candidates.items[i].id, pack_hex);
+	}
+
+out:
+	if (lock.held)
+		meta_unlock(store, &lock);
+	release_expired_receive_packs(&candidates);
+	return ret;
+}
+
 int vex_store_recover_expired_epochs(struct vex_store *store,
 				      unsigned int min_age_seconds,
 				      unsigned int *recovered)
@@ -811,12 +925,17 @@ int vex_store_recover_expired_epochs(struct vex_store *store,
 	size_t i;
 	int ret;
 	int cleanup_ret = VEX_STORE_OK;
+	unsigned int raw_recovered = 0;
 
 	if (!store || store->backend != VEX_STORE_BACKEND_MYSQL_S3 ||
 	    min_age_seconds > 86400)
 		return VEX_STORE_ERR_INVALID;
 	if (recovered)
 		*recovered = 0;
+	ret = vex_store_recover_expired_receive_packs(store, min_age_seconds,
+					       &raw_recovered);
+	if (ret)
+		return ret;
 	if ((ret = load_locked(store, &lock, &state)))
 		return ret;
 	ret = meta_mysql_result(vex_meta_mysql_state_for_each_expired_open_locked(
@@ -839,7 +958,7 @@ int vex_store_recover_expired_epochs(struct vex_store *store,
 		if (ret)
 			goto out;
 		if (recovered)
-			*recovered = epochs.nr;
+			*recovered = raw_recovered + epochs.nr;
 		trace_printf("vex: recovered %zu stale receive epoch(s) repo=%s age=%us",
 			     epochs.nr, store->repo_id, min_age_seconds);
 		for (i = 0; i < epochs.nr; i++) {
@@ -854,6 +973,8 @@ int vex_store_recover_expired_epochs(struct vex_store *store,
 	}
 	ret = cleanup_ret;
 out:
+	if (!ret && recovered && !epochs.nr)
+		*recovered = raw_recovered;
 	if (lock.held)
 		meta_unlock(store, &lock);
 	vex_meta_state_release(&state);
@@ -1223,46 +1344,41 @@ static int append_receive_pack_manifest_record(
 		uint64_t *members)
 {
 	const char *cursor;
-	char *type_end;
-	char *size_end;
+	char *offset_end;
 	struct object_id oid;
 	struct strbuf row = STRBUF_INIT;
-	uintmax_t size;
-	int type;
+	uintmax_t offset;
 	unsigned int i;
 	char hex[GIT_MAX_HEXSZ + 1];
 	int ret = -1;
 
 	if (!store || !line || !members)
 		return -1;
-	/* `verify-pack -v` ends with summary lines; only records start with an OID. */
-	if (line->len <= store->hash_algo->hexsz ||
-	    line->buf[store->hash_algo->hexsz] != ' ')
-		return 0;
-	for (i = 0; i < store->hash_algo->hexsz; i++)
-		if (!isxdigit(line->buf[i]))
-			return 0;
-	if (parse_oid_hex_algop(line->buf, &oid, &cursor, store->hash_algo) ||
-	    *cursor++ != ' ')
-		return -1;
-	type_end = strchr((char *)cursor, ' ');
-	if (!type_end)
-		return -1;
-	*type_end = '\0';
-	type = type_from_string_gently(cursor, -1, 1);
-	*type_end = ' ';
-	if (!valid_object_type(type))
-		return -1;
-	cursor = type_end + 1;
+	/* show-index emits: <nonzero offset> <lowercase oid> (<8-hex crc>). */
 	errno = 0;
-	size = strtoumax(cursor, &size_end, 10);
-	if (errno || size_end == cursor ||
-	    (*size_end != ' ' && *size_end != '\0') || size > UINT64_MAX)
+	offset = strtoumax(line->buf, &offset_end, 10);
+	if (errno || offset_end == line->buf || !offset || *offset_end != ' ')
+		return -1;
+	cursor = offset_end + 1;
+	if (line->len < (size_t)(cursor - line->buf) +
+		store->hash_algo->hexsz + 11)
+		return -1;
+	for (i = 0; i < store->hash_algo->hexsz; i++)
+		if (!isdigit(cursor[i]) && (cursor[i] < 'a' || cursor[i] > 'f'))
+			return -1;
+	if (parse_oid_hex_algop(cursor, &oid, &cursor, store->hash_algo) ||
+	    *cursor++ != ' ' || *cursor++ != '(')
+		return -1;
+	for (i = 0; i < 8; i++)
+		if (!isxdigit(cursor[i]))
+			return -1;
+	if (cursor[8] != ')' || cursor[9] != '\0')
 		return -1;
 	if (*members == UINT64_MAX)
 		return -1;
 	hash_to_hex_algop_r(hex, oid.hash, store->hash_algo);
-	strbuf_addf(&row, "%s\t%d\t%"PRIuMAX"\n", hex, type, size);
+	/* The immutable .idx owns offsets, type, and size; MySQL owns membership. */
+	strbuf_addf(&row, "%s\t0\t0\n", hex);
 	if (write_in_full(fd, row.buf, row.len) != (ssize_t)row.len)
 		goto out;
 	(*members)++;
@@ -1273,10 +1389,11 @@ out:
 }
 
 /*
- * index-pack has already verified the incoming stream.  verify-pack gives us
- * the compact per-member facts needed for the MySQL OID-to-pack map without
- * reading/decompressing every object into this process.  Its output is
- * rewritten into a strict, unquoted TSV dialect before LOAD DATA sees it.
+ * index-pack has already verified the incoming stream.  show-index makes one
+ * linear index-only pass to build the MySQL OID-to-pack membership map, with
+ * no second pack-content/decompression scan.  The immutable .idx remains the
+ * authoritative offset/type/size source.  Its output is rewritten into a
+ * strict, unquoted TSV dialect before LOAD DATA sees it.
  */
 static int vex_store_write_receive_pack_manifest(
 		struct vex_store *store, const char *objects_dir,
@@ -1288,6 +1405,8 @@ static int vex_store_write_receive_pack_manifest(
 	struct strbuf line = STRBUF_INIT;
 	char *template = NULL;
 	FILE *output = NULL;
+	struct stat st;
+	int idx_fd = -1;
 	uint64_t members = 0;
 	int child_started = 0;
 	int ret = VEX_STORE_ERR;
@@ -1303,8 +1422,12 @@ static int vex_store_write_receive_pack_manifest(
 	free(template);
 	if (!manifest)
 		goto out;
-	strvec_pushl(&child.args, "verify-pack", "-v", idx_path, NULL);
-	child.no_stdin = 1;
+	idx_fd = open_nofollow(idx_path, O_RDONLY);
+	if (idx_fd < 0 || fstat(idx_fd, &st) || !S_ISREG(st.st_mode))
+		goto out;
+	child.in = idx_fd;
+	idx_fd = -1; /* start_command owns and closes a supplied child input. */
+	strvec_pushl(&child.args, "show-index", NULL);
 	child.out = -1;
 	child.git_cmd = 1;
 	if (start_command(&child))
@@ -1338,6 +1461,8 @@ out:
 		fclose(output);
 	if (child_started)
 		(void)finish_command(&child);
+	if (idx_fd >= 0)
+		close(idx_fd);
 	strbuf_release(&line);
 	delete_tempfile(&manifest);
 	return ret;
@@ -1401,6 +1526,7 @@ int vex_store_stage_receive_pack(struct vex_store *store,
 	if (ret)
 		goto out;
 	staged_to_s3 = 0;
+	vex_test_kill_at("after-receive-pack-stage");
 	ret = vex_epoch_adopt_receive_pack(epoch, pack_id);
 out:
 	if (ret && staged_to_s3)
@@ -3276,6 +3402,7 @@ static int vex_ref_transaction_commit_receive_pack(
 	if (ret)
 		return ret;
 	epoch->receive_pack_promoted = 1;
+	vex_test_kill_at("after-receive-pack-promote");
 	if ((ret = meta_lock(store, &lock)))
 		return ret;
 	ret = meta_mysql_result(vex_meta_mysql_receive_pack_seal_locked(

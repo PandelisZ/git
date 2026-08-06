@@ -118,8 +118,9 @@ struct vex_meta_mysql_receive_pack {
 
 /*
  * Metadata for one object whose canonical bytes live in a sealed raw pack.
- * The caller can materialize `pack_key`/`idx_key` through the blob backend;
- * release the strings with vex_meta_mysql_receive_pack_object_release().
+ * object_type and size are zero when the receive map was derived from the
+ * pack index alone; callers then materialize the immutable pack/idx pair.
+ * Release the strings with vex_meta_mysql_receive_pack_object_release().
  */
 struct vex_meta_mysql_receive_pack_object {
 	unsigned int object_type;
