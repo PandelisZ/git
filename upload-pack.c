@@ -305,6 +305,16 @@ struct vex_precomputed_want_check {
 	unsigned char *visible;
 };
 
+struct vex_precomputed_pack {
+	struct packed_git *pack;
+	/*
+	 * A default-clone relay pack is a request-scoped source.  Unlike the
+	 * complete snapshot cache, it must be closed after the bytes are sent so
+	 * that its independent clone lease is released.
+	 */
+	struct odb_vex_default_clone_pack *default_clone;
+};
+
 static int vex_precomputed_pack_fallback(const char *reason)
 {
 	trace_printf("vex: precomputed-pack fallback: %s", reason);
@@ -326,6 +336,62 @@ static int vex_precomputed_want_is_visible(const struct reference *ref,
 	return 0;
 }
 
+static void vex_precomputed_pack_release(struct vex_precomputed_pack *pack)
+{
+	if (!pack)
+		return;
+	odb_source_vex_close_default_clone_pack(pack->default_clone);
+	pack->default_clone = NULL;
+	pack->pack = NULL;
+}
+
+static struct packed_git *vex_precomputed_packed_source_one_pack(
+		struct odb_source_packed *packed)
+{
+	struct packfile_list_entry *entry;
+
+	if (!packed)
+		return NULL;
+	entry = packfile_store_get_packs(packed);
+	if (!entry || entry->next || !entry->pack || !entry->pack->pack_size)
+		return NULL;
+	return entry->pack;
+}
+
+static int vex_precomputed_pack_matches_wants(struct upload_pack_data *data,
+						      struct packed_git *pack)
+{
+	struct vex_precomputed_want_check want_check;
+	unsigned char *visible = NULL;
+	int ret;
+	int i;
+
+	if (!pack)
+		return 0;
+	/*
+	 * Do not turn an allowed unadvertised-object request into a whole-pack
+	 * disclosure. Every requested object must still be a current public ref
+	 * and be physically present in the exact immutable artifact.
+	 */
+	CALLOC_ARRAY(visible, data->want_obj.nr);
+	want_check.data = data;
+	want_check.visible = visible;
+	ret = refs_for_each_ref(get_main_ref_store(the_repository),
+				vex_precomputed_want_is_visible, &want_check);
+	if (ret)
+		goto out;
+	for (i = 0; i < data->want_obj.nr; i++) {
+		struct object *want = data->want_obj.objects[i].item;
+
+		if (!visible[i] || !find_pack_entry_one(&want->oid, pack))
+			goto out;
+	}
+	ret = 1;
+out:
+	free(visible);
+	return ret;
+}
+
 /*
  * A derived Vex pack is a complete, immutable snapshot of the public object
  * graph at one sealed generation.  It is only safe to put that whole pack on
@@ -334,17 +400,14 @@ static int vex_precomputed_want_is_visible(const struct reference *ref,
  * the normal pack-objects path.
  */
 static int vex_precomputed_pack_eligible(struct upload_pack_data *data,
-					 struct packed_git **pack_out)
+					 struct vex_precomputed_pack *pack_out)
 {
 	struct odb_source *source;
 	struct odb_source_packed *packed;
-	struct packfile_list_entry *entry;
-	struct vex_precomputed_want_check want_check;
-	unsigned char *visible = NULL;
-	int ret;
-	int i;
+	struct odb_vex_default_clone_pack *default_clone = NULL;
+	struct packed_git *pack;
 
-	*pack_out = NULL;
+	memset(pack_out, 0, sizeof(*pack_out));
 	if (!repo_uses_vex_storage(the_repository) ||
 	    (get_git_namespace() && *get_git_namespace()) ||
 	    data->pack_objects_hook || data->hidden_refs.nr ||
@@ -373,39 +436,39 @@ static int vex_precomputed_pack_eligible(struct upload_pack_data *data,
 	if (!source || source->next || !odb_source_is_vex(source))
 		return vex_precomputed_pack_fallback("repository has non-Vex object sources");
 
-	/* Refresh the selected current artifact before taking its local pack FD. */
+	/*
+	 * Prefer the smaller default-clone closure when its verified index covers
+	 * every requested public tip. It is an additional request-scoped cache:
+	 * it never replaces the complete snapshot used by normal Vex ODB reads or
+	 * by the full-pack fallback below. Try it before refreshing that complete
+	 * cache: a default-clone relay must not download a larger artifact merely
+	 * to discover that the smaller exact closure can satisfy this request.
+	 */
+	if (!odb_source_vex_open_default_clone_pack(source, &default_clone)) {
+		packed = odb_source_vex_default_clone_pack_packed(default_clone);
+		pack = vex_precomputed_packed_source_one_pack(packed);
+		if (vex_precomputed_pack_matches_wants(data, pack)) {
+			pack_out->pack = pack;
+			pack_out->default_clone = default_clone;
+			return 1;
+		}
+		odb_source_vex_close_default_clone_pack(default_clone);
+	}
+
+	/* The complete derived snapshot remains the general direct-relay path. */
 	odb_source_prepare(source, ODB_PREPARE_FLUSH_CACHES);
 	packed = odb_source_vex_packed_store(source);
 	if (!packed)
 		return vex_precomputed_pack_fallback("no current verified Vex pack cache");
-	entry = packfile_store_get_packs(packed);
-	if (!entry || entry->next || !entry->pack || !entry->pack->pack_size)
+	pack = vex_precomputed_packed_source_one_pack(packed);
+	if (!pack)
 		return vex_precomputed_pack_fallback("Vex cache does not contain exactly one pack");
-
-	/*
-	 * Do not turn an allowed unadvertised-object request into a whole-pack
-	 * disclosure.  Every requested object must still be a current public ref.
-	 */
-	CALLOC_ARRAY(visible, data->want_obj.nr);
-	want_check.data = data;
-	want_check.visible = visible;
-	ret = refs_for_each_ref(get_main_ref_store(the_repository),
-				vex_precomputed_want_is_visible, &want_check);
-	if (ret)
-		goto out;
-	for (i = 0; i < data->want_obj.nr; i++) {
-		struct object *want = data->want_obj.objects[i].item;
-
-		if (!visible[i] || !find_pack_entry_one(&want->oid, entry->pack))
-			goto out;
+	if (vex_precomputed_pack_matches_wants(data, pack)) {
+		pack_out->pack = pack;
+		return 1;
 	}
-
-	*pack_out = entry->pack;
-	out:
-	free(visible);
-	if (!*pack_out)
-		trace_printf("vex: precomputed-pack fallback: wanted object is not public or missing from current pack");
-	return !!*pack_out;
+	trace_printf("vex: precomputed-pack fallback: wanted object is not public or missing from current pack");
+	return 0;
 }
 
 static void create_vex_precomputed_pack_file(struct upload_pack_data *pack_data,
@@ -450,27 +513,33 @@ fail:
 static int try_vex_precomputed_pack(struct upload_pack_data *pack_data,
 					   const struct string_list *uri_protocols)
 {
+	struct vex_precomputed_pack selected;
 	struct packed_git *pack;
 	struct stat st;
 	int pack_fd;
 
 	if (uri_protocols && uri_protocols->nr)
 		return 0;
-	if (!vex_precomputed_pack_eligible(pack_data, &pack))
+	if (!vex_precomputed_pack_eligible(pack_data, &selected))
 		return 0;
+	pack = selected.pack;
 	pack_fd = open_nofollow(pack->pack_name, O_RDONLY);
-	if (pack_fd < 0)
+	if (pack_fd < 0) {
+		vex_precomputed_pack_release(&selected);
 		return 0;
+	}
 	if (fstat(pack_fd, &st) || !S_ISREG(st.st_mode) ||
 	    st.st_size != pack->pack_size ||
 	    st.st_size < the_hash_algo->rawsz) {
 		close(pack_fd);
+		vex_precomputed_pack_release(&selected);
 		return 0;
 	}
 
 	trace_printf("vex: serving verified precomputed pack %s",
 		     pack->pack_name);
 	create_vex_precomputed_pack_file(pack_data, pack_fd);
+	vex_precomputed_pack_release(&selected);
 	return 1;
 }
 

@@ -598,17 +598,17 @@ clone_and_verify_relay() {
 	# before this test can assert the relay artifact.  Keep any multi-object
 	# response as a pack solely for this wire-level assertion.
 	GIT_TRACE_PACKET="$trace" git_https -c fetch.unpackLimit=1 -c "protocol.version=$protocol" \
-		clone -q "$origin" "$clone_path"
+		clone -q --branch main "$origin" "$clone_path"
 	shopt -s nullglob
 	cloned_packs=("$clone_path"/.git/objects/pack/pack-*.pack)
 	shopt -u nullglob
 	[ "${#cloned_packs[@]}" -eq 1 ] || {
-		printf 'vex receive-pack WAL E2E: protocol-v%s clone has %s packed object files, expected one compact relay pack\n' \
+		printf 'vex receive-pack WAL E2E: protocol-v%s clone has %s packed object files, expected one selected relay pack\n' \
 			"$protocol" "${#cloned_packs[@]}" >&2
 		return 1
 	}
 	[ "${cloned_packs[0]##*/}" = "pack-$expected_pack.pack" ] || {
-		printf 'vex receive-pack WAL E2E: protocol-v%s clone received %s instead of compact pack-%s.pack\n' \
+		printf 'vex receive-pack WAL E2E: protocol-v%s clone received %s instead of selected pack-%s.pack\n' \
 			"$protocol" "${cloned_packs[0]##*/}" "$expected_pack" >&2
 		return 1
 	}
@@ -627,24 +627,25 @@ clone_and_verify_relay() {
 	"$stock_git" -C "$clone_path" fsck --no-progress >/dev/null
 }
 
-# The raw WAL seed and compact derived snapshot are now MySQL/S3-verified.
-# Turn the seed gate off, then use the same fault seam as the direct-pack test:
-# passing the following clones proves upload-pack did not invoke git-pack-objects
-# and the received client pack checksum proves it selected the compact artifact.
-# The annotated tag makes protocol-v0's include-tag negotiation part of this
-# relay contract too.
+# The raw WAL seed, complete derived snapshot, and narrower default-clone
+# artifact are now MySQL/S3-verified. Turn the seed gate off, then use the
+# same fault seam as the direct-pack test: passing the following default-branch
+# clones proves upload-pack did not invoke git-pack-objects and the received
+# client pack checksum proves it selected the partial artifact rather than the
+# raw or complete pack. The annotated tag makes protocol-v0's include-tag
+# negotiation part of this relay contract too.
 restore_gateway
 clone_v0="$scratch/clone-v0"
 clone_v2="$scratch/clone-v2"
 activate_gateway_relay_fault
-clone_and_verify_relay 0 "$clone_v0" "$scratch/v0.trace" "$compact_pack_id"
-clone_and_verify_relay 2 "$clone_v2" "$scratch/v2.trace" "$compact_pack_id"
+clone_and_verify_relay 0 "$clone_v0" "$scratch/v0.trace" "$default_pack_id"
+clone_and_verify_relay 2 "$clone_v2" "$scratch/v2.trace" "$default_pack_id"
 grep -Eq 'clone< version 2$' "$scratch/v2.trace" || {
 	printf '%s\n' 'vex receive-pack WAL E2E: stock clone did not negotiate protocol v2' >&2
 	exit 1
 }
 
 restore_gateway
-printf 'vex receive-pack WAL E2E: PASS stock non-thin initial mirror refs=%s raw_objects=%s default_objects=%s raw_pack=%s compact_pack=%s default_pack=%s; raw MySQL map retained, the default heads/tags index is exact and partial, compact S3 pack/idx remains globally selected, and protocol-v0/v2 annotated-tag fsck clones received the compact pack without git-pack-objects for %s\n' \
+printf 'vex receive-pack WAL E2E: PASS stock non-thin initial mirror refs=%s raw_objects=%s default_objects=%s raw_pack=%s compact_pack=%s default_pack=%s; raw MySQL map retained, the default heads/tags index is exact and partial, compact S3 pack/idx remains globally selected, and protocol-v0/v2 annotated-tag fsck clones received the default pack without git-pack-objects for %s\n' \
 	"$expected_refs" "$expected_members" "$default_expected_members" "$pack_id" \
 	"$compact_pack_id" "$default_pack_id" "$origin"
