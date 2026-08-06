@@ -569,12 +569,46 @@ static int vex_be_transaction_abort(struct ref_store *ref_store UNUSED,
 	return 0;
 }
 
+static void vex_maybe_build_fetch_delta_cache(struct vex_ref_store *refs,
+		struct ref_transaction *transaction)
+{
+	struct ref_update *candidate = NULL;
+	size_t i;
+
+	/*
+	 * Keep this cache deliberately narrow. Multi-ref, tag, deletion, and
+	 * force-update transactions retain the canonical upload-pack path; a cache
+	 * miss is always safe, while an expensive post-receive pack must never hold
+	 * up those broader transaction shapes.
+	 */
+	for (i = 0; i < transaction->nr; i++) {
+		struct ref_update *update = transaction->updates[i];
+
+		if (update->flags & REF_LOG_ONLY)
+			continue;
+		if (!(update->flags & REF_HAVE_OLD) ||
+		    !(update->flags & REF_HAVE_NEW) || update->new_target ||
+		    !starts_with(update->refname, "refs/heads/") ||
+		    is_null_oid(&update->old_oid) || is_null_oid(&update->new_oid))
+			return;
+		if (candidate)
+			return;
+		candidate = update;
+	}
+	if (candidate)
+		odb_source_vex_maybe_build_fetch_delta_cache(refs->base.repo,
+						      &candidate->old_oid,
+						      &candidate->new_oid);
+}
+
 static int vex_be_transaction_finish(struct ref_store *ref_store,
 				     struct ref_transaction *transaction,
 				     struct strbuf *err)
 {
 	struct vex_ref_store *refs = vex_downcast(ref_store);
 	struct vex_transaction_data *data = transaction->backend_data;
+	int cache_eligible = !data->receive_transaction ||
+		!odb_vex_receive_pack_wal_enabled(data->receive_transaction);
 	int ret;
 
 	vex_test_kill_at("before-ref-commit");
@@ -590,6 +624,13 @@ static int vex_be_transaction_finish(struct ref_store *ref_store,
 	}
 	if (data->epoch)
 		vex_epoch_free(data->epoch);
+	/*
+	 * The raw initial-mirror path already retains its immutable receive pack.
+	 * For ordinary receives, materialize the optional cache only after the
+	 * shared epoch is terminal, so it reads the sealed canonical namespace.
+	 */
+	if (!ret && cache_eligible)
+		vex_maybe_build_fetch_delta_cache(refs, transaction);
 	free(data);
 	transaction->backend_data = NULL;
 	transaction->state = REF_TRANSACTION_CLOSED;

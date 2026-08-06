@@ -10,6 +10,7 @@ struct vex_store;
 struct vex_epoch;
 struct odb_transaction;
 struct odb_source_packed;
+struct packed_git;
 struct odb_vex_default_clone_pack;
 struct repository;
 
@@ -53,6 +54,24 @@ struct odb_source_packed *odb_source_vex_default_clone_pack_packed(
 	const struct odb_vex_default_clone_pack *pack);
 void odb_source_vex_close_default_clone_pack(
 	struct odb_vex_default_clone_pack *pack);
+
+/*
+ * Return a local, post-receive delta pack only when it was published for the
+ * exact old/new pair. The returned pack is owned by `source` and remains
+ * valid until that source is closed or prepared again. It is a disposable
+ * NVMe cache, never an authoritative Vex artifact.
+ */
+struct packed_git *odb_source_vex_fetch_delta_cache_pack(
+	struct odb_source *source, const struct object_id *old_oid,
+	const struct object_id *new_oid);
+
+/*
+ * Best-effort post-seal cache for a small normal fast-forward update. It is
+ * local scratch only; a failure cannot affect durable Vex objects or refs.
+ */
+void odb_source_vex_maybe_build_fetch_delta_cache(
+	struct repository *repo, const struct object_id *old_oid,
+	const struct object_id *new_oid);
 
 /*
  * Receive-pack starts its Vex ODB transaction in the parent process.  These

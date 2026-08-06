@@ -471,6 +471,52 @@ static int vex_precomputed_pack_eligible(struct upload_pack_data *data,
 	return 0;
 }
 
+/*
+ * A local fetch-delta cache is a thick pack produced after one ordinary
+ * fast-forward receive: `new ^old`. It may be sent as-is only when the
+ * client proved it has that exact old commit and asks for that exact current
+ * public tip. Do not try to generalize this into negotiation: every other
+ * incremental fetch stays on the normal pack-objects path.
+ */
+static int vex_fetch_delta_pack_eligible(struct upload_pack_data *data,
+					 struct packed_git **pack_out)
+{
+	struct odb_source *source;
+	struct object *want;
+	int i;
+
+	*pack_out = NULL;
+	if (!repo_uses_vex_storage(the_repository) ||
+	    (get_git_namespace() && *get_git_namespace()) ||
+	    data->pack_objects_hook || data->hidden_refs.nr ||
+	    repo_has_promisor_remote(the_repository) ||
+	    is_repository_shallow(the_repository) ||
+	    data->want_obj.nr != 1 || !data->have_obj.nr ||
+	    data->extra_edge_obj.nr || data->shallows.nr || data->shallow_nr ||
+	    data->depth || data->deepen_since || data->deepen_rev_list ||
+	    data->deepen_relative || data->filter_options.choice ||
+	    data->uri_protocols.nr || strmap_get_size(&data->wanted_refs) ||
+	    !data->use_ofs_delta)
+		return vex_precomputed_pack_fallback("request is not an exact cached fast-forward fetch");
+
+	source = the_repository->objects->sources;
+	if (!source || source->next || !odb_source_is_vex(source))
+		return vex_precomputed_pack_fallback("repository has non-Vex object sources");
+	want = data->want_obj.objects[0].item;
+	for (i = 0; i < data->have_obj.nr; i++) {
+		struct object *have = data->have_obj.objects[i].item;
+		struct packed_git *pack;
+
+		pack = odb_source_vex_fetch_delta_cache_pack(source, &have->oid,
+						      &want->oid);
+		if (pack && vex_precomputed_pack_matches_wants(data, pack)) {
+			*pack_out = pack;
+			return 1;
+		}
+	}
+	return vex_precomputed_pack_fallback("no exact local fetch-delta cache");
+}
+
 static void create_vex_precomputed_pack_file(struct upload_pack_data *pack_data,
 					      int pack_fd)
 {
@@ -543,6 +589,37 @@ static int try_vex_precomputed_pack(struct upload_pack_data *pack_data,
 	return 1;
 }
 
+static int try_vex_fetch_delta_pack(struct upload_pack_data *pack_data,
+					    const struct string_list *uri_protocols)
+{
+	struct packed_git *pack;
+	struct stat st;
+	int pack_fd;
+
+	if (uri_protocols && uri_protocols->nr)
+		return 0;
+	if (!vex_fetch_delta_pack_eligible(pack_data, &pack))
+		return 0;
+	if (!is_pack_valid(pack))
+		return 0;
+	/* Open an independent immutable descriptor, like the complete-pack relay.
+	 * The packed source may be mid-read, so a duplicated descriptor would share
+	 * its seek position. */
+	pack_fd = open_nofollow(pack->pack_name, O_RDONLY);
+	if (pack_fd < 0)
+		return 0;
+	if (fstat(pack_fd, &st) || !S_ISREG(st.st_mode) ||
+	    st.st_size != pack->pack_size ||
+	    st.st_size < the_hash_algo->rawsz) {
+		close(pack_fd);
+		return 0;
+	}
+
+	trace_printf("vex: serving exact local fetch-delta pack %s", pack->pack_name);
+	create_vex_precomputed_pack_file(pack_data, pack_fd);
+	return 1;
+}
+
 static void create_pack_file(struct upload_pack_data *pack_data,
 			     const struct string_list *uri_protocols)
 {
@@ -556,7 +633,8 @@ static void create_pack_file(struct upload_pack_data *pack_data,
 	int i;
 	FILE *pipe_fd;
 
-	if (try_vex_precomputed_pack(pack_data, uri_protocols))
+	if (try_vex_fetch_delta_pack(pack_data, uri_protocols) ||
+	    try_vex_precomputed_pack(pack_data, uri_protocols))
 		return;
 	/* Test-only dispatch proof: an eligible Vex request must never get here. */
 	if (repo_uses_vex_storage(the_repository) &&

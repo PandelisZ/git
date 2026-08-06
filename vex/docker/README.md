@@ -57,6 +57,20 @@ The initial worker intentionally does not consume the raw receive-pack WAL:
 that path remains synchronously sealed by the C receive transaction so refs
 never outrun durable S3 bytes.
 
+For a small normal fast-forward receive, the C ref backend also materializes a
+best-effort, post-seal delta pack under the shared `GIT_VEX_SCRATCH` volume.
+It is a disposable fetch cache, not a Vex durability input: a cache miss or
+loss falls back to the canonical MySQL/S3 object path. Each repository admits
+at most 32 immutable deltas of at most 32 MiB, rotating old entries under a
+local lock. Set `GIT_VEX_FETCH_DELTA_CACHE=false` to disable it. This lets
+normal `git pack-objects` repack a just-pushed closure from local NVMe rather
+than start one S3/curl object read per new object. For the even narrower case
+of one current public `new` want and an exact cached `old` have, upload-pack
+may relay the verified thick delta pack directly. It never broadens object
+visibility or replaces normal negotiation: tags, filters, shallow requests,
+namespaces, hooks, non-Vex alternates, and every non-exact request still use
+stock `pack-objects`.
+
 `scripts/vex/build-pack.sh group/repository.git` remains the explicit
 immediate builder for maintenance and comparison.
 

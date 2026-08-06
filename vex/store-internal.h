@@ -115,6 +115,8 @@ struct vex_store {
 	struct vex_meta_mysql *meta_mysql;
 	struct vex_blob_fs *blob_fs;
 	struct vex_blob_s3 *blob_s3;
+	/* A successful repository metadata ensure is immutable per store handle. */
+	unsigned int metadata_checked:1;
 	unsigned int blob_s3_checked:1;
 	/* Avoid repeating the stale-epoch scan on every operation in one store. */
 	unsigned int epoch_recovery_checked:1;

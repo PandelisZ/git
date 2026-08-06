@@ -1747,7 +1747,12 @@ int vex_store_ensure_metadata(struct vex_store *store)
 
 	if (!store)
 		return VEX_STORE_ERR_INVALID;
+	if (store->metadata_checked)
+		return VEX_STORE_OK;
 	ret = meta_ensure(store);
+	/* Cache only success so a transient backend failure remains retryable. */
+	if (!ret)
+		store->metadata_checked = 1;
 	return ret;
 }
 

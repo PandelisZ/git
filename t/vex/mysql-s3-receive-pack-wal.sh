@@ -71,63 +71,106 @@ fi
 
 gateway_wal_active=0
 gateway_fault_active=0
+gateway_s3_read_fault_active=0
 restore_gateway() {
-	local actual_wal actual_fault
+	local actual_wal actual_fault actual_s3_read_fault
 
-	if [ "$gateway_wal_active" -eq 0 ] && [ "$gateway_fault_active" -eq 0 ]; then
+	if [ "$gateway_wal_active" -eq 0 ] && [ "$gateway_fault_active" -eq 0 ] &&
+		[ "$gateway_s3_read_fault_active" -eq 0 ]; then
 		return 0
 	fi
 	env GIT_VEX_RECEIVE_PACK_WAL= GIT_VEX_TEST_FAIL_PACK_OBJECTS= \
+		GIT_VEX_TEST_S3_FAIL_READS= \
 		"${compose[@]}" up -d --no-build --no-deps --force-recreate git-http >/dev/null
 	wait_for_storage
 	actual_wal=$("${compose[@]}" exec -T git-http /bin/sh -c \
 		'printf %s "${GIT_VEX_RECEIVE_PACK_WAL:-}"')
 	actual_fault=$("${compose[@]}" exec -T git-http /bin/sh -c \
 		'printf %s "${GIT_VEX_TEST_FAIL_PACK_OBJECTS:-}"')
-	[ -z "$actual_wal" ] && [ -z "$actual_fault" ] || {
+	actual_s3_read_fault=$("${compose[@]}" exec -T git-http /bin/sh -c \
+		'printf %s "${GIT_VEX_TEST_S3_FAIL_READS:-}"')
+	[ -z "$actual_wal" ] && [ -z "$actual_fault" ] &&
+		[ -z "$actual_s3_read_fault" ] || {
 		printf '%s\n' 'vex receive-pack WAL E2E: gateway retained a test-only gate' >&2
 		return 1
 	}
 	gateway_wal_active=0
 	gateway_fault_active=0
+	gateway_s3_read_fault_active=0
 }
 
 activate_gateway_wal() {
-	local actual_wal actual_fault
+	local actual_wal actual_fault actual_s3_read_fault
 
 	env GIT_VEX_RECEIVE_PACK_WAL=1 GIT_VEX_TEST_FAIL_PACK_OBJECTS= \
+		GIT_VEX_TEST_S3_FAIL_READS= \
 		"${compose[@]}" up -d --no-build --no-deps --force-recreate git-http >/dev/null
 	wait_for_storage
 	actual_wal=$("${compose[@]}" exec -T git-http /bin/sh -c \
 		'printf %s "${GIT_VEX_RECEIVE_PACK_WAL:-}"')
 	actual_fault=$("${compose[@]}" exec -T git-http /bin/sh -c \
 		'printf %s "${GIT_VEX_TEST_FAIL_PACK_OBJECTS:-}"')
-	[ "$actual_wal" = 1 ] && [ -z "$actual_fault" ] || {
+	actual_s3_read_fault=$("${compose[@]}" exec -T git-http /bin/sh -c \
+		'printf %s "${GIT_VEX_TEST_S3_FAIL_READS:-}"')
+	[ "$actual_wal" = 1 ] && [ -z "$actual_fault" ] &&
+		[ -z "$actual_s3_read_fault" ] || {
 		printf '%s\n' 'vex receive-pack WAL E2E: gateway was not recreated with the WAL gate' >&2
 		return 1
 	}
 	gateway_wal_active=1
+	gateway_s3_read_fault_active=0
 }
 
 activate_gateway_relay_fault() {
-	local actual_wal actual_fault
+	local actual_wal actual_fault actual_s3_read_fault
 
 	# The raw pack has already been sealed before this point.  Disable the
 	# seed-only receive path and make any upload-pack fallback fail instead, so
 	# both following stock-client clones must relay the verified raw pack.
 	env GIT_VEX_RECEIVE_PACK_WAL= GIT_VEX_TEST_FAIL_PACK_OBJECTS=1 \
+		GIT_VEX_TEST_S3_FAIL_READS= \
 		"${compose[@]}" up -d --no-build --no-deps --force-recreate git-http >/dev/null
 	wait_for_storage
 	actual_wal=$("${compose[@]}" exec -T git-http /bin/sh -c \
 		'printf %s "${GIT_VEX_RECEIVE_PACK_WAL:-}"')
 	actual_fault=$("${compose[@]}" exec -T git-http /bin/sh -c \
 		'printf %s "${GIT_VEX_TEST_FAIL_PACK_OBJECTS:-}"')
-	[ -z "$actual_wal" ] && [ "$actual_fault" = 1 ] || {
+	actual_s3_read_fault=$("${compose[@]}" exec -T git-http /bin/sh -c \
+		'printf %s "${GIT_VEX_TEST_S3_FAIL_READS:-}"')
+	[ -z "$actual_wal" ] && [ "$actual_fault" = 1 ] &&
+		[ -z "$actual_s3_read_fault" ] || {
 		printf '%s\n' 'vex receive-pack WAL E2E: gateway was not recreated with the raw-pack relay fault gate' >&2
 		return 1
 	}
 	gateway_wal_active=0
 	gateway_fault_active=1
+	gateway_s3_read_fault_active=0
+}
+
+activate_gateway_fetch_delta_relay_fault() {
+	local actual_wal actual_fault actual_s3_read_fault
+
+	# An exact old-have/new-want fetch may relay the local delta pack. Reject
+	# both canonical S3 reads and pack-objects dispatch to prove that narrow
+	# fast path; all other requests still retain their normal fallback.
+	env GIT_VEX_RECEIVE_PACK_WAL= GIT_VEX_TEST_FAIL_PACK_OBJECTS=1 \
+		GIT_VEX_TEST_S3_FAIL_READS=1 \
+		"${compose[@]}" up -d --no-build --no-deps --force-recreate git-http >/dev/null
+	wait_for_storage
+	actual_wal=$("${compose[@]}" exec -T git-http /bin/sh -c \
+		'printf %s "${GIT_VEX_RECEIVE_PACK_WAL:-}"')
+	actual_fault=$("${compose[@]}" exec -T git-http /bin/sh -c \
+		'printf %s "${GIT_VEX_TEST_FAIL_PACK_OBJECTS:-}"')
+	actual_s3_read_fault=$("${compose[@]}" exec -T git-http /bin/sh -c \
+		'printf %s "${GIT_VEX_TEST_S3_FAIL_READS:-}"')
+	[ -z "$actual_wal" ] && [ "$actual_fault" = 1 ] &&
+		[ "$actual_s3_read_fault" = 1 ] || {
+		printf '%s\n' 'vex receive-pack WAL E2E: gateway was not recreated with the fetch-delta relay gate' >&2
+		return 1
+	}
+	gateway_wal_active=0
+	gateway_fault_active=1
+	gateway_s3_read_fault_active=1
 }
 
 scratch=$(mktemp -d "${TMPDIR:-/tmp}/vex-mysql-s3-receive-pack-wal.XXXXXX")
@@ -708,6 +751,65 @@ overlay_rebuild=$(mysql_query "
 		"$overlay_rebuild" "$post_seed_generation" >&2
 	exit 1
 }
+
+# The first ordinary update gets a disposable local pack containing only its
+# new closure. There is intentionally no current derived relay yet, so a
+# stock-client fetch with both S3 byte reads and pack-objects rejected proves
+# the server relays exactly that local delta pack for its old-have/new-want.
+fetch_delta_dir="/var/git-scratch/vex-fetch-delta/$repo_id/objects/pack"
+fetch_delta_manifest_dir="/var/git-scratch/vex-fetch-delta/$repo_id/manifests"
+"${compose[@]}" exec -T git-http /bin/sh -c '
+	set -eu
+	set -- "$1"/pack-*.idx
+	test -s "$1"
+	test -s "${1%.idx}.pack"
+' sh "$fetch_delta_dir"
+"${compose[@]}" exec -T git-http /bin/sh -c '
+	set -eu
+	set -- "$1"/pack-*.vex-fetch-delta
+	test "$#" -eq 1
+	test -s "$1"
+' sh "$fetch_delta_manifest_dir"
+fetch_delta_pack_id=$("${compose[@]}" exec -T git-http /bin/sh -c '
+	set -eu
+	set -- "$1"/pack-*.vex-fetch-delta
+	test "$#" -eq 1
+	test -s "$1"
+	sed -n "4p" "$1"
+' sh "$fetch_delta_manifest_dir")
+case "$fetch_delta_pack_id" in
+????????????????????????????????????????) ;;
+*)
+	printf 'vex receive-pack WAL E2E: invalid fetch-delta manifest pack id: %s\n' \
+		"$fetch_delta_pack_id" >&2
+	exit 1
+	;;
+esac
+current_generation_relay=$(mysql_query "
+	SELECT COUNT(*) FROM pack_envelopes
+	 WHERE repo_id = UNHEX('$repo_id')
+	   AND state = 'sealed'
+	   AND idx_key IS NOT NULL
+	   AND covering_generation = $post_seed_generation;")
+[ "$current_generation_relay" = 0 ] || {
+	printf 'vex receive-pack WAL E2E: delta-cache proof has a current relay candidate: %s\n' \
+		"$current_generation_relay" >&2
+	exit 1
+}
+activate_gateway_fetch_delta_relay_fault
+"$stock_git" -C "$clone_v0" config fetch.unpackLimit 1
+git_https -C "$clone_v0" fetch -q origin refs/heads/main:refs/remotes/origin/main
+[ "$("$stock_git" -C "$clone_v0" rev-parse refs/remotes/origin/main)" = "$post_seed_tip" ] || {
+	printf '%s\n' 'vex receive-pack WAL E2E: direct delta relay fetch did not reach the overlay tip' >&2
+	exit 1
+}
+test -s "$clone_v0/.git/objects/pack/pack-$fetch_delta_pack_id.pack" || {
+	printf 'vex receive-pack WAL E2E: client did not retain relayed delta pack %s\n' \
+		"$fetch_delta_pack_id" >&2
+	exit 1
+}
+"$stock_git" -C "$clone_v0" fsck --no-progress >/dev/null
+restore_gateway
 
 # Rebuild the partial clone relay after a normal overlay. The retained raw
 # seed is older than the current generation, so this proves the builder joins

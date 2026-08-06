@@ -497,3 +497,45 @@ for clone, establishing the stale-artifact cause. Its fetch samples improved
 to below the numerical target, but an unrelated probe changed the benchmark
 branch during force-with-lease restoration; the harness correctly marked that
 fetch receipt invalid. No fresh fetch or GitHub gate is claimed here.
+
+## 2026-08-06 — Exact local post-push delta relay
+
+Normal one-branch fast-forward receives now publish a bounded local NVMe
+delta-pack cache only after their Vex ref epoch seals. The cache is not a
+durability input: it is one `pack-objects --revs --include-tag` closure of
+`new ^old`, indexed locally and paired with an atomically published manifest
+outside the Git objects directory. It admits at most 32 immutable packs, each
+at most 32 MiB; a miss, interrupted build, eviction, or disabled scratch
+volume falls through to canonical MySQL/S3 reads.
+
+`upload-pack` can relay one of those packs directly only for one visible
+current-public `new` want with an exact cached `old` have. It rejects
+namespaces, alternates, hooks, hidden refs, promisor/shallow/deepen/filter/
+URI/want-ref requests, and clients without `ofs-delta`; all other fetches use
+stock `pack-objects`. This remains a C request-path optimization. The Rust
+worker retains its pack-level S3/MySQL responsibility; neither path puts Git
+object payloads in MySQL.
+
+Verified locally:
+
+```sh
+make -j4 VEX_MYSQL=YesPlease git git-http-backend
+# PASS
+
+VEX_COMPOSE_NO_BUILD=1 VEX_STOCK_GIT=/usr/bin/git \
+  t/vex/mysql-s3-receive-pack-wal.sh
+# PASS: a pre-push stock client fetches under both S3-read and pack-objects
+# faults; fsck passes and its retained received pack checksum matches the
+# atomically selected local delta manifest.
+```
+
+Fresh same-listener five-trial evidence is recorded in
+`roadmap/evidence/perf-git-git-current-direct-delta-20260806T135500Z.json`.
+Clone remains green: Vex p50 `7187.819ms`, disk p50 `11800.474ms`, ratio
+`0.6091x`; Vex/disk clone CVs are `1.8714%`/`3.2281%`. The direct fetch median
+also crosses the numerical target: Vex p50 `182.587ms`, disk p50 `190.251ms`,
+ratio `0.9597x`, with both lease restorations passing. The required fetch gate
+still fails solely because five-sample stability remains above the 15% policy
+limit (Vex `24.7650%`, disk `30.7689%`). This is not an L4 or five-minute
+client-seed claim; its next work is measurement/frontend stability, not a
+per-object C/Rust rewrite.

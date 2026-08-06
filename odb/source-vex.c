@@ -1,5 +1,7 @@
 #include "git-compat-util.h"
 #include "abspath.h"
+#include "commit-reach.h"
+#include "commit.h"
 #include "config.h"
 #include "dir.h"
 #include "hash.h"
@@ -20,6 +22,7 @@
 #include "parse.h"
 #include "path.h"
 #include "repository.h"
+#include "run-command.h"
 #include "strbuf.h"
 #include "strvec.h"
 #include "tempfile.h"
@@ -27,6 +30,8 @@
 #include "wrapper.h"
 
 #define VEX_DERIVED_PACK_CACHE_LEASE_SECONDS 900
+#define VEX_FETCH_DELTA_CACHE_MAX_PACKS 32
+#define VEX_FETCH_DELTA_CACHE_MAX_PACK_BYTES (32UL * 1024UL * 1024UL)
 
 /*
  * The Vex source deliberately keeps source.path pointed at the thin
@@ -57,6 +62,14 @@ struct odb_source_vex {
 	char *pack_cache_path;
 	/* Protect the selected pack while this source can serve it locally. */
 	struct vex_pack_lease pack_lease;
+	/*
+	 * A bounded, disposable NVMe cache of normal fast-forward receive deltas.
+	 * It is deliberately independent from the MySQL/S3 source of truth: its
+	 * only job is to keep an immediate post-push fetch from paying one S3 curl
+	 * process per newly received object.
+	 */
+	struct odb_source_packed *fetch_delta_cache;
+	char *fetch_delta_cache_path;
 	/*
 	 * A retained raw seed is an ODB base only after normal receives advance the
 	 * generation beyond a complete relay artifact.  New objects still resolve
@@ -107,6 +120,8 @@ struct odb_read_stream_vex {
 	unsigned char *data;
 	size_t offset;
 };
+
+static int vex_source_open(struct odb_source_vex *source);
 
 static char *vex_canonical_repo_id(const char *payload)
 {
@@ -322,6 +337,17 @@ static void vex_source_release_pack_cache(struct odb_source_vex *source)
 				       &source->pack_lease);
 }
 
+static void vex_source_release_fetch_delta_cache(struct odb_source_vex *source)
+{
+	if (source->fetch_delta_cache) {
+		odb_source_close(&source->fetch_delta_cache->base);
+		odb_source_free(&source->fetch_delta_cache->base);
+	}
+	source->fetch_delta_cache = NULL;
+	free(source->fetch_delta_cache_path);
+	source->fetch_delta_cache_path = NULL;
+}
+
 static void vex_source_release_raw_base_cache(struct odb_source_vex *source)
 {
 	vex_source_release_cached_pack(source, &source->raw_base_cache,
@@ -377,6 +403,189 @@ static char *vex_source_pack_cache_root(const struct odb_source_vex *source)
 		return NULL;
 	return xstrfmt("%s/vex-pack-cache/%s", fallback,
 		       vex_store_repo_id(source->store));
+}
+
+static int vex_source_fetch_delta_cache_enabled(void)
+{
+	const char *value = getenv("GIT_VEX_FETCH_DELTA_CACHE");
+
+	/* The cache is enabled whenever the configured scratch volume exists. */
+	return !value || vex_env_true("GIT_VEX_FETCH_DELTA_CACHE");
+}
+
+static char *vex_fetch_delta_cache_root_for_repository(
+		const struct repository *repo)
+{
+	const char *scratch = getenv("GIT_VEX_SCRATCH");
+	char *repo_id;
+	char *root;
+
+	if (!repo || !scratch || !is_absolute_path(scratch) ||
+	    strpbrk(scratch, "\r\n"))
+		return NULL;
+	repo_id = vex_canonical_repo_id(repo->ref_storage_payload);
+	if (!repo_id)
+		return NULL;
+	root = xstrfmt("%s/vex-fetch-delta/%s", scratch, repo_id);
+	free(repo_id);
+	return root;
+}
+
+static char *vex_source_fetch_delta_cache_objects_path(
+		const struct odb_source_vex *source)
+{
+	char *root;
+	char *objects_path;
+
+	if (!source || !source->base.odb ||
+	    !vex_source_fetch_delta_cache_enabled())
+		return NULL;
+	root = vex_fetch_delta_cache_root_for_repository(source->base.odb->repo);
+	if (!root)
+		return NULL;
+	objects_path = xstrfmt("%s/objects", root);
+	free(root);
+	return objects_path;
+}
+
+static int vex_source_refresh_fetch_delta_cache(struct odb_source_vex *source)
+{
+	struct odb_source_packed *cache = NULL;
+	struct packfile_list_entry *entry;
+	char *objects_path;
+
+	objects_path = vex_source_fetch_delta_cache_objects_path(source);
+	if (!objects_path || !is_directory(objects_path)) {
+		free(objects_path);
+		vex_source_release_fetch_delta_cache(source);
+		return VEX_STORE_ERR_NOT_FOUND;
+	}
+	if (source->fetch_delta_cache && source->fetch_delta_cache_path &&
+	    !strcmp(source->fetch_delta_cache_path, objects_path)) {
+		free(objects_path);
+		return VEX_STORE_OK;
+	}
+	cache = odb_source_packed_new(source->base.odb, objects_path, false);
+	odb_source_prepare(&cache->base, ODB_PREPARE_FLUSH_CACHES);
+	entry = packfile_store_get_packs(cache);
+	if (!entry) {
+		odb_source_close(&cache->base);
+		odb_source_free(&cache->base);
+		free(objects_path);
+		return VEX_STORE_ERR_NOT_FOUND;
+	}
+	vex_source_release_fetch_delta_cache(source);
+	source->fetch_delta_cache = cache;
+	source->fetch_delta_cache_path = objects_path;
+	trace_printf("vex: activated local fetch-delta cache repo=%s",
+		     vex_store_repo_id(source->store));
+	return VEX_STORE_OK;
+}
+
+static int vex_fetch_delta_cache_manifest_content(
+		const struct git_hash_algo *hash_algo,
+		const struct object_id *pack_id,
+		const struct object_id *old_oid,
+		const struct object_id *new_oid,
+		char *buffer, size_t buffer_len)
+{
+	char pack_hex[GIT_MAX_HEXSZ + 1];
+	char old_hex[GIT_MAX_HEXSZ + 1];
+	char new_hex[GIT_MAX_HEXSZ + 1];
+	int len;
+
+	if (!hash_algo || !pack_id || !old_oid || !new_oid || !buffer ||
+	    !buffer_len)
+		return -1;
+	hash_to_hex_algop_r(pack_hex, pack_id->hash, hash_algo);
+	hash_to_hex_algop_r(old_hex, old_oid->hash, hash_algo);
+	hash_to_hex_algop_r(new_hex, new_oid->hash, hash_algo);
+	len = xsnprintf(buffer, buffer_len,
+			"vex-fetch-delta-v1\n%s\n%s\n%s\n",
+			old_hex, new_hex, pack_hex);
+	return len < 0 || (size_t)len >= buffer_len ? -1 : len;
+}
+
+static int vex_fetch_delta_cache_manifest_matches(
+		const struct odb_source_vex *source, const char *manifest_dir,
+		const struct packed_git *pack,
+		const struct object_id *old_oid, const struct object_id *new_oid)
+{
+	const struct git_hash_algo *hash_algo = source->base.odb->repo->hash_algo;
+	struct object_id pack_id;
+	struct strbuf manifest_path = STRBUF_INIT;
+	struct stat st;
+	char expected[(GIT_MAX_HEXSZ + 1) * 3 + 32];
+	char actual[sizeof(expected)];
+	char pack_hex[GIT_MAX_HEXSZ + 1];
+	int expected_len;
+	int fd = -1;
+	int ret = 0;
+
+	if (!manifest_dir || !pack || !old_oid || !new_oid)
+		goto out;
+	oidread(&pack_id, pack->hash, hash_algo);
+	expected_len = vex_fetch_delta_cache_manifest_content(
+		hash_algo, &pack_id, old_oid, new_oid,
+		expected, sizeof(expected));
+	if (expected_len < 0)
+		goto out;
+	hash_to_hex_algop_r(pack_hex, pack_id.hash, hash_algo);
+	strbuf_addf(&manifest_path, "%s/pack-%s.vex-fetch-delta", manifest_dir,
+			   pack_hex);
+	fd = open_nofollow(manifest_path.buf, O_RDONLY);
+	if (fd < 0 || fstat(fd, &st) || !S_ISREG(st.st_mode) ||
+	    st.st_size != expected_len ||
+	    read_in_full(fd, actual, expected_len) != expected_len)
+		goto out;
+	ret = !memcmp(actual, expected, expected_len);
+
+out:
+	if (fd >= 0)
+		close(fd);
+	strbuf_release(&manifest_path);
+	return ret;
+}
+
+struct packed_git *odb_source_vex_fetch_delta_cache_pack(
+		struct odb_source *base, const struct object_id *old_oid,
+		const struct object_id *new_oid)
+{
+	struct odb_source_vex *source;
+	struct packfile_list_entry *entry;
+	char *root = NULL;
+	char *manifest_dir = NULL;
+	struct packed_git *result = NULL;
+
+	if (!odb_source_is_vex(base) || !old_oid || !new_oid)
+		return NULL;
+	source = container_of(base, struct odb_source_vex, base);
+	/* Object parsing opens the Vex source before upload-pack reaches here.
+	 * Do not force a cold raw-base materialization merely to probe this
+	 * optional local relay cache. */
+	if (!source->store || vex_source_refresh_fetch_delta_cache(source))
+		goto out;
+	root = vex_fetch_delta_cache_root_for_repository(source->base.odb->repo);
+	if (!root)
+		goto out;
+	manifest_dir = xstrfmt("%s/manifests", root);
+	if (!is_directory(manifest_dir))
+		goto out;
+	for (entry = packfile_store_get_packs(source->fetch_delta_cache);
+	     entry; entry = entry->next) {
+		if (entry->pack &&
+		    vex_fetch_delta_cache_manifest_matches(source, manifest_dir, entry->pack,
+						   old_oid, new_oid) &&
+		    find_pack_entry_one(new_oid, entry->pack)) {
+			result = entry->pack;
+			break;
+		}
+	}
+
+out:
+	free(manifest_dir);
+	free(root);
+	return result;
 }
 
 /*
@@ -890,6 +1099,15 @@ static int vex_source_open(struct odb_source_vex *source)
 		return error(_("unable to activate inherited Vex receive pack"));
 	}
 	/*
+	 * This cache is not part of the Vex durability contract. A missing or
+	 * malformed scratch entry simply leaves the canonical MySQL/S3 read path
+	 * in charge of the request.
+	 */
+	ret = vex_source_refresh_fetch_delta_cache(source);
+	if (ret && ret != VEX_STORE_ERR_NOT_FOUND)
+		trace_printf("vex: fetch-delta cache refresh unavailable repo=%s (%d)",
+			     vex_store_repo_id(source->store), ret);
+	/*
 	 * Derived relay caches are optional, but a retained raw receive pack is a
 	 * canonical ODB base after an incremental overlay.  Keep that path live
 	 * even when a test disables the performance cache.
@@ -1020,7 +1238,14 @@ static int vex_source_active_epoch(struct odb_source_vex *source,
 {
 	struct odb_transaction_vex *transaction = vex_source_transaction(source);
 
-	if (transaction) {
+	/*
+	 * A receive transaction remains owned by the parent until receive-pack
+	 * returns, but its ref backend may already have sealed the epoch.  Reads
+	 * after that handoff (for example, the best-effort delta-cache builder)
+	 * must use canonical visibility rather than trying to refresh or read an
+	 * inactive epoch.
+	 */
+	if (transaction && !transaction->handoff_finished) {
 		*epoch = transaction->epoch;
 		return 0;
 	}
@@ -1127,6 +1352,10 @@ static int odb_source_vex_read_object_info(struct odb_source *base,
 	    !odb_source_read_object_info(&source->receive_pack_cache->base, oid,
 					 oi, flags))
 		return 0;
+	if (source->fetch_delta_cache &&
+	    !odb_source_read_object_info(&source->fetch_delta_cache->base, oid,
+					 oi, flags))
+		return 0;
 	if (source->pack_cache &&
 	    !odb_source_read_object_info(&source->pack_cache->base, oid, oi, flags))
 		return 0;
@@ -1195,6 +1424,10 @@ static int odb_source_vex_read_object_stream(struct odb_read_stream **out,
 		return -1;
 	if (source->receive_pack_cache &&
 	    !odb_source_read_object_stream(out, &source->receive_pack_cache->base,
+					   oid))
+		return 0;
+	if (source->fetch_delta_cache &&
+	    !odb_source_read_object_stream(out, &source->fetch_delta_cache->base,
 					   oid))
 		return 0;
 	if (source->pack_cache &&
@@ -1279,6 +1512,12 @@ static int odb_source_vex_for_each_object(struct odb_source *base,
 		if (ret)
 			return ret;
 	}
+	if (source->fetch_delta_cache) {
+		ret = odb_source_for_each_object(&source->fetch_delta_cache->base,
+						 request, cb, cb_data, opts);
+		if (ret)
+			return ret;
+	}
 	if (source->pack_cache) {
 		ret = odb_source_for_each_object(&source->pack_cache->base, request,
 						 cb, cb_data, opts);
@@ -1316,6 +1555,13 @@ static int odb_source_vex_count_objects(struct odb_source *base,
 		return -1;
 	if (source->receive_pack_cache) {
 		ret = odb_source_count_objects(&source->receive_pack_cache->base,
+						       flags, &source_count);
+		if (ret < 0)
+			return ret;
+		count += source_count;
+	}
+	if (source->fetch_delta_cache) {
+		ret = odb_source_count_objects(&source->fetch_delta_cache->base,
 						       flags, &source_count);
 		if (ret < 0)
 			return ret;
@@ -1362,6 +1608,12 @@ static int odb_source_vex_find_abbrev_len(struct odb_source *base,
 		if (ret < 0)
 			return ret;
 	}
+	if (source->fetch_delta_cache) {
+		ret = odb_source_find_abbrev_len(&source->fetch_delta_cache->base,
+						      oid, len, &len);
+		if (ret < 0)
+			return ret;
+	}
 	if (source->pack_cache) {
 		ret = odb_source_find_abbrev_len(&source->pack_cache->base, oid,
 						      len, &len);
@@ -1395,6 +1647,9 @@ static int odb_source_vex_freshen_object(struct odb_source *base,
 		return 0;
 	if (source->receive_pack_cache &&
 	    odb_source_freshen_object(&source->receive_pack_cache->base, oid, mtime))
+		return 1;
+	if (source->fetch_delta_cache &&
+	    odb_source_freshen_object(&source->fetch_delta_cache->base, oid, mtime))
 		return 1;
 	if (source->pack_cache &&
 	    odb_source_freshen_object(&source->pack_cache->base, oid, mtime))
@@ -1804,6 +2059,7 @@ static void odb_source_vex_close(struct odb_source *base)
 	vex_epoch_detach(source->inherited_epoch);
 	source->inherited_epoch = NULL;
 	vex_source_release_receive_pack_cache(source);
+	vex_source_release_fetch_delta_cache(source);
 	vex_source_release_pack_cache(source);
 	vex_source_release_raw_base_cache(source);
 	if (source->store)
@@ -1830,6 +2086,8 @@ static void odb_source_vex_prepare(struct odb_source *base,
 	}
 	if (source->receive_pack_cache)
 		odb_source_prepare(&source->receive_pack_cache->base, flags);
+	if (source->fetch_delta_cache)
+		odb_source_prepare(&source->fetch_delta_cache->base, flags);
 	if (source->pack_cache)
 		odb_source_prepare(&source->pack_cache->base, flags);
 	if (source->raw_base_cache)
@@ -1978,6 +2236,395 @@ void odb_source_vex_close_default_clone_pack(
 	vex_source_release_cached_pack(pack->source, &pack->packed,
 				       &pack->pack_id, &pack->cache_path, &pack->lease);
 	free(pack);
+}
+
+static int vex_fetch_delta_cache_count_packs(const char *pack_dir)
+{
+	struct dirent *entry;
+	DIR *dir;
+	int count = 0;
+
+	dir = opendir(pack_dir);
+	if (!dir)
+		return 0;
+	while ((entry = readdir(dir))) {
+		const char *name = entry->d_name;
+
+		if (starts_with(name, "pack-") && ends_with(name, ".idx"))
+			count++;
+	}
+	closedir(dir);
+	return count;
+}
+
+static void vex_fetch_delta_cache_prune_orphans(const char *pack_dir)
+{
+	struct dirent *entry;
+	DIR *dir;
+
+	dir = opendir(pack_dir);
+	if (!dir)
+		return;
+	while ((entry = readdir(dir))) {
+		const char *name = entry->d_name;
+		char *path;
+
+		/* These names are owned only by this cache's interrupted builders. */
+		if (!starts_with(name, ".vex-fetch-delta-pack-") &&
+		    !starts_with(name, "tmp_pack_"))
+			continue;
+		path = xstrfmt("%s/%s", pack_dir, name);
+		unlink(path);
+		free(path);
+	}
+	closedir(dir);
+}
+
+static int vex_fetch_delta_cache_remove_oldest_pack(const char *pack_dir,
+		const char *manifest_dir)
+{
+	struct dirent *entry;
+	struct stat oldest_st = { 0 };
+	DIR *dir;
+	char *oldest = NULL;
+
+	dir = opendir(pack_dir);
+	if (!dir)
+		return -1;
+	while ((entry = readdir(dir))) {
+		const char *name = entry->d_name;
+		struct stat st;
+		char *path;
+
+		if (!starts_with(name, "pack-") || !ends_with(name, ".idx"))
+			continue;
+		path = xstrfmt("%s/%s", pack_dir, name);
+		if (lstat(path, &st) || !S_ISREG(st.st_mode)) {
+			free(path);
+			continue;
+		}
+		if (!oldest || st.st_mtime < oldest_st.st_mtime ||
+		    (st.st_mtime == oldest_st.st_mtime && strcmp(path, oldest) < 0)) {
+			free(oldest);
+			oldest = path;
+			oldest_st = st;
+		} else {
+			free(path);
+		}
+	}
+	closedir(dir);
+	if (!oldest)
+		return -1;
+	oldest[strlen(oldest) - strlen(".idx")] = '\0';
+	{
+		const char *pack_basename = strrchr(oldest, '/');
+		char *idx_path = xstrfmt("%s.idx", oldest);
+		char *pack_path = xstrfmt("%s.pack", oldest);
+		char *rev_path = xstrfmt("%s.rev", oldest);
+		char *bitmap_path = xstrfmt("%s.bitmap", oldest);
+		char *manifest_path;
+		int unlink_failed = 0;
+
+		pack_basename = pack_basename ? pack_basename + 1 : oldest;
+		manifest_path = xstrfmt("%s/%s.vex-fetch-delta", manifest_dir,
+					pack_basename);
+
+		/* Stop direct relay selection before withdrawing generic ODB discovery. */
+		if (unlink(manifest_path) && errno != ENOENT)
+			unlink_failed = 1;
+		/* Stop new packed-source discovery; existing open sources stay valid. */
+		if (unlink(idx_path) && errno != ENOENT)
+			unlink_failed = 1;
+		unlink(pack_path);
+		unlink(rev_path);
+		unlink(bitmap_path);
+		free(manifest_path);
+		free(bitmap_path);
+		free(rev_path);
+		free(pack_path);
+		free(idx_path);
+		if (unlink_failed) {
+			free(oldest);
+			return -1;
+		}
+	}
+	free(oldest);
+	return 0;
+}
+
+static int vex_fetch_delta_cache_make_room(const char *pack_dir,
+		const char *manifest_dir)
+{
+	int count;
+
+	vex_fetch_delta_cache_prune_orphans(pack_dir);
+	count = vex_fetch_delta_cache_count_packs(pack_dir);
+	while (count >= VEX_FETCH_DELTA_CACHE_MAX_PACKS) {
+		if (vex_fetch_delta_cache_remove_oldest_pack(pack_dir, manifest_dir))
+			return -1;
+		count--;
+	}
+	return 0;
+}
+
+static int vex_fetch_delta_cache_read_index_pack_report(
+		int fd, const struct git_hash_algo *hash_algo,
+		struct object_id *pack_id)
+{
+	char report[GIT_MAX_HEXSZ + 6];
+	const char *oid_hex;
+	size_t len;
+
+	if (!hash_algo || !pack_id)
+		return -1;
+	len = hash_algo->hexsz + 6;
+	if (read_in_full(fd, report, len) != len || report[len - 1] != '\n')
+		return -1;
+	report[len - 1] = '\0';
+	if (!skip_prefix(report, "pack\t", &oid_hex) &&
+	    !skip_prefix(report, "keep\t", &oid_hex))
+		return -1;
+	return strlen(oid_hex) != hash_algo->hexsz ||
+		get_oid_hex_algop(oid_hex, pack_id, hash_algo) ? -1 : 0;
+}
+
+static int vex_fetch_delta_cache_write_manifest(const char *manifest_dir,
+		const struct git_hash_algo *hash_algo,
+		const struct object_id *pack_id,
+		const struct object_id *old_oid,
+		const struct object_id *new_oid)
+{
+	struct strbuf manifest_path = STRBUF_INIT;
+	char content[(GIT_MAX_HEXSZ + 1) * 3 + 32];
+	char pack_hex[GIT_MAX_HEXSZ + 1];
+	char *template = NULL;
+	struct tempfile *temp = NULL;
+	int content_len;
+	int ret = -1;
+
+	if (!manifest_dir || !hash_algo)
+		goto out;
+	content_len = vex_fetch_delta_cache_manifest_content(
+		hash_algo, pack_id, old_oid, new_oid, content, sizeof(content));
+	if (content_len < 0)
+		goto out;
+	hash_to_hex_algop_r(pack_hex, pack_id->hash, hash_algo);
+	strbuf_addf(&manifest_path, "%s/pack-%s.vex-fetch-delta", manifest_dir,
+			   pack_hex);
+	template = xstrfmt("%s/.vex-fetch-delta-manifest-XXXXXX", manifest_dir);
+	temp = mks_tempfile_m(template, 0600);
+	if (!temp ||
+	    write_in_full(get_tempfile_fd(temp), content, content_len) != content_len ||
+	    rename_tempfile(&temp, manifest_path.buf))
+		goto out;
+	ret = 0;
+
+out:
+	delete_tempfile(&temp);
+	free(template);
+	strbuf_release(&manifest_path);
+	return ret;
+}
+
+static int vex_fetch_delta_cache_is_fast_forward(struct repository *repo,
+		const struct object_id *old_oid, const struct object_id *new_oid)
+{
+	struct commit *old_commit;
+	struct commit *new_commit;
+
+	old_commit = lookup_commit_reference_gently(repo, old_oid, 1);
+	new_commit = lookup_commit_reference_gently(repo, new_oid, 1);
+	if (!old_commit || !new_commit)
+		return 0;
+	return repo_in_merge_bases(repo, old_commit, new_commit) > 0;
+}
+
+/*
+ * Materialize a small, thick incremental pack under the shared scratch
+ * volume. This is a performance-only after-commit action: all failures leave
+ * the already-sealed Vex ref transaction untouched and readers fall back to
+ * the canonical MySQL/S3 object source.
+ */
+static int vex_fetch_delta_cache_build(struct repository *repo,
+		const struct object_id *old_oid, const struct object_id *new_oid)
+{
+	struct child_process pack_objects = CHILD_PROCESS_INIT;
+	struct child_process index_pack = CHILD_PROCESS_INIT;
+	struct lock_file lock = LOCK_INIT;
+	struct tempfile *pack_temp = NULL;
+	struct object_id pack_id;
+	struct stat st;
+	char *root = NULL;
+	char *objects_path = NULL;
+	char *pack_dir = NULL;
+	char *manifest_dir = NULL;
+	char *probe = NULL;
+	char *pack_probe = NULL;
+	char *template = NULL;
+	char *lock_path = NULL;
+	uintmax_t pack_bytes = 0;
+	char buffer[8192];
+	int pack_started = 0;
+	int pack_too_large = 0;
+	int pack_io_failed = 0;
+	int pack_fd = -1;
+	int index_pack_started = 0;
+	int index_pack_report_ok = 0;
+	int ret = -1;
+
+	root = vex_fetch_delta_cache_root_for_repository(repo);
+	if (!root)
+		goto out;
+	objects_path = xstrfmt("%s/objects", root);
+	pack_dir = xstrfmt("%s/pack", objects_path);
+	manifest_dir = xstrfmt("%s/manifests", root);
+	pack_probe = xstrfmt("%s/.vex-fetch-delta-probe", pack_dir);
+	probe = xstrfmt("%s/.vex-fetch-delta-probe", manifest_dir);
+	if (safe_create_leading_directories_const(repo, pack_probe) != SCLD_OK ||
+	    safe_create_leading_directories_const(repo, probe) != SCLD_OK ||
+	    !is_directory(pack_dir) || !is_directory(manifest_dir))
+		goto out;
+	lock_path = xstrfmt("%s/.vex-fetch-delta-install", root);
+	if (hold_lock_file_for_update_timeout(&lock, lock_path, LOCK_NO_DEREF,
+					      30000) < 0 ||
+	    vex_fetch_delta_cache_make_room(pack_dir, manifest_dir))
+		goto out;
+	template = xstrfmt("%s/.vex-fetch-delta-pack-XXXXXX", pack_dir);
+	pack_temp = mks_tempfile_m(template, 0600);
+	if (!pack_temp)
+		goto out;
+
+	strvec_pushl(&pack_objects.args, "pack-objects", "--revs", "--stdout",
+			     "--delta-base-offset", "--no-reuse-delta", "--include-tag",
+			     NULL);
+	strvec_pushf(&pack_objects.env, "GIT_DIR=%s", repo->gitdir);
+	pack_objects.in = -1;
+	pack_objects.out = -1;
+	/* A bounded-cache overflow is expected and must not taint push output. */
+	pack_objects.no_stderr = 1;
+	pack_objects.git_cmd = 1;
+	if (start_command(&pack_objects))
+		goto out;
+	pack_started = 1;
+	if (write_in_full(pack_objects.in, oid_to_hex(new_oid),
+			  repo->hash_algo->hexsz) < 0 ||
+	    write_in_full(pack_objects.in, "\n^", 2) < 0 ||
+	    write_in_full(pack_objects.in, oid_to_hex(old_oid),
+			  repo->hash_algo->hexsz) < 0 ||
+	    write_in_full(pack_objects.in, "\n", 1) < 0) {
+		close(pack_objects.in);
+		pack_objects.in = -1;
+		close(pack_objects.out);
+		pack_objects.out = -1;
+		(void)finish_command(&pack_objects);
+		pack_started = 0;
+		goto out;
+	}
+	close(pack_objects.in);
+	pack_objects.in = -1;
+	for (;;) {
+		ssize_t bytes = xread(pack_objects.out, buffer, sizeof(buffer));
+
+		if (!bytes)
+			break;
+		if (bytes < 0) {
+			pack_io_failed = 1;
+			break;
+		}
+		if ((uintmax_t)bytes >
+			VEX_FETCH_DELTA_CACHE_MAX_PACK_BYTES - pack_bytes) {
+			pack_too_large = 1;
+			break;
+		}
+		if (write_in_full(get_tempfile_fd(pack_temp), buffer, bytes) != bytes) {
+			pack_io_failed = 1;
+			break;
+		}
+		pack_bytes += bytes;
+	}
+	close(pack_objects.out);
+	pack_objects.out = -1;
+	if (finish_command(&pack_objects)) {
+		pack_started = 0;
+		goto out;
+	}
+	pack_started = 0;
+	if (pack_too_large || pack_io_failed || !pack_bytes ||
+	    fstat(get_tempfile_fd(pack_temp), &st) || st.st_size <= 0 ||
+	    (uintmax_t)st.st_size != pack_bytes)
+		goto out;
+	if (close_tempfile_gently(pack_temp) < 0)
+		goto out;
+	pack_fd = open_nofollow(get_tempfile_path(pack_temp), O_RDONLY);
+	if (pack_fd < 0)
+		goto out;
+	strvec_pushl(&index_pack.args, "index-pack", "--stdin", NULL);
+	strvec_pushf(&index_pack.env, "GIT_DIR=%s", repo->gitdir);
+	strvec_pushf(&index_pack.env, "GIT_OBJECT_DIRECTORY=%s", objects_path);
+	index_pack.in = pack_fd;
+	index_pack.out = -1;
+	index_pack.no_stderr = 1;
+	index_pack.git_cmd = 1;
+	if (start_command(&index_pack))
+		goto out;
+	pack_fd = -1;
+	index_pack_started = 1;
+	index_pack_report_ok = !vex_fetch_delta_cache_read_index_pack_report(
+		index_pack.out, repo->hash_algo, &pack_id);
+	close(index_pack.out);
+	index_pack.out = -1;
+	if (finish_command(&index_pack)) {
+		index_pack_started = 0;
+		goto out;
+	}
+	index_pack_started = 0;
+	if (!index_pack_report_ok || vex_fetch_delta_cache_write_manifest(
+			manifest_dir, repo->hash_algo, &pack_id, old_oid, new_oid))
+		goto out;
+	trace_printf("vex: published local fetch-delta cache old=%s new=%s bytes=%"PRIuMAX,
+		     oid_to_hex(old_oid), oid_to_hex(new_oid), (uintmax_t)st.st_size);
+	ret = 0;
+
+out:
+	if (pack_started) {
+		if (pack_objects.in >= 0)
+			close(pack_objects.in);
+		if (pack_objects.out >= 0)
+			close(pack_objects.out);
+		(void)finish_command(&pack_objects);
+	}
+	if (index_pack_started) {
+		if (index_pack.out >= 0)
+			close(index_pack.out);
+		(void)finish_command(&index_pack);
+	}
+	if (pack_fd >= 0)
+		close(pack_fd);
+	delete_tempfile(&pack_temp);
+	rollback_lock_file(&lock);
+	free(lock_path);
+	free(template);
+	free(pack_probe);
+	free(probe);
+	free(manifest_dir);
+	free(pack_dir);
+	free(objects_path);
+	free(root);
+	return ret;
+}
+
+void odb_source_vex_maybe_build_fetch_delta_cache(struct repository *repo,
+		const struct object_id *old_oid, const struct object_id *new_oid)
+{
+	if (!repo_uses_vex_storage(repo) || !old_oid || !new_oid ||
+	    is_null_oid(old_oid) || is_null_oid(new_oid) ||
+	    !vex_source_fetch_delta_cache_enabled())
+		return;
+	if (!vex_fetch_delta_cache_is_fast_forward(repo, old_oid, new_oid))
+		return;
+	if (vex_fetch_delta_cache_build(repo, old_oid, new_oid))
+		trace_printf("vex: skipped local fetch-delta cache old=%s new=%s",
+			     oid_to_hex(old_oid), oid_to_hex(new_oid));
 }
 
 bool repo_uses_vex_storage(const struct repository *repo)
