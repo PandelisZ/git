@@ -405,6 +405,18 @@ int vex_meta_mysql_current_sealed_default_clone_pack(
 	return mysql_unavailable();
 }
 
+int vex_meta_mysql_base_receive_pack(struct vex_meta_mysql *db,
+	const char *repo_id, const struct git_hash_algo *hash_algo,
+	struct vex_meta_mysql_pack *pack)
+{
+	(void)db;
+	(void)repo_id;
+	(void)hash_algo;
+	if (pack)
+		memset(pack, 0, sizeof(*pack));
+	return mysql_unavailable();
+}
+
 void vex_meta_mysql_pack_release(struct vex_meta_mysql_pack *pack)
 {
 	if (!pack)
@@ -3932,6 +3944,97 @@ int vex_meta_mysql_current_sealed_default_clone_pack(
 						       pack, 1);
 }
 
+int vex_meta_mysql_base_receive_pack(struct vex_meta_mysql *db,
+	const char *repo_id, const struct git_hash_algo *hash_algo,
+	struct vex_meta_mysql_pack *pack)
+{
+	char *repo = NULL;
+	char *sql = NULL;
+	MYSQL_RES *res = NULL;
+	MYSQL_ROW row;
+	unsigned long *lengths;
+	struct object_id checked_id;
+	char *pack_key = NULL;
+	char *idx_key = NULL;
+	uint64_t covering_generation;
+	int ret = VEX_META_MYSQL_ERR;
+
+	if (!db || !db->mysql || !repo_id || !hash_algo || !pack)
+		return VEX_META_MYSQL_ERR_INVALID;
+	memset(pack, 0, sizeof(*pack));
+	repo = sql_repo_literal(repo_id, NULL);
+	if (!repo) {
+		ret = set_error(db, VEX_META_MYSQL_ERR_INVALID,
+				"invalid Vex repository UUID for raw base selection");
+		goto out;
+	}
+	/*
+	 * A sealed raw seed remains the canonical base after later normal receives.
+	 * Select its earliest retained full snapshot rather than a newer generation:
+	 * the latter may be an incremental envelope in a future pack-set format.
+	 * This selector is intentionally separate from the exact-current relay
+	 * selector above; serving the base through ODB never advertises it whole.
+	 */
+	sql = vex_format("SELECT p.pack_id, p.pack_key, p.idx_key, "
+			 "p.covering_generation FROM pack_envelopes AS p "
+			 "WHERE p.repo_id = %s AND p.source_kind = 'receive' "
+			 "AND p.state IN ('sealed', 'obsolete') "
+			 "AND p.is_full_snapshot = TRUE AND p.idx_key IS NOT NULL "
+			 "ORDER BY p.covering_generation ASC, p.sealed_at ASC, p.pack_id "
+			 "LIMIT 1", repo);
+	if (!sql) {
+		ret = set_error(db, VEX_META_MYSQL_ERR_NOMEM,
+				"could not allocate Vex raw base pack query");
+		goto out;
+	}
+	ret = state_query_result(db, sql, &res);
+	if (ret)
+		goto out;
+	if (mysql_num_fields(res) != 4) {
+		ret = set_error(db, VEX_META_MYSQL_ERR,
+				"MySQL returned invalid Vex raw base pack metadata");
+		goto out;
+	}
+	row = mysql_fetch_row(res);
+	if (!row) {
+		ret = VEX_META_MYSQL_ERR_NOT_FOUND;
+		goto out;
+	}
+	lengths = mysql_fetch_lengths(res);
+	if (!row[0] || !row[1] || !row[2] || !row[3] || !lengths ||
+	    lengths[0] != VEX_META_MYSQL_OID_BYTES || !lengths[1] ||
+	    lengths[1] > 512 || !lengths[2] || lengths[2] > 512 ||
+	    parse_u64(row[3], &covering_generation) ||
+	    state_oid_from_binary(row[0], lengths[0], hash_algo, &checked_id)) {
+		ret = set_error(db, VEX_META_MYSQL_ERR,
+				"MySQL returned invalid Vex raw base pack metadata");
+		goto out;
+	}
+	pack_key = state_row_text(row[1], lengths[1]);
+	idx_key = state_row_text(row[2], lengths[2]);
+	if (!pack_key || !idx_key) {
+		ret = set_error(db, VEX_META_MYSQL_ERR,
+				"MySQL returned unsafe Vex raw base keys");
+		goto out;
+	}
+	memcpy(pack->pack_id, row[0], sizeof(pack->pack_id));
+	pack->covering_generation = covering_generation;
+	pack->pack_key = pack_key;
+	pack->idx_key = idx_key;
+	pack_key = NULL;
+	idx_key = NULL;
+	ret = VEX_META_MYSQL_OK;
+
+out:
+	free(idx_key);
+	free(pack_key);
+	if (res)
+		mysql_free_result(res);
+	free(sql);
+	free(repo);
+	return ret;
+}
+
 void vex_meta_mysql_pack_release(struct vex_meta_mysql_pack *pack)
 {
 	if (!pack)
@@ -4980,6 +5083,7 @@ struct vex_meta_mysql_saved_pack {
 	unsigned char *bitmap_key;
 	size_t bitmap_key_len;
 	uint64_t covering_generation;
+	unsigned int is_full_snapshot;
 	char *state;
 	char *created_at;
 	char *sealed_at;
@@ -5157,12 +5261,16 @@ static int state_load_packs(struct vex_meta_mysql *db, const char *repo,
 	unsigned long *lengths;
 	int ret;
 
+	/* Raw receive envelopes and their membership maps are canonical base data,
+	 * not state-snapshot rows. Keep them in place while a normal incremental
+	 * receive rewrites the overlay metadata below. */
 	sql = vex_format("SELECT pack_id, pack_key, idx_key, bitmap_key, "
-			 "covering_generation, state, "
+			 "covering_generation, state, is_full_snapshot, "
 			 "DATE_FORMAT(created_at, '%%Y-%%m-%%d %%H:%%i:%%s.%%f'), "
 			 "DATE_FORMAT(sealed_at, '%%Y-%%m-%%d %%H:%%i:%%s.%%f'), "
 			 "DATE_FORMAT(obsolete_at, '%%Y-%%m-%%d %%H:%%i:%%s.%%f') "
-			 "FROM pack_envelopes WHERE repo_id = %s ORDER BY pack_id", repo);
+			 "FROM pack_envelopes WHERE repo_id = %s "
+			 "AND source_kind = 'derived' ORDER BY pack_id", repo);
 	if (!sql)
 		return set_error(db, VEX_META_MYSQL_ERR_NOMEM,
 				 "could not allocate Vex pack preservation query");
@@ -5173,16 +5281,19 @@ static int state_load_packs(struct vex_meta_mysql *db, const char *repo,
 	while ((row = mysql_fetch_row(res))) {
 		struct vex_meta_mysql_saved_pack *pack;
 		uint64_t covering_generation;
+		uint64_t is_full_snapshot;
 
 		lengths = mysql_fetch_lengths(res);
-		if (!row[0] || !row[1] || !row[4] || !row[5] || !row[6] || !lengths ||
+		if (!row[0] || !row[1] || !row[4] || !row[5] || !row[6] || !row[7] ||
+		    !lengths ||
 		    lengths[0] != VEX_META_MYSQL_OID_BYTES || lengths[1] > 512 ||
 		    (row[2] && lengths[2] > 512) ||
 		    (row[3] && lengths[3] > 512) || lengths[5] == 0 ||
-		    lengths[5] > 16 || lengths[6] > 32 ||
-		    (row[7] && lengths[7] > 32) ||
+		    lengths[5] > 16 || lengths[7] > 32 ||
 		    (row[8] && lengths[8] > 32) ||
-		    parse_u64(row[4], &covering_generation)) {
+		    (row[9] && lengths[9] > 32) ||
+		    parse_u64(row[4], &covering_generation) ||
+		    parse_u64(row[6], &is_full_snapshot) || is_full_snapshot > 1) {
 			ret = set_error(db, VEX_META_MYSQL_ERR,
 					"MySQL returned invalid Vex pack metadata");
 			goto out;
@@ -5202,15 +5313,16 @@ static int state_load_packs(struct vex_meta_mysql *db, const char *repo,
 			pack->bitmap_key_len = lengths[3];
 		}
 		pack->covering_generation = covering_generation;
+		pack->is_full_snapshot = (unsigned int)is_full_snapshot;
 		pack->state = state_row_text(row[5], lengths[5]);
-		pack->created_at = state_row_text(row[6], lengths[6]);
-		pack->sealed_at = row[7] ? state_row_text(row[7], lengths[7]) : NULL;
-		pack->obsolete_at = row[8] ? state_row_text(row[8], lengths[8]) : NULL;
+		pack->created_at = state_row_text(row[7], lengths[7]);
+		pack->sealed_at = row[8] ? state_row_text(row[8], lengths[8]) : NULL;
+		pack->obsolete_at = row[9] ? state_row_text(row[9], lengths[9]) : NULL;
 		if (!pack->pack_key || !pack->state || !pack->created_at ||
 		    (row[2] && !pack->idx_key) ||
 		    (row[3] && !pack->bitmap_key) ||
-		    (row[7] && !pack->sealed_at) ||
-		    (row[8] && !pack->obsolete_at)) {
+		    (row[8] && !pack->sealed_at) ||
+		    (row[9] && !pack->obsolete_at)) {
 			ret = set_error(db, VEX_META_MYSQL_ERR_NOMEM,
 					"could not preserve Vex pack metadata");
 			goto out;
@@ -5219,8 +5331,11 @@ static int state_load_packs(struct vex_meta_mysql *db, const char *repo,
 	mysql_free_result(res);
 	res = NULL;
 
-	sql = vex_format("SELECT pack_id, oid FROM pack_objects "
-			 "WHERE repo_id = %s ORDER BY pack_id, oid", repo);
+	sql = vex_format("SELECT po.pack_id, po.oid FROM pack_objects AS po "
+			 "INNER JOIN pack_envelopes AS p "
+			 "ON p.repo_id = po.repo_id AND p.pack_id = po.pack_id "
+			 "WHERE po.repo_id = %s AND p.source_kind = 'derived' "
+			 "ORDER BY po.pack_id, po.oid", repo);
 	if (!sql)
 		return set_error(db, VEX_META_MYSQL_ERR_NOMEM,
 				 "could not allocate Vex pack-object preservation query");
@@ -5328,6 +5443,7 @@ static int state_has_current_complete_pack(
 
 		if (strcmp(pack->state, "sealed") ||
 		    pack->covering_generation != sealed_generation ||
+		    !pack->is_full_snapshot ||
 		    !pack->idx_key || !pack->idx_key_len)
 			continue;
 		if (!state_saved_pack_is_incomplete(packs, pack, state_snapshot,
@@ -5457,10 +5573,14 @@ static int state_insert_packs(struct vex_meta_mysql *db, const char *repo,
 		}
 		sql = vex_format("INSERT INTO pack_envelopes "
 				 "(repo_id, pack_id, pack_key, idx_key, bitmap_key, "
-				 "covering_generation, state, created_at, sealed_at, obsolete_at) "
-				 "VALUES (%s, %s, %s, %s, %s, %" PRIu64 ", %s, %s, %s, %s)",
+				 "covering_generation, state, source_kind, receive_generation, "
+				 "is_full_snapshot, created_at, sealed_at, obsolete_at) "
+				 "VALUES (%s, %s, %s, %s, %s, %" PRIu64 ", %s, "
+				 "'derived', NULL, %s, %s, %s, %s)",
 				 repo, pack_id, pack_key, idx_key, bitmap_key,
-				 pack->covering_generation, state, created_at, sealed_at, obsolete_at);
+				 pack->covering_generation, state,
+				 pack->is_full_snapshot ? "TRUE" : "FALSE",
+				 created_at, sealed_at, obsolete_at);
 		free(obsolete_at);
 		free(sealed_at);
 		free(created_at);
@@ -5521,9 +5641,20 @@ static int state_delete_rows(struct vex_meta_mysql *db, const char *repo)
 	size_t i;
 
 	for (i = 0; i < ARRAY_SIZE(tables); i++) {
-		char *sql = vex_format("DELETE FROM %s WHERE repo_id = %s", tables[i],
-					       repo);
+		char *sql;
 		int ret;
+
+		if (!strcmp(tables[i], "pack_objects"))
+			sql = vex_format("DELETE po FROM pack_objects AS po "
+					 "INNER JOIN pack_envelopes AS p "
+					 "ON p.repo_id = po.repo_id AND p.pack_id = po.pack_id "
+					 "WHERE po.repo_id = %s AND p.source_kind = 'derived'", repo);
+		else if (!strcmp(tables[i], "pack_envelopes"))
+			sql = vex_format("DELETE FROM pack_envelopes WHERE repo_id = %s "
+					 "AND source_kind = 'derived'", repo);
+		else
+			sql = vex_format("DELETE FROM %s WHERE repo_id = %s", tables[i],
+					 repo);
 
 		if (!sql)
 			return set_error(db, VEX_META_MYSQL_ERR_NOMEM,
@@ -6300,12 +6431,9 @@ int vex_meta_mysql_state_save_locked(struct vex_meta_mysql *db,
 			      const struct vex_meta_state *state)
 {
 	char *repo;
-	char *raw_sql = NULL;
 	struct vex_meta_mysql_saved_pins pins = { 0 };
 	struct vex_meta_mysql_saved_packs packs = { 0 };
 	uint64_t sealed_generation;
-	uint64_t raw_receive_packs;
-	int raw_found;
 	int has_current_pack;
 	int ret;
 
@@ -6317,28 +6445,10 @@ int vex_meta_mysql_state_save_locked(struct vex_meta_mysql *db,
 		return set_error(db, VEX_META_MYSQL_ERR_INVALID,
 				 "invalid Vex repository UUID");
 	/*
-	 * The snapshot writer rewrites objects and pack_envelopes.  Until the
-	 * generic pack-set/read path can serve a raw base plus later loose objects,
-	 * reject rather than silently lose the canonical raw mapping or publish an
-	 * unreadable incremental generation.
+	 * `state_delete_rows()` preserves source_kind='receive' envelopes and
+	 * received_pack_objects.  The ODB's raw-base cache resolves that immutable
+	 * snapshot while this state replacement publishes later per-object epochs.
 	 */
-	raw_sql = vex_format("SELECT COUNT(*) FROM pack_envelopes WHERE repo_id = %s "
-			 "AND source_kind = 'receive' AND state <> 'deleted'", repo);
-	if (!raw_sql) {
-		ret = set_error(db, VEX_META_MYSQL_ERR_NOMEM,
-				"could not allocate raw receive-pack state-save guard");
-		goto out;
-	}
-	ret = query_one_u64(db, raw_sql, &raw_receive_packs, &raw_found);
-	free(raw_sql);
-	raw_sql = NULL;
-	if (ret)
-		goto out;
-	if (!raw_found || raw_receive_packs) {
-		ret = set_error(db, VEX_META_MYSQL_ERR_STATE,
-				"legacy state save is disabled while a raw receive pack is retained");
-		goto out;
-	}
 	if ((ret = state_load_pins(db, repo, &pins)) ||
 	    (ret = state_load_packs(db, repo, &packs)))
 		goto out;
@@ -6362,7 +6472,6 @@ int vex_meta_mysql_state_save_locked(struct vex_meta_mysql *db,
 	if (!ret)
 		db->state_transaction = 0;
 out:
-	free(raw_sql);
 	state_saved_packs_release(&packs);
 	state_saved_pins_release(&pins);
 	free(repo);
@@ -6386,6 +6495,18 @@ int vex_meta_mysql_current_sealed_pack(struct vex_meta_mysql *db,
 int vex_meta_mysql_current_sealed_default_clone_pack(
 	struct vex_meta_mysql *db, const char *repo_id,
 	const struct git_hash_algo *hash_algo, struct vex_meta_mysql_pack *pack)
+{
+	(void)repo_id;
+	(void)hash_algo;
+	if (pack)
+		memset(pack, 0, sizeof(*pack));
+	return set_error(db, VEX_META_MYSQL_ERR_STATE,
+			 "Vex MySQL store adapter was not compiled into this binary");
+}
+
+int vex_meta_mysql_base_receive_pack(struct vex_meta_mysql *db,
+	const char *repo_id, const struct git_hash_algo *hash_algo,
+	struct vex_meta_mysql_pack *pack)
 {
 	(void)repo_id;
 	(void)hash_algo;

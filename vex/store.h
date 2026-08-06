@@ -312,6 +312,14 @@ int vex_store_current_pack(struct vex_store *store,
  */
 int vex_store_current_default_clone_pack(struct vex_store *store,
 					 struct vex_pack_artifact *artifact);
+
+/*
+ * Find the retained raw receive base for an incremental MySQL+S3 repository.
+ * This is an ODB-only fallback: it is never selected for direct clone relay
+ * after a newer generation has been published.
+ */
+int vex_store_base_receive_pack(struct vex_store *store,
+				struct vex_pack_artifact *artifact);
 int vex_store_download_pack(struct vex_store *store,
 			    const struct vex_pack_artifact *artifact,
 			    const char *pack_destination,

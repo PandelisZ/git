@@ -57,6 +57,16 @@ struct odb_source_vex {
 	char *pack_cache_path;
 	/* Protect the selected pack while this source can serve it locally. */
 	struct vex_pack_lease pack_lease;
+	/*
+	 * A retained raw seed is an ODB base only after normal receives advance the
+	 * generation beyond a complete relay artifact.  New objects still resolve
+	 * through the canonical per-object store below; this cache supplies their
+	 * immutable ancestors without turning the stale pack into a clone relay.
+	 */
+	struct odb_source_packed *raw_base_cache;
+	char *raw_base_cache_id;
+	char *raw_base_cache_path;
+	struct vex_pack_lease raw_base_lease;
 };
 
 /*
@@ -310,6 +320,14 @@ static void vex_source_release_pack_cache(struct odb_source_vex *source)
 				       &source->pack_cache_id,
 				       &source->pack_cache_path,
 				       &source->pack_lease);
+}
+
+static void vex_source_release_raw_base_cache(struct odb_source_vex *source)
+{
+	vex_source_release_cached_pack(source, &source->raw_base_cache,
+				       &source->raw_base_cache_id,
+				       &source->raw_base_cache_path,
+				       &source->raw_base_lease);
 }
 
 static void vex_source_release_receive_pack_cache(struct odb_source_vex *source)
@@ -582,6 +600,26 @@ static int vex_source_install_pack_cache(struct odb_source_vex *source,
 	return 0;
 }
 
+static int vex_source_install_raw_base_cache(
+		struct odb_source_vex *source,
+		const struct vex_pack_artifact *artifact, const char *pack_id)
+{
+	struct odb_source_packed *cache = NULL;
+	char *objects_path = NULL;
+	int ret;
+
+	ret = vex_source_materialize_pack_cache(source, artifact, pack_id,
+						 &cache, &objects_path);
+	if (ret)
+		return ret;
+	/* Only replace the base after its immutable pair is fully verified. */
+	vex_source_release_raw_base_cache(source);
+	source->raw_base_cache = cache;
+	source->raw_base_cache_id = xstrdup(pack_id);
+	source->raw_base_cache_path = objects_path;
+	return 0;
+}
+
 static int vex_source_refresh_pack_cache(struct odb_source_vex *source)
 {
 	struct vex_pack_artifact artifact;
@@ -592,7 +630,7 @@ static int vex_source_refresh_pack_cache(struct odb_source_vex *source)
 	ret = vex_store_current_pack(source->store, &artifact);
 	if (ret == VEX_STORE_ERR_NOT_FOUND) {
 		vex_source_release_pack_cache(source);
-		return 0;
+		return VEX_STORE_ERR_NOT_FOUND;
 	}
 	if (ret)
 		return ret;
@@ -634,6 +672,53 @@ static int vex_source_refresh_pack_cache(struct odb_source_vex *source)
 	return ret;
 }
 
+static int vex_source_refresh_raw_base_cache(struct odb_source_vex *source)
+{
+	struct vex_pack_artifact artifact;
+	struct vex_pack_lease new_lease = { 0 };
+	char pack_id[GIT_MAX_HEXSZ + 1];
+	int ret;
+
+	ret = vex_store_base_receive_pack(source->store, &artifact);
+	if (ret == VEX_STORE_ERR_NOT_FOUND) {
+		vex_source_release_raw_base_cache(source);
+		return ret;
+	}
+	if (ret)
+		return ret;
+	hash_to_hex_algop_r(pack_id, artifact.pack_id.hash,
+			    source->base.odb->repo->hash_algo);
+	if (source->raw_base_cache && source->raw_base_cache_id &&
+	    !strcmp(source->raw_base_cache_id, pack_id) &&
+	    source->raw_base_lease.active)
+		return 0;
+	ret = vex_store_pack_lease_acquire(source->store, &artifact,
+					 vex_source_pack_cache_lease_seconds(),
+					 &new_lease);
+	if (ret)
+		return ret;
+	if (source->raw_base_cache && source->raw_base_cache_id &&
+	    !strcmp(source->raw_base_cache_id, pack_id)) {
+		source->raw_base_lease = new_lease;
+		return 0;
+	}
+	ret = vex_source_install_raw_base_cache(source, &artifact, pack_id);
+	if (ret) {
+		int release_ret = vex_store_pack_lease_release(source->store,
+							       &new_lease);
+
+		if (release_ret)
+			trace_printf("vex: could not release failed raw base lease repo=%s (%d)",
+				     vex_store_repo_id(source->store), release_ret);
+		return ret;
+	}
+	source->raw_base_lease = new_lease;
+	trace_printf("vex: activated raw base pack cache repo=%s pack=%s generation=%"PRIu64,
+		     vex_store_repo_id(source->store), pack_id,
+		     artifact.covering_generation);
+	return 0;
+}
+
 static int vex_source_install_inherited_receive_pack(
 		struct odb_source_vex *source);
 
@@ -653,13 +738,32 @@ static int vex_source_open(struct odb_source_vex *source)
 		source->store = NULL;
 		return error(_("unable to activate inherited Vex receive pack"));
 	}
-	/* The cache is strictly opportunistic: canonical Vex reads stay available. */
-	if (!vex_source_derived_pack_cache_enabled())
+	/*
+	 * Derived relay caches are optional, but a retained raw receive pack is a
+	 * canonical ODB base after an incremental overlay.  Keep that path live
+	 * even when a test disables the performance cache.
+	 */
+	if (!vex_source_derived_pack_cache_enabled()) {
+		ret = vex_source_refresh_raw_base_cache(source);
+		if (ret && ret != VEX_STORE_ERR_NOT_FOUND) {
+			vex_store_close(source->store);
+			source->store = NULL;
+			return error(_("unable to activate Vex raw base pack"));
+		}
 		return 0;
+	}
 	ret = vex_source_refresh_pack_cache(source);
-	if (ret)
+	if (ret == VEX_STORE_ERR_NOT_FOUND) {
+		ret = vex_source_refresh_raw_base_cache(source);
+		if (ret && ret != VEX_STORE_ERR_NOT_FOUND) {
+			vex_store_close(source->store);
+			source->store = NULL;
+			return error(_("unable to activate Vex raw base pack"));
+		}
+	} else if (ret) {
 		trace_printf("vex: derived pack cache unavailable repo=%s (%d)",
 			     vex_store_repo_id(source->store), ret);
+	}
 	return 0;
 }
 
@@ -862,7 +966,9 @@ static int odb_source_vex_read_object_info(struct odb_source *base,
 	if ((flags & OBJECT_INFO_SECOND_READ) &&
 	    vex_source_derived_pack_cache_enabled()) {
 		ret = vex_source_refresh_pack_cache(source);
-		if (ret)
+		if (ret == VEX_STORE_ERR_NOT_FOUND)
+			ret = vex_source_refresh_raw_base_cache(source);
+		if (ret && ret != VEX_STORE_ERR_NOT_FOUND)
 			trace_printf("vex: derived pack cache refresh unavailable repo=%s (%d)",
 				     vex_store_repo_id(source->store), ret);
 	}
@@ -872,6 +978,10 @@ static int odb_source_vex_read_object_info(struct odb_source *base,
 		return 0;
 	if (source->pack_cache &&
 	    !odb_source_read_object_info(&source->pack_cache->base, oid, oi, flags))
+		return 0;
+	if (source->raw_base_cache &&
+	    !odb_source_read_object_info(&source->raw_base_cache->base, oid, oi,
+					 flags))
 		return 0;
 
 	if (vex_source_active_epoch(source, &epoch))
@@ -939,6 +1049,9 @@ static int odb_source_vex_read_object_stream(struct odb_read_stream **out,
 		return 0;
 	if (source->pack_cache &&
 	    !odb_source_read_object_stream(out, &source->pack_cache->base, oid))
+		return 0;
+	if (source->raw_base_cache &&
+	    !odb_source_read_object_stream(out, &source->raw_base_cache->base, oid))
 		return 0;
 	if (vex_source_active_epoch(source, &epoch))
 		return -1;
@@ -1010,12 +1123,24 @@ static int odb_source_vex_for_each_object(struct odb_source *base,
 		return 0;
 	if (vex_source_open(source))
 		return -1;
-	if (source->receive_pack_cache)
-		return odb_source_for_each_object(&source->receive_pack_cache->base,
-						  request, cb, cb_data, opts);
-	if (source->pack_cache)
-		return odb_source_for_each_object(&source->pack_cache->base, request,
-						  cb, cb_data, opts);
+	if (source->receive_pack_cache) {
+		ret = odb_source_for_each_object(&source->receive_pack_cache->base,
+						 request, cb, cb_data, opts);
+		if (ret)
+			return ret;
+	}
+	if (source->pack_cache) {
+		ret = odb_source_for_each_object(&source->pack_cache->base, request,
+						 cb, cb_data, opts);
+		if (ret)
+			return ret;
+	}
+	if (source->raw_base_cache) {
+		ret = odb_source_for_each_object(&source->raw_base_cache->base,
+						 request, cb, cb_data, opts);
+		if (ret)
+			return ret;
+	}
 	if (vex_source_active_epoch(source, &epoch))
 		return -1;
 	ret = vex_store_for_each_object(source->store,
@@ -1033,21 +1158,39 @@ static int odb_source_vex_count_objects(struct odb_source *base,
 {
 	struct odb_source_vex *source = container_of(base, struct odb_source_vex, base);
 	struct vex_epoch *epoch;
+	unsigned long count = 0;
+	unsigned long source_count;
 	int ret;
 
 	if (vex_source_open(source))
 		return -1;
-	if (source->receive_pack_cache)
-		return odb_source_count_objects(&source->receive_pack_cache->base,
-							flags, out);
-	if (source->pack_cache)
-		return odb_source_count_objects(&source->pack_cache->base, flags, out);
+	if (source->receive_pack_cache) {
+		ret = odb_source_count_objects(&source->receive_pack_cache->base,
+						       flags, &source_count);
+		if (ret < 0)
+			return ret;
+		count += source_count;
+	}
+	if (source->pack_cache) {
+		ret = odb_source_count_objects(&source->pack_cache->base, flags,
+						       &source_count);
+		if (ret < 0)
+			return ret;
+		count += source_count;
+	}
+	if (source->raw_base_cache) {
+		ret = odb_source_count_objects(&source->raw_base_cache->base, flags,
+						       &source_count);
+		if (ret < 0)
+			return ret;
+		count += source_count;
+	}
 	if (vex_source_active_epoch(source, &epoch))
 		return -1;
-	ret = vex_store_count_objects(source->store,
-				      epoch, out);
+	ret = vex_store_count_objects(source->store, epoch, &source_count);
 	if (ret)
 		return error(_("unable to count Vex objects"));
+	*out = count + source_count;
 	return 0;
 }
 
@@ -1058,23 +1201,35 @@ static int odb_source_vex_find_abbrev_len(struct odb_source *base,
 {
 	struct odb_source_vex *source = container_of(base, struct odb_source_vex, base);
 	struct vex_epoch *epoch;
+	unsigned len = min_length;
 	int ret;
 
 	if (vex_source_open(source))
 		return -1;
-	if (source->receive_pack_cache)
-		return odb_source_find_abbrev_len(&source->receive_pack_cache->base,
-						  oid, min_length, out);
-	if (source->pack_cache)
-		return odb_source_find_abbrev_len(&source->pack_cache->base, oid,
-						  min_length, out);
+	if (source->receive_pack_cache) {
+		ret = odb_source_find_abbrev_len(&source->receive_pack_cache->base,
+						      oid, len, &len);
+		if (ret < 0)
+			return ret;
+	}
+	if (source->pack_cache) {
+		ret = odb_source_find_abbrev_len(&source->pack_cache->base, oid,
+						      len, &len);
+		if (ret < 0)
+			return ret;
+	}
+	if (source->raw_base_cache) {
+		ret = odb_source_find_abbrev_len(&source->raw_base_cache->base, oid,
+						      len, &len);
+		if (ret < 0)
+			return ret;
+	}
 	if (vex_source_active_epoch(source, &epoch))
 		return -1;
-	ret = vex_store_find_abbrev_len(source->store,
-					 epoch,
-					 oid, min_length, out);
+	ret = vex_store_find_abbrev_len(source->store, epoch, oid, len, &len);
 	if (ret)
 		return error(_("unable to find Vex object abbreviation"));
+	*out = len;
 	return 0;
 }
 
@@ -1088,11 +1243,15 @@ static int odb_source_vex_freshen_object(struct odb_source *base,
 
 	if (vex_source_open(source))
 		return 0;
-	if (source->receive_pack_cache)
-		return odb_source_freshen_object(&source->receive_pack_cache->base,
-						 oid, mtime);
-	if (source->pack_cache)
-		return odb_source_freshen_object(&source->pack_cache->base, oid, mtime);
+	if (source->receive_pack_cache &&
+	    odb_source_freshen_object(&source->receive_pack_cache->base, oid, mtime))
+		return 1;
+	if (source->pack_cache &&
+	    odb_source_freshen_object(&source->pack_cache->base, oid, mtime))
+		return 1;
+	if (source->raw_base_cache &&
+	    odb_source_freshen_object(&source->raw_base_cache->base, oid, mtime))
+		return 1;
 	if (vex_source_active_epoch(source, &epoch))
 		return 0;
 	if (epoch && !vex_object_index_get(source->store, oid, &info) &&
@@ -1497,6 +1656,7 @@ static void odb_source_vex_close(struct odb_source *base)
 	source->inherited_epoch = NULL;
 	vex_source_release_receive_pack_cache(source);
 	vex_source_release_pack_cache(source);
+	vex_source_release_raw_base_cache(source);
 	if (source->store)
 		vex_store_close(source->store);
 	source->store = NULL;
@@ -1513,7 +1673,9 @@ static void odb_source_vex_prepare(struct odb_source *base,
 	if ((flags & ODB_PREPARE_FLUSH_CACHES) &&
 	    vex_source_derived_pack_cache_enabled()) {
 		ret = vex_source_refresh_pack_cache(source);
-		if (ret)
+		if (ret == VEX_STORE_ERR_NOT_FOUND)
+			ret = vex_source_refresh_raw_base_cache(source);
+		if (ret && ret != VEX_STORE_ERR_NOT_FOUND)
 			trace_printf("vex: derived pack cache refresh unavailable repo=%s (%d)",
 				     vex_store_repo_id(source->store), ret);
 	}
@@ -1521,6 +1683,8 @@ static void odb_source_vex_prepare(struct odb_source *base,
 		odb_source_prepare(&source->receive_pack_cache->base, flags);
 	if (source->pack_cache)
 		odb_source_prepare(&source->pack_cache->base, flags);
+	if (source->raw_base_cache)
+		odb_source_prepare(&source->raw_base_cache->base, flags);
 }
 
 static void odb_source_vex_free(struct odb_source *base)

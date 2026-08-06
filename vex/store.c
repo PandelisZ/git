@@ -699,14 +699,32 @@ static int verify_ref_target_object(struct vex_store *store,
 				    const struct vex_ref_update *update)
 {
 	struct vex_meta_object *object;
+	struct vex_meta_mysql_receive_pack_object received = { 0 };
 	int exists;
+	int ret;
 
 	if (update->new_target.type != VEX_REF_TARGET_OID)
 		return VEX_STORE_OK;
 	object = find_object((struct vex_meta_state *)state,
 			     &update->new_target.oid);
-	if (!object_is_visible_to_epoch(state, object, epoch))
-		return VEX_STORE_ERR_NOT_FOUND;
+	if (!object_is_visible_to_epoch(state, object, epoch)) {
+		/*
+		 * A normal receive may create a ref to an immutable object that lives
+		 * only in the retained raw seed.  Those OIDs deliberately do not have
+		 * legacy `objects` rows: received_pack_objects is their metadata index.
+		 * Look there only after the normal state misses, so a newer overlay
+		 * continues to own the usual visibility and final-blob checks.
+		 */
+		if (store->backend != VEX_STORE_BACKEND_MYSQL_S3)
+			return VEX_STORE_ERR_NOT_FOUND;
+		ret = meta_mysql_result(vex_meta_mysql_receive_pack_object_get_visible(
+			store->meta_mysql, store->repo_id, update->new_target.oid.hash,
+			store->hash_algo->rawsz, epoch, &received));
+		vex_meta_mysql_receive_pack_object_release(&received);
+		if (!ret)
+			return VEX_STORE_OK;
+		return ret;
+	}
 	if (object->state == VEX_OBJECT_PUBLISHED) {
 		exists = blob_backend_has_final(store, &object->oid);
 		if (exists < 0)
@@ -2336,6 +2354,31 @@ int vex_store_current_default_clone_pack(struct vex_store *store,
 	return vex_store_current_pack_by_shape(store, artifact, 1);
 }
 
+int vex_store_base_receive_pack(struct vex_store *store,
+				struct vex_pack_artifact *artifact)
+{
+	struct vex_meta_mysql_pack pack = { 0 };
+	int ret;
+
+	if (!store || !artifact)
+		return VEX_STORE_ERR_INVALID;
+	memset(artifact, 0, sizeof(*artifact));
+	if (store->backend != VEX_STORE_BACKEND_MYSQL_S3)
+		return VEX_STORE_ERR_NOT_FOUND;
+	ret = meta_mysql_result(vex_meta_mysql_base_receive_pack(
+		store->meta_mysql, store->repo_id, store->hash_algo, &pack));
+	if (ret)
+		return ret;
+	if (!current_pack_keys_match(store, &pack)) {
+		vex_meta_mysql_pack_release(&pack);
+		return VEX_STORE_ERR_CORRUPT;
+	}
+	memcpy(artifact->pack_id.hash, pack.pack_id, store->hash_algo->rawsz);
+	artifact->covering_generation = pack.covering_generation;
+	vex_meta_mysql_pack_release(&pack);
+	return VEX_STORE_OK;
+}
+
 int vex_store_download_pack(struct vex_store *store,
 			    const struct vex_pack_artifact *artifact,
 			    const char *pack_destination,
@@ -3453,11 +3496,22 @@ int vex_ref_transaction_commit(struct vex_ref_transaction *transaction)
 	epoch = transaction->epoch;
 	if (epoch->receive_pack_staged)
 		return vex_ref_transaction_commit_receive_pack(transaction);
-	if ((ret = check_epoch(store, epoch)) ||
-	    (ret = vex_store_flush_staged(store, epoch)) ||
-	    (ret = vex_epoch_heartbeat(epoch)) ||
-	    (ret = load_locked(store, &lock, &state)))
+	if ((ret = check_epoch(store, epoch))) {
+		error(_("invalid Vex ref transaction epoch"));
 		return ret;
+	}
+	if ((ret = vex_store_flush_staged(store, epoch))) {
+		error(_("unable to flush staged Vex receive objects"));
+		return ret;
+	}
+	if ((ret = vex_epoch_heartbeat(epoch))) {
+		error(_("unable to refresh Vex receive epoch"));
+		return ret;
+	}
+	if ((ret = load_locked(store, &lock, &state))) {
+		error(_("unable to load Vex ref transaction state"));
+		return ret;
+	}
 	meta_epoch = find_epoch(&state, epoch->id);
 	if (!meta_epoch || meta_epoch->state != VEX_EPOCH_OPEN) {
 		ret = VEX_STORE_ERR_STATE;
@@ -3478,6 +3532,8 @@ int vex_ref_transaction_commit(struct vex_ref_transaction *transaction)
 	ret = blob_backend_promote_epoch(store, &state, epoch->id);
 	if (ret) {
 		int save_ret;
+
+		error(_("unable to promote staged Vex receive objects"));
 
 		snapshot_epoch_objects(&state, epoch->id, &blobs);
 		abort_epoch_state(&state, epoch->id);

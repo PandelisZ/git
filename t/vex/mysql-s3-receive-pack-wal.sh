@@ -646,6 +646,128 @@ grep -Eq 'clone< version 2$' "$scratch/v2.trace" || {
 }
 
 restore_gateway
-printf 'vex receive-pack WAL E2E: PASS stock non-thin initial mirror refs=%s raw_objects=%s default_objects=%s raw_pack=%s compact_pack=%s default_pack=%s; raw MySQL map retained, the default heads/tags index is exact and partial, compact S3 pack/idx remains globally selected, and protocol-v0/v2 annotated-tag fsck clones received the default pack without git-pack-objects for %s\n' \
+
+# A raw WAL seed is a canonical base, not a write-once repository.  Advance
+# the same branch with a normal stock-Git receive, then fetch into a reader
+# that predates the push.  This forces a fresh server process to resolve the
+# raw base plus newly published per-object overlay; the old relay artifacts
+# may no longer be advertised as current, but their shape and the raw map must
+# survive the metadata state replacement intact.
+post_seed_tip_before=$main_oid
+printf 'Vex raw-base incremental overlay\n' >>"$clone_v2/history"
+"$stock_git" -C "$clone_v2" add history
+"$stock_git" -C "$clone_v2" -c commit.gpgSign=false commit -q \
+	-m 'Vex raw base incremental overlay'
+post_seed_tip=$("$stock_git" -C "$clone_v2" rev-parse HEAD)
+git_https -C "$clone_v2" push -q origin HEAD:refs/heads/main
+[ "$post_seed_tip" != "$post_seed_tip_before" ] || {
+	printf '%s\n' 'vex receive-pack WAL E2E: incremental overlay did not advance main' >&2
+	exit 1
+}
+post_seed_generation=$(mysql_query "
+	SELECT COALESCE(MAX(generation), 0) FROM generations
+	 WHERE repo_id = UNHEX('$repo_id') AND state = 'sealed';")
+[ "$post_seed_generation" -gt "$covering_generation" ] || {
+	printf 'vex receive-pack WAL E2E: incremental overlay did not seal a newer generation (%s <= %s)\n' \
+		"$post_seed_generation" "$covering_generation" >&2
+	exit 1
+}
+raw_after_overlay=$(mysql_query "
+	SELECT CONCAT(state, ':', covering_generation, ':', COUNT(rpo.oid))
+	  FROM pack_envelopes AS p
+	  JOIN received_pack_objects AS rpo
+	    ON rpo.repo_id = p.repo_id AND rpo.pack_id = p.pack_id
+	 WHERE p.repo_id = UNHEX('$repo_id')
+	   AND p.pack_id = UNHEX('$pack_mysql_id')
+	 GROUP BY p.state, p.covering_generation;")
+[ "$raw_after_overlay" = "sealed:$covering_generation:$expected_members" ] || {
+	printf 'vex receive-pack WAL E2E: normal overlay changed the raw canonical map: %s\n' \
+		"$raw_after_overlay" >&2
+	exit 1
+}
+default_after_overlay=$(mysql_query "
+	SELECT CONCAT(state, ':', is_full_snapshot)
+	  FROM pack_envelopes
+	 WHERE repo_id = UNHEX('$repo_id')
+	   AND pack_id = UNHEX('$default_pack_mysql_id');")
+[ "$default_after_overlay" = 'obsolete:0' ] || {
+	printf 'vex receive-pack WAL E2E: normal overlay did not preserve/obsolete the partial relay shape: %s\n' \
+		"$default_after_overlay" >&2
+	exit 1
+}
+overlay_objects=$(mysql_query "SELECT COUNT(*) FROM objects WHERE repo_id = UNHEX('$repo_id');")
+[ "$overlay_objects" -gt 0 ] || {
+	printf '%s\n' 'vex receive-pack WAL E2E: normal overlay did not publish any per-object metadata' >&2
+	exit 1
+}
+overlay_rebuild=$(mysql_query "
+	SELECT target_generation FROM pack_rebuild_requests
+	 WHERE repo_id = UNHEX('$repo_id');")
+[ "$overlay_rebuild" = "$post_seed_generation" ] || {
+	printf 'vex receive-pack WAL E2E: normal overlay did not queue the current pack rebuild (%s != %s)\n' \
+		"$overlay_rebuild" "$post_seed_generation" >&2
+	exit 1
+}
+
+# `pull_oid` is deliberately absent from the original heads/tags relay.  Fetch
+# it after the overlay, then publish a new branch pointing at that raw-only
+# object.  The branch update carries no new object bytes, so acceptance proves
+# the ref transaction consults the retained received-pack map rather than
+# requiring a legacy per-object metadata row.
+raw_branch=raw-base-pull
+git_https -C "$clone_v2" fetch -q origin \
+	"refs/pull/1/head:refs/remotes/origin/$raw_branch"
+[ "$("$stock_git" -C "$clone_v2" rev-parse "refs/remotes/origin/$raw_branch")" = "$pull_oid" ] || {
+	printf '%s\n' 'vex receive-pack WAL E2E: raw-only pull ref could not be fetched after overlay' >&2
+	exit 1
+}
+"$stock_git" -C "$clone_v2" branch -f "$raw_branch" "$pull_oid"
+git_https -C "$clone_v2" push -q origin \
+	"refs/heads/$raw_branch:refs/heads/$raw_branch"
+remote_raw_branch=$(git_https ls-remote --refs "$origin" "refs/heads/$raw_branch" |
+	awk 'NF == 2 { print $1; exit }')
+[ "$remote_raw_branch" = "$pull_oid" ] || {
+	printf 'vex receive-pack WAL E2E: raw-only branch target %s differs from %s\n' \
+		"$remote_raw_branch" "$pull_oid" >&2
+	exit 1
+}
+
+# Exercise server-side all-object enumeration in a fresh process.  This is the
+# union boundary: raw members have no `objects` rows, while the overlay only
+# exists in those rows, so both IDs must be present together.
+server_all_objects="$scratch/server-all-objects"
+"${compose[@]}" exec -T git-http /opt/vex-git/git \
+	"--git-dir=/srv/git/$repo_name" cat-file --batch-all-objects --batch-check \
+	>"$server_all_objects"
+grep -q "^$pull_oid " "$server_all_objects" &&
+	grep -q "^$post_seed_tip " "$server_all_objects" || {
+	printf '%s\n' 'vex receive-pack WAL E2E: all-object enumeration omitted raw or overlay content' >&2
+	exit 1
+}
+
+# A cold reader must resolve both layers without relying on one of the earlier
+# relay clones retaining the old default pack locally.
+clone_after_overlay="$scratch/clone-after-overlay"
+git_https clone -q --branch main "$origin" "$clone_after_overlay"
+[ "$("$stock_git" -C "$clone_after_overlay" rev-parse HEAD)" = "$post_seed_tip" ] || {
+	printf '%s\n' 'vex receive-pack WAL E2E: cold clone did not reach the raw-base overlay tip' >&2
+	exit 1
+}
+git_https -C "$clone_after_overlay" fetch -q origin \
+	"refs/heads/$raw_branch:refs/remotes/origin/$raw_branch"
+[ "$("$stock_git" -C "$clone_after_overlay" rev-parse "refs/remotes/origin/$raw_branch")" = "$pull_oid" ] || {
+	printf '%s\n' 'vex receive-pack WAL E2E: cold clone did not fetch the raw-only branch' >&2
+	exit 1
+}
+"$stock_git" -C "$clone_after_overlay" fsck --no-progress >/dev/null
+
+git_https -C "$clone_v0" fetch -q origin refs/heads/main:refs/remotes/origin/main
+[ "$("$stock_git" -C "$clone_v0" rev-parse refs/remotes/origin/main)" = "$post_seed_tip" ] || {
+	printf '%s\n' 'vex receive-pack WAL E2E: reader fetch did not reach the raw-base overlay tip' >&2
+	exit 1
+}
+"$stock_git" -C "$clone_v0" fsck --no-progress >/dev/null
+
+printf 'vex receive-pack WAL E2E: PASS stock non-thin initial mirror refs=%s raw_objects=%s default_objects=%s raw_pack=%s compact_pack=%s default_pack=%s; raw MySQL map retained, the default heads/tags index is exact and partial, compact S3 pack/idx remains globally selected, protocol-v0/v2 annotated-tag fsck clones received the default pack without git-pack-objects, and a normal overlay supported raw-only ref publication plus cold clone/fsck for %s\n' \
 	"$expected_refs" "$expected_members" "$default_expected_members" "$pack_id" \
 	"$compact_pack_id" "$default_pack_id" "$origin"

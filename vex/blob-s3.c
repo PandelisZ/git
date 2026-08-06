@@ -682,7 +682,13 @@ static int delete_keys_batch(struct vex_blob_s3 *blob,
 	ret = make_url(blob, "", &url);
 	if (ret)
 		goto out;
-	strbuf_addstr(&url, "?delete");
+	/*
+	 * SigV4 canonical query encoding represents an empty subresource value as
+	 * `delete=`.  curl signs that spelling and MinIO/AWS verify it consistently;
+	 * the shorter `?delete` causes a SignatureDoesNotMatch response and turns a
+	 * successful promotion copy into a failed receive cleanup.
+	 */
+	strbuf_addstr(&url, "?delete=");
 	ret = run_curl_with_headers(blob, "POST", url.buf,
 				    body_file->filename.buf,
 				    response_file->filename.buf, headers,

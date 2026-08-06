@@ -358,6 +358,16 @@ int vex_meta_mysql_current_sealed_pack(struct vex_meta_mysql *db,
 int vex_meta_mysql_current_sealed_default_clone_pack(
 	struct vex_meta_mysql *db, const char *repo_id,
 	const struct git_hash_algo *hash_algo, struct vex_meta_mysql_pack *pack);
+
+/*
+ * Find the oldest sealed raw receive snapshot retained by this repository.
+ * It is a read-only canonical base for a later loose-object overlay, never a
+ * current-generation relay selection.  Obsolete raw packs remain readable
+ * because their received-pack membership is still a durable recovery root.
+ */
+int vex_meta_mysql_base_receive_pack(struct vex_meta_mysql *db,
+	const char *repo_id, const struct git_hash_algo *hash_algo,
+	struct vex_meta_mysql_pack *pack);
 void vex_meta_mysql_pack_release(struct vex_meta_mysql_pack *pack);
 
 /* Store only commit-graph edge metadata; neither object contains Git bytes. */
