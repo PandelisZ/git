@@ -115,6 +115,78 @@ def stream_pack(git: str, mirror: Path, oids: Path, name: str, arguments: list[s
     )
 
 
+def stream_pack_to_index(git: str, mirror: Path, oids: Path, scratch: Path) -> dict[str, Any]:
+    """Model a direct receive pack's client pack plus server index/write work.
+
+    The throw-away bare repository is a local-NVMe lower bound. A real Vex
+    fast path would keep that spool crash-recoverably until its S3 and metadata
+    seal completes.
+    """
+    target = scratch / "incoming-index.git"
+    checked(
+        [git, "init", "--bare", "--quiet", str(target)],
+        "create index-pack scratch",
+        stderr=subprocess.PIPE,
+    )
+    producer_command = git_command(git, mirror, "pack-objects", "--stdout", "--revs")
+    index_command = [git, "--git-dir={}".format(target), "index-pack", "--stdin", "--fix-thin"]
+    started = time.monotonic()
+    with oids.open("rb") as stdin:
+        producer = subprocess.Popen(
+            producer_command,
+            stdin=stdin,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        assert producer.stdout is not None
+        consumer = subprocess.Popen(
+            index_command,
+            stdin=producer.stdout,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        producer.stdout.close()
+        consumer_stdout, consumer_stderr = consumer.communicate()
+        assert producer.stderr is not None
+        producer_stderr = producer.stderr.read()
+        producer_returncode = producer.wait()
+    if producer_returncode:
+        fail(
+            "direct_receive_index_candidate pack producer failed with exit {}{}".format(
+                producer_returncode,
+                ": " + producer_stderr.decode("utf-8", "replace").strip() if producer_stderr else "",
+            )
+        )
+    if consumer.returncode:
+        fail(
+            "direct_receive_index_candidate index-pack failed with exit {}{}".format(
+                consumer.returncode,
+                ": " + consumer_stderr.decode("utf-8", "replace").strip() if consumer_stderr else "",
+            )
+        )
+    pack_files = sorted((target / "objects" / "pack").glob("*.pack"))
+    index_files = sorted((target / "objects" / "pack").glob("*.idx"))
+    if len(pack_files) != 1 or len(index_files) != 1:
+        fail(
+            "direct_receive_index_candidate produced {} pack(s) and {} index(es)".format(
+                len(pack_files), len(index_files)
+            )
+        )
+    pack_bytes = pack_files[0].stat().st_size
+    idx_bytes = index_files[0].stat().st_size
+    if not pack_bytes or not idx_bytes:
+        fail("direct_receive_index_candidate produced an empty pack or index")
+    return elapsed_phase(
+        "direct_receive_index_candidate",
+        started,
+        pack_bytes=pack_bytes,
+        idx_bytes=idx_bytes,
+        pack_id=consumer_stdout.decode("utf-8", "replace").strip(),
+        producer_command=producer_command,
+        index_command=index_command,
+    )
+
+
 def stream_existing_packs(mirror: Path) -> dict[str, Any]:
     """Read and hash the existing source packs: an I/O-only direct-pack floor."""
     pack_files = sorted((mirror / "objects" / "pack").glob("*.pack"))
@@ -211,9 +283,11 @@ def main() -> int:
             )
         )
         phases.append(stream_pack(git, mirror, oids, "reuse_pack_candidate", []))
+        phases.append(stream_pack_to_index(git, mirror, oids, Path(temporary_directory)))
 
     current = next(phase for phase in phases if phase["name"] == "current_builder_repack")
     reuse = next(phase for phase in phases if phase["name"] == "reuse_pack_candidate")
+    direct_index = next(phase for phase in phases if phase["name"] == "direct_receive_index_candidate")
     payload: dict[str, Any] = {
         "schema": "vex-seed-pack-profile/v1",
         "captured_at": utc_now(),
@@ -223,9 +297,10 @@ def main() -> int:
                 "reachable-object enumeration",
                 "the exact pack-objects flags used by scripts/vex/build-pack.sh",
                 "a normal Git reuse-pack comparison",
+                "normal Git pack production plus index-pack into a throw-away local scratch repository",
             ],
             "excluded": [
-                "stock-Git HTTPS upload-pack negotiation and client pack generation",
+                "stock-Git HTTPS upload-pack negotiation and network transfer",
                 "Vex receive-pack/unpack-objects work",
                 "S3/MinIO transfer latency and request count",
                 "MySQL metadata transactions",
@@ -248,11 +323,18 @@ def main() -> int:
         "comparison": {
             "current_builder_seconds": current["seconds"],
             "reuse_candidate_seconds": reuse["seconds"],
+            "direct_receive_index_candidate_seconds": direct_index["seconds"],
             "current_to_reuse_ratio": round(
                 float(current["seconds"]) / max(float(reuse["seconds"]), 0.000001), 3
             ),
+            "current_to_direct_receive_index_ratio": round(
+                float(current["seconds"]) / max(float(direct_index["seconds"]), 0.000001), 3
+            ),
             "five_minute_seed_budget_seconds": 300,
             "remaining_budget_after_current_builder_seconds": round(300 - float(current["seconds"]), 6),
+            "remaining_budget_after_direct_receive_index_seconds": round(
+                300 - float(direct_index["seconds"]), 6
+            ),
         },
     }
     write_json_atomically(output, payload)
