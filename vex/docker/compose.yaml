@@ -173,8 +173,11 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "1.0"
-          memory: 1G
+          # Receiving a large delta-heavy pack is CPU- and memory-bound. Do
+          # not benchmark the pack-WAL path behind the former small-fixture
+          # one-core/one-GiB cap; operators can lower these explicit limits.
+          cpus: "${VEX_GIT_HTTP_CPUS:-8.0}"
+          memory: ${VEX_GIT_HTTP_MEMORY:-4G}
     networks: [vex_net]
 
   valkey:
