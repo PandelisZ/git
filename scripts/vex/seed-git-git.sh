@@ -16,15 +16,15 @@ usage() {
 	cat <<'EOF'
 usage: scripts/vex/seed-git-git.sh [--mirror PATH] [--upstream URL] [--refresh]
                                     [--origin HTTPS_URL] [--disk-control PATH]
-                                    [--replace]
 
 Import a faithful git/git mirror into an already-active Vex MySQL+S3 Compose
 repository at git/git.git, make a matching local disk-control bare repository,
 seal the incoming immutable Vex pack/idx pair, and write
 t/vex/out/seed-manifest.json.
 
-The import itself is a normal stock-Git HTTPS `push --mirror`. --replace is
-required before changing a non-empty target whose refs differ from the mirror.
+The import itself is a normal stock-Git HTTPS `push --mirror`. The first-pack
+path only seeds an empty target, or verifies a target that already matches the
+mirror; it never replaces a non-empty target with different refs.
 The script never starts Compose and never deletes the host disk-control
 repository; it installs a validated copy into the separate benchmark volume.
 
@@ -57,6 +57,40 @@ require_sha256() {
 	esac
 }
 
+# date(1) does not provide a portable high-resolution monotonic clock on the
+# supported host platforms. Python is already a required dependency for the
+# redacted evidence manifest, so use its monotonic nanosecond clock to make the
+# five-minute server-ingest gate precise and independent of wall-clock changes.
+monotonic_ns() {
+	python3 -c 'import time; print(time.monotonic_ns())'
+}
+
+elapsed_seconds() {
+	local started_ns=$1 finished_ns=$2
+
+	python3 - "$started_ns" "$finished_ns" <<'PY'
+import sys
+
+started_ns, finished_ns = (int(value) for value in sys.argv[1:])
+if finished_ns < started_ns:
+    raise SystemExit("vex seed-git-git: monotonic phase clock moved backwards")
+print("{:.3f}".format((finished_ns - started_ns) / 1_000_000_000))
+PY
+}
+
+within_seconds_budget() {
+	local started_ns=$1 finished_ns=$2 budget_seconds=$3
+
+	python3 - "$started_ns" "$finished_ns" "$budget_seconds" <<'PY'
+import sys
+
+started_ns, finished_ns, budget_seconds = (int(value) for value in sys.argv[1:])
+if finished_ns < started_ns:
+    raise SystemExit(2)
+raise SystemExit(0 if finished_ns - started_ns <= budget_seconds * 1_000_000_000 else 1)
+PY
+}
+
 absolute_path() {
 	local input=$1 parent
 
@@ -71,7 +105,6 @@ upstream=${VEX_GIT_GIT_UPSTREAM:-https://github.com/git/git}
 origin=''
 disk_control="$repo_root/t/vex/out/git-git-disk.git"
 refresh=0
-replace_target=0
 
 while [ "$#" -gt 0 ]; do
 	case "$1" in
@@ -116,8 +149,7 @@ while [ "$#" -gt 0 ]; do
 		shift
 		;;
 	--replace)
-		replace_target=1
-		shift
+		die '--replace is not available for the first-pack seed path'
 		;;
 	-h|--help)
 		usage
@@ -220,6 +252,8 @@ wait_for_storage() {
 
 wait_for_storage ||
 	die 'Compose is not actively serving the Vex MySQL+S3 data plane; run scripts/vex/up.sh first'
+
+workflow_started_ns=$(monotonic_ns)
 
 # A git/git-scale stock-Git push has a much larger Content-Length, can run
 # longer than the normal small-fixture CGI deadline, and must not be mistaken
@@ -425,6 +459,20 @@ s3_object_bytes() {
 		'
 }
 
+s3_object_exists() {
+	local object_key=$1
+
+	# This is a metadata-only final-key check. Keep it in raw_ingest so the
+	# availability gate proves the promoted S3 pair without charging a full pack
+	# body read to the server seed budget.
+	"${compose[@]}" run --rm --no-deps -T --entrypoint /bin/sh \
+		-e "VEX_MANIFEST_KEY=$object_key" minio-init -c '
+			set -eu
+			mc alias set vex "$MINIO_ENDPOINT" "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD" >/dev/null
+			mc stat "vex/$MINIO_BUCKET/$VEX_MANIFEST_KEY" >/dev/null
+		'
+}
+
 mysql_query() {
 	"${compose[@]}" exec -T mysql \
 		mysql --local-infile=1 --protocol=TCP -h 127.0.0.1 \
@@ -445,13 +493,35 @@ mirror=$(absolute_path "$mirror")
 disk_control=$(absolute_path "$disk_control")
 [ "$mirror" != "$disk_control" ] || die 'mirror and disk-control paths must differ'
 
+scratch=$(mktemp -d "${TMPDIR:-/tmp}/vex-seed-git-git.XXXXXX")
+phase_timings_tsv="$scratch/phase-timings.tsv"
+: >"$phase_timings_tsv"
+five_minute_seed_budget_seconds=300
+
+record_phase() {
+	local phase=$1 started_ns=$2 finished_ns=$3 seconds
+
+	seconds=$(elapsed_seconds "$started_ns" "$finished_ns")
+	printf '%s\t%s\n' "$phase" "$seconds" >>"$phase_timings_tsv"
+	printf 'vex seed-git-git: phase=%s seconds=%s\n' "$phase" "$seconds"
+}
+
+record_raw_ingest() {
+	local seconds=$1 status=$2 mode=$3
+
+	printf 'raw_ingest\t%s\n' "$seconds" >>"$phase_timings_tsv"
+	printf 'vex seed-git-git: phase=raw_ingest raw_ingest_seconds=%s five_minute_gate_seconds=%s status=%s mode=%s\n' \
+		"$seconds" "$five_minute_seed_budget_seconds" "$status" "$mode"
+}
+
 ensure_args=(--mirror "$mirror" --upstream "$upstream")
 if [ "$refresh" -eq 1 ]; then
 	ensure_args+=(--refresh)
 fi
+phase_started_ns=$(monotonic_ns)
 "$repo_root/scripts/vex/ensure-git-git-mirror.sh" "${ensure_args[@]}"
-
-scratch=$(mktemp -d "${TMPDIR:-/tmp}/vex-seed-git-git.XXXXXX")
+phase_finished_ns=$(monotonic_ns)
+record_phase source_mirror "$phase_started_ns" "$phase_finished_ns"
 
 source_refs="$scratch/source-refs"
 target_before_refs="$scratch/target-before-refs"
@@ -459,6 +529,7 @@ target_refs="$scratch/target-refs"
 disk_refs="$scratch/disk-refs"
 images_tsv="$scratch/images.tsv"
 
+phase_started_ns=$(monotonic_ns)
 source_head_ref=$("$stock_git" --git-dir="$mirror" symbolic-ref -q HEAD)
 case "$source_head_ref" in
 refs/heads/*) ;;
@@ -482,32 +553,12 @@ source_object_count=$(count_reachable_objects "$mirror")
 [ "$source_object_count" -gt 0 ] || die 'source mirror has no reachable objects'
 source_commit_count=$(count_commits "$mirror")
 [ "$source_commit_count" -gt 0 ] || die 'source mirror has no reachable commits'
-
-# A disk control is intentionally a separate bare repository: --no-local
-# prevents hardlink/reference shortcuts, and the documented full repack makes
-# the baseline's pack layout explicit and reproducible.
-if [ -e "$disk_control" ]; then
-	[ -d "$disk_control" ] || die "disk-control path is not a directory: $disk_control"
-	disk_is_bare=$("$stock_git" --git-dir="$disk_control" rev-parse --is-bare-repository 2>/dev/null || true)
-	[ "$disk_is_bare" = true ] || die "disk-control path is not a bare Git repository: $disk_control"
-	list_local_refs "$disk_control" "$disk_refs"
-	assert_same_refs "$source_refs" "$disk_refs" 'existing disk-control'
-else
-	"$stock_git" clone --quiet --mirror --no-local "$mirror" "$disk_control"
-fi
-"$stock_git" --git-dir="$disk_control" symbolic-ref HEAD "$source_head_ref"
-"$stock_git" --git-dir="$disk_control" repack -adf --write-bitmap-index
-"$stock_git" --git-dir="$disk_control" fsck --connectivity-only --no-progress >/dev/null
-list_local_refs "$disk_control" "$disk_refs"
-assert_same_refs "$source_refs" "$disk_refs" 'disk-control'
-disk_head_oid=$("$stock_git" --git-dir="$disk_control" rev-parse --verify 'HEAD^{commit}')
-[ "$disk_head_oid" = "$source_head_oid" ] || die 'disk-control HEAD does not match the source mirror'
-disk_object_count=$(count_reachable_objects "$disk_control")
-[ "$disk_object_count" = "$source_object_count" ] ||
-	die "disk-control object count differs from source ($disk_object_count != $source_object_count)"
+phase_finished_ns=$(monotonic_ns)
+record_phase source_validation "$phase_started_ns" "$phase_finished_ns"
 
 # The normal initializer creates a thin Vex repository only; the following
 # stock client push is what publishes the actual refs and canonical S3 bytes.
+phase_started_ns=$(monotonic_ns)
 "$repo_root/scripts/vex/seed-empty-repo.sh" git/git.git >/dev/null
 repository_uri=$("${compose[@]}" exec -T git-http /opt/vex-git/git \
 	'--git-dir=/srv/git/git/git.git' config --get extensions.refstorage)
@@ -517,14 +568,12 @@ vex://????????????????????????????????) repo_id=${repository_uri#vex://} ;;
 esac
 
 list_remote_refs "$target_before_refs"
+seed_needs_push=0
 if cmp -s "$source_refs" "$target_before_refs"; then
 	printf '%s\n' 'vex seed-git-git: Vex target refs already match the source mirror'
 else
 	if [ -s "$target_before_refs" ]; then
 		printf '%s\n' 'vex seed-git-git: pack-WAL seed requires a target with no published refs.' >&2
-		if [ "$replace_target" -eq 1 ]; then
-			printf '%s\n' 'vex seed-git-git: --replace is not available for the first-pack seed path.' >&2
-		fi
 		exit 1
 	fi
 	# The first raw pack admits precisely one unborn symbolic HEAD scaffold.
@@ -536,6 +585,19 @@ else
 		"--git-dir=/srv/git/git/git.git" symbolic-ref -q HEAD)
 	[ "$target_preseed_head_ref" = "$source_head_ref" ] ||
 		die 'Vex target HEAD did not retain the source default before pack seed'
+	seed_needs_push=1
+
+fi
+phase_finished_ns=$(monotonic_ns)
+record_phase target_prepare "$phase_started_ns" "$phase_finished_ns"
+
+raw_ingest_mode=already-sealed
+raw_ingest_started_ns=''
+if [ "$seed_needs_push" -eq 1 ]; then
+	raw_ingest_mode=push-mirror
+	# Keep this assignment immediately adjacent to the stock client invocation:
+	# raw_ingest is the server availability budget, not mirror or disk work.
+	raw_ingest_started_ns=$(monotonic_ns)
 	GIT_DIR="$mirror" "$stock_git" -c http.sslCAInfo="$ca_file" \
 		-c "http.extraHeader=Authorization: Basic $auth" \
 		push --mirror "$origin"
@@ -599,20 +661,77 @@ require_uint 'pack generation' "$pack_generation"
 case "$pack_key" in "git/v1/$repo_id/packs/$pack_id.pack") ;; *) die "unexpected Vex pack key: $pack_key" ;; esac
 case "$idx_key" in "git/v1/$repo_id/packs/$pack_id.idx") ;; *) die "unexpected Vex index key: $idx_key" ;; esac
 
+# The sealed MySQL envelope is written only after the immutable final pair has
+# been promoted. Verify both final keys with metadata-only S3 requests before
+# ending the availability phase; full payload hashing belongs to the manifest
+# phase below and must not consume the five-minute server-ingest budget.
+s3_object_exists "$pack_key"
+s3_object_exists "$idx_key"
+
+if [ -n "$raw_ingest_started_ns" ]; then
+	raw_ingest_finished_ns=$(monotonic_ns)
+	raw_ingest_seconds=$(elapsed_seconds "$raw_ingest_started_ns" "$raw_ingest_finished_ns")
+	if ! within_seconds_budget "$raw_ingest_started_ns" "$raw_ingest_finished_ns" \
+		"$five_minute_seed_budget_seconds"; then
+		record_raw_ingest "$raw_ingest_seconds" FAIL "$raw_ingest_mode"
+		die "raw ingest exceeded the ${five_minute_seed_budget_seconds}-second availability budget"
+	fi
+	record_raw_ingest "$raw_ingest_seconds" PASS "$raw_ingest_mode"
+else
+	# No push was necessary: retain an explicit zero rather than presenting the
+	# verification time for an already-sealed repository as a new ingest time.
+	raw_ingest_seconds=0.000
+	record_raw_ingest "$raw_ingest_seconds" PASS "$raw_ingest_mode"
+fi
+
+# Return the gateway to its prior limits as soon as the availability proof is
+# complete. Disk-control work and evidence generation must not prolong the
+# large receive-pack override or affect the raw_ingest five-minute result.
+phase_started_ns=$(monotonic_ns)
+restore_gateway_limits || die 'git-http gateway limits could not be restored after raw ingest proof'
+phase_finished_ns=$(monotonic_ns)
+record_phase gateway_restore "$phase_started_ns" "$phase_finished_ns"
+
+# A disk control is intentionally a separate bare repository: --no-local
+# prevents hardlink/reference shortcuts, and the documented full repack makes
+# the baseline's pack layout explicit and reproducible. It follows the raw
+# availability gate so it can never delay first Vex availability.
+phase_started_ns=$(monotonic_ns)
+if [ -e "$disk_control" ]; then
+	[ -d "$disk_control" ] || die "disk-control path is not a directory: $disk_control"
+	disk_is_bare=$("$stock_git" --git-dir="$disk_control" rev-parse --is-bare-repository 2>/dev/null || true)
+	[ "$disk_is_bare" = true ] || die "disk-control path is not a bare Git repository: $disk_control"
+	list_local_refs "$disk_control" "$disk_refs"
+	assert_same_refs "$source_refs" "$disk_refs" 'existing disk-control'
+else
+	"$stock_git" clone --quiet --mirror --no-local "$mirror" "$disk_control"
+fi
+"$stock_git" --git-dir="$disk_control" symbolic-ref HEAD "$source_head_ref"
+"$stock_git" --git-dir="$disk_control" repack -adf --write-bitmap-index
+"$stock_git" --git-dir="$disk_control" fsck --connectivity-only --no-progress >/dev/null
+list_local_refs "$disk_control" "$disk_refs"
+assert_same_refs "$source_refs" "$disk_refs" 'disk-control'
+disk_head_oid=$("$stock_git" --git-dir="$disk_control" rev-parse --verify 'HEAD^{commit}')
+[ "$disk_head_oid" = "$source_head_oid" ] || die 'disk-control HEAD does not match the source mirror'
+disk_object_count=$(count_reachable_objects "$disk_control")
+[ "$disk_object_count" = "$source_object_count" ] ||
+	die "disk-control object count differs from source ($disk_object_count != $source_object_count)"
+"$repo_root/scripts/vex/install-bench-disk-control.sh" \
+	--source "$disk_control" --origin "$disk_origin"
+phase_finished_ns=$(monotonic_ns)
+record_phase disk_control "$phase_started_ns" "$phase_finished_ns"
+
+phase_started_ns=$(monotonic_ns)
 # The raw pair is the S3 batch boundary: pack payload bytes were transferred
 # once, immutable keys were promoted together, and MySQL holds only the OID
-# map. Recheck the sealed S3 bytes for the reproducible seed manifest without
-# materializing them on the host.
+# map. Stream those bytes only for the reproducible artifact after the raw
+# availability proof has passed.
 pack_sha256=$(s3_object_sha256 "$pack_key")
 require_sha256 "$pack_sha256"
 pack_bytes=$(s3_object_bytes "$pack_key")
 idx_bytes=$(s3_object_bytes "$idx_key")
 require_uint 'pack byte count' "$pack_bytes"
 require_uint 'pack index byte count' "$idx_bytes"
-
-"$repo_root/scripts/vex/install-bench-disk-control.sh" \
-	--source "$disk_control" --origin "$disk_origin"
-
 : >"$images_tsv"
 collect_image_fact mysql "$images_tsv"
 collect_image_fact minio "$images_tsv"
@@ -627,7 +746,8 @@ python3 - "$manifest" "$source_refs" "$target_refs" \
 	"$origin" "$repo_id" "$target_head_ref" "$target_head_oid" \
 	"$pack_id" "$pack_key" "$idx_key" "$pack_object_count" "$pack_generation" \
 	"$pack_bytes" "$idx_bytes" "$pack_sha256" "$disk_control" "$disk_origin" "$images_tsv" \
-	"$compose_file" "${COMPOSE_PROJECT_NAME:-vex}" "$stock_git_version" <<'PY'
+	"$compose_file" "${COMPOSE_PROJECT_NAME:-vex}" "$stock_git_version" "$phase_timings_tsv" \
+	"$raw_ingest_mode" "$five_minute_seed_budget_seconds" <<'PY'
 import hashlib
 import json
 import os
@@ -664,6 +784,9 @@ from urllib.parse import urlsplit, urlunsplit
     compose_name,
     compose_project,
     stock_git_version,
+    phase_timings_name,
+    raw_ingest_mode,
+    raw_ingest_budget_seconds,
 ) = sys.argv[1:]
 
 
@@ -702,6 +825,24 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def load_phase_timings(path_name: str) -> dict[str, float]:
+    timings: dict[str, float] = {}
+    for raw_line in Path(path_name).read_text(encoding="utf-8").splitlines():
+        phase, seconds_text = raw_line.split("\t", 1)
+        if not phase or phase in timings:
+            raise SystemExit("vex seed-git-git: invalid duplicate phase timing: {}".format(raw_line))
+        try:
+            seconds = float(seconds_text)
+        except ValueError as error:
+            raise SystemExit("vex seed-git-git: invalid phase timing: {}".format(raw_line)) from error
+        if seconds < 0:
+            raise SystemExit("vex seed-git-git: negative phase timing: {}".format(raw_line))
+        timings[phase] = seconds
+    if "raw_ingest" not in timings:
+        raise SystemExit("vex seed-git-git: missing raw_ingest phase timing")
+    return timings
+
+
 disk_control = Path(disk_control_name)
 disk_pack_dir = disk_control / "objects" / "pack"
 disk_packs = []
@@ -729,6 +870,7 @@ for raw_line in Path(images_name).read_text(encoding="utf-8").splitlines():
 
 created_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 default_branch = source_head_ref[len("refs/heads/"):]
+phase_timings = load_phase_timings(phase_timings_name)
 
 payload = {
     "commit_count": int(source_commit_count),
@@ -767,6 +909,15 @@ payload = {
     "stock_git": {"version": stock_git_version},
     "object_count": int(source_object_count),
     "pack_bytes": int(pack_bytes),
+    "timing": {
+        "five_minute_raw_ingest_gate": {
+            "budget_seconds": int(raw_ingest_budget_seconds),
+            "mode": raw_ingest_mode,
+            "passed": True,
+            "raw_ingest_seconds": phase_timings["raw_ingest"],
+        },
+        "phases_seconds": phase_timings,
+    },
     "upstream": redact_url(upstream),
     "vex": {
         "commit_count": int(source_commit_count),
@@ -800,7 +951,11 @@ finally:
     temporary.unlink(missing_ok=True)
 PY
 
-restore_gateway_limits || die 'git-http gateway limits could not be restored after the seed'
+phase_finished_ns=$(monotonic_ns)
+record_phase manifest "$phase_started_ns" "$phase_finished_ns"
+workflow_finished_ns=$(monotonic_ns)
+workflow_seconds=$(elapsed_seconds "$workflow_started_ns" "$workflow_finished_ns")
 
-printf 'vex seed-git-git: PASS repository=git/git.git refs=%s objects=%s pack=%s disk_control=%s disk_origin=%s manifest=%s\n' \
-	"$source_ref_count" "$source_object_count" "$pack_id" "$disk_control" "$disk_origin" "$manifest"
+printf 'vex seed-git-git: PASS repository=git/git.git refs=%s objects=%s pack=%s raw_ingest_seconds=%s raw_ingest_budget_seconds=%s workflow_seconds=%s disk_control=%s disk_origin=%s manifest=%s\n' \
+	"$source_ref_count" "$source_object_count" "$pack_id" "$raw_ingest_seconds" \
+	"$five_minute_seed_budget_seconds" "$workflow_seconds" "$disk_control" "$disk_origin" "$manifest"

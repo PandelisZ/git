@@ -40,12 +40,17 @@ scripts/vex/seed-git-git.sh
 ```
 
 The seed script caches a host-side `--mirror` clone under
-`t/vex/out/git-git-mirror.git`, imports it into `git/git.git`, creates a
-separate `t/vex/out/git-git-disk.git` control using
-`git repack -adf --write-bitmap-index`, builds the immutable Vex S3 pack, and
-writes a redacted `t/vex/out/seed-manifest.json`. Use `--refresh` to update the
-cached mirror. It refuses to replace a non-empty Vex target with a different
-ref set unless `--replace` is explicit, and it never starts Compose itself.
+`t/vex/out/git-git-mirror.git`, imports it into `git/git.git`, proves the
+sealed immutable Vex S3 pack and refs/HEAD, then creates a separate
+`t/vex/out/git-git-disk.git` control using
+`git repack -adf --write-bitmap-index` and writes a redacted
+`t/vex/out/seed-manifest.json`. It reports phase timings and fails the
+server-only `raw_ingest_seconds` gate if the interval from immediately before
+the stock `push --mirror` through seal and availability verification exceeds
+five minutes; disk-control and manifest work are outside that gate. Use
+`--refresh` to update the cached mirror. The first-pack workflow accepts only
+an empty Vex target or one whose refs already match the mirror; it does not
+replace a different non-empty target. It never starts Compose itself.
 When an older local `.env` caps smart-HTTP bodies below 8 GiB, it temporarily
 recreates only `git-http` at that admission limit for the mirror push, verifies
 the active data plane, then restores the gateway's previous running limit.
