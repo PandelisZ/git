@@ -248,9 +248,12 @@ other_ref_rows=$(mysql_query "SELECT COUNT(*) FROM refs WHERE repo_id = UNHEX('$
 	exit 1
 }
 
-# Make a small but complete mirror with a branch, an annotated tag, and a
-# side branch. `--no-thin` below is an explicit stock-client pack contract;
-# repacking this mirror also gives the test a local full-pack member count.
+# Make a small but complete mirror with a branch, an annotated tag, a side
+# branch, and one pull-only commit.  The latter is deliberately outside
+# refs/heads and refs/tags, so the default-clone derived artifact must differ
+# from the complete raw/full relay artifact. `--no-thin` below is an explicit
+# stock-client pack contract; repacking this mirror also gives the test a
+# local full-pack member count.
 fixture="$scratch/fixture"
 mirror="$scratch/fixture.git"
 "$stock_git" init -q "$fixture"
@@ -265,6 +268,14 @@ done
 "$stock_git" -C "$fixture" branch -M main
 "$stock_git" -C "$fixture" branch side HEAD~1
 "$stock_git" -C "$fixture" tag -a -m 'Vex receive-pack WAL annotated fixture tag' fixture-v1
+"$stock_git" -C "$fixture" checkout -q -b fixture-pull
+printf 'Vex receive-pack WAL pull-only fixture object\n' >>"$fixture/history"
+"$stock_git" -C "$fixture" add history
+"$stock_git" -C "$fixture" -c commit.gpgSign=false commit -q \
+	-m 'Vex receive-pack WAL pull-only fixture'
+"$stock_git" -C "$fixture" update-ref refs/pull/1/head HEAD
+"$stock_git" -C "$fixture" checkout -q main
+"$stock_git" -C "$fixture" branch -D fixture-pull >/dev/null
 "$stock_git" clone --mirror --no-local -q "$fixture" "$mirror"
 # Keep the pushed raw pack intentionally non-delta so the post-seed compactor
 # must produce a distinct, smaller full snapshot rather than reusing this
@@ -306,10 +317,34 @@ expected_refs=$("$stock_git" --git-dir="$mirror" for-each-ref --format='%(refnam
 main_oid=$("$stock_git" --git-dir="$mirror" rev-parse refs/heads/main)
 tag_oid=$("$stock_git" --git-dir="$mirror" rev-parse refs/tags/fixture-v1)
 tag_target=$("$stock_git" --git-dir="$mirror" rev-parse refs/tags/fixture-v1^{})
+pull_oid=$("$stock_git" --git-dir="$mirror" rev-parse refs/pull/1/head)
 [ "$tag_target" = "$main_oid" ] || {
 	printf 'vex receive-pack WAL E2E: annotated fixture tag target %s differs from main %s\n' "$tag_target" "$main_oid" >&2
 	exit 1
 }
+[ "$pull_oid" != "$main_oid" ] || {
+	printf '%s\n' 'vex receive-pack WAL E2E: pull-only fixture ref unexpectedly points at main' >&2
+	exit 1
+}
+default_expected_oids="$scratch/default-clone-expected-oids"
+"$stock_git" --git-dir="$mirror" for-each-ref --format='%(objectname)' refs/heads refs/tags |
+	"$stock_git" --git-dir="$mirror" rev-list --objects --no-object-names --stdin |
+	LC_ALL=C sort -u >"$default_expected_oids"
+default_expected_members=$(wc -l <"$default_expected_oids" | tr -d ' ')
+[ "$default_expected_members" -gt 0 ] && [ "$expected_members" -gt "$default_expected_members" ] || {
+	printf 'vex receive-pack WAL E2E: expected partial default closure (%s) to be nonempty and smaller than raw pack (%s)\n' \
+		"$default_expected_members" "$expected_members" >&2
+	exit 1
+}
+grep -Fx "$tag_oid" "$default_expected_oids" >/dev/null || {
+	printf '%s\n' 'vex receive-pack WAL E2E: annotated tag object is absent from the expected default closure' >&2
+	exit 1
+}
+if grep -Fx "$pull_oid" "$default_expected_oids" >/dev/null
+then
+	printf '%s\n' 'vex receive-pack WAL E2E: pull-only commit leaked into the expected default closure' >&2
+	exit 1
+fi
 
 git_https --git-dir="$mirror" push --no-thin --mirror "$origin"
 
@@ -425,6 +460,114 @@ selection_kind=$(mysql_query "SELECT source_kind FROM pack_envelopes AS p WHERE 
 assert_minio_object_exists "$compact_pack_key"
 assert_minio_object_exists "$compact_idx_key"
 
+# Build the narrower default-clone relay artifact after the full compact
+# snapshot.  It is deliberately not globally selectable yet: the current
+# full-snapshot query must remain on the complete relay pack while a separate
+# cache owner consumes this `is_full_snapshot = FALSE` shape.
+default_output=$(VEX_COMPOSE_NO_BUILD=1 VEX_COMPOSE_ALREADY_UP=1 \
+	"$root/scripts/vex/build-pack.sh" --default-clone-from-receive "$repo_name")
+case "$default_output" in
+*"vex build-pack: PASS repository=$repo_name"*' pack='*' objects='*' pack_key='*' idx_key='*) ;;
+*)
+	printf 'vex receive-pack WAL E2E: unexpected default-clone builder output: %s\n' \
+		"$default_output" >&2
+	exit 1
+	;;
+esac
+default_rows=$(mysql_query "SELECT COUNT(*) FROM pack_envelopes WHERE repo_id = UNHEX('$repo_id') AND source_kind = 'derived' AND state = 'sealed' AND is_full_snapshot = FALSE AND covering_generation = $covering_generation;")
+[ "$default_rows" = 1 ] || {
+	printf 'vex receive-pack WAL E2E: expected one current partial default-clone envelope, found %s\n' \
+		"$default_rows" >&2
+	exit 1
+}
+IFS=$'\t' read -r default_pack_id default_generation default_full default_pack_key default_idx_key <<EOF
+$(mysql_query "SELECT LOWER(LEFT(HEX(pack_id), $oid_hex_len)), covering_generation, is_full_snapshot, pack_key, idx_key FROM pack_envelopes WHERE repo_id = UNHEX('$repo_id') AND source_kind = 'derived' AND state = 'sealed' AND is_full_snapshot = FALSE ORDER BY sealed_at DESC, pack_id LIMIT 1;")
+EOF
+[ -n "$default_pack_id" ] && [ "$default_generation" = "$covering_generation" ] &&
+	[ "$default_full" = 0 ] || {
+	printf 'vex receive-pack WAL E2E: default-clone derived envelope metadata is invalid: %s:%s:%s\n' \
+		"$default_pack_id" "$default_generation" "$default_full" >&2
+	exit 1
+}
+[ "$default_pack_id" != "$pack_id" ] && [ "$default_pack_id" != "$compact_pack_id" ] || {
+	printf '%s\n' 'vex receive-pack WAL E2E: default-clone artifact unexpectedly reused a raw/full pack checksum' >&2
+	exit 1
+}
+[ "$default_pack_key" = "git/v1/$repo_id/packs/$default_pack_id.pack" ] &&
+	[ "$default_idx_key" = "git/v1/$repo_id/packs/$default_pack_id.idx" ] || {
+	printf 'vex receive-pack WAL E2E: default-clone derived keys are non-canonical: %s %s\n' \
+		"$default_pack_key" "$default_idx_key" >&2
+	exit 1
+}
+default_pack_mysql_id=$(mysql_oid "$default_pack_id")
+default_pack_objects=$(mysql_query "SELECT COUNT(*) FROM pack_objects WHERE repo_id = UNHEX('$repo_id') AND pack_id = UNHEX('$default_pack_mysql_id');")
+[ "$default_pack_objects" = 0 ] || {
+	printf 'vex receive-pack WAL E2E: default-clone envelope unexpectedly has %s legacy pack-object rows\n' \
+		"$default_pack_objects" >&2
+	exit 1
+}
+assert_minio_object_exists "$default_pack_key"
+assert_minio_object_exists "$default_idx_key"
+default_index="$scratch/default-clone.idx"
+minio_run -e "VEX_S3_OBJECT_KEY=$default_idx_key" minio-init -c '
+	set -eu
+	mc alias set vex "$MINIO_ENDPOINT" "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD" >/dev/null
+	mc cat "vex/$MINIO_BUCKET/$VEX_S3_OBJECT_KEY"
+' >"$default_index"
+default_index_oids="$scratch/default-clone-index-oids"
+"$stock_git" show-index <"$default_index" | awk '{ print $2 }' | LC_ALL=C sort -u >"$default_index_oids"
+default_index_members=$(wc -l <"$default_index_oids" | tr -d ' ')
+[ "$default_index_members" = "$default_expected_members" ] || {
+	printf 'vex receive-pack WAL E2E: default-clone index has %s members, expected heads/tags closure %s\n' \
+		"$default_index_members" "$default_expected_members" >&2
+	exit 1
+}
+cmp -s "$default_expected_oids" "$default_index_oids" || {
+	printf '%s\n' 'vex receive-pack WAL E2E: default-clone index does not exactly match heads/tags closure' >&2
+	diff -u "$default_expected_oids" "$default_index_oids" >&2 || true
+	exit 1
+}
+raw_received_oids="$scratch/raw-received-oids"
+mysql_query "SELECT LOWER(LEFT(HEX(oid), $oid_hex_len)) FROM received_pack_objects WHERE repo_id = UNHEX('$repo_id') AND pack_id = UNHEX('$pack_mysql_id');" |
+	LC_ALL=C sort -u >"$raw_received_oids"
+comm -23 "$default_index_oids" "$raw_received_oids" >"$scratch/default-not-in-raw"
+[ ! -s "$scratch/default-not-in-raw" ] || {
+	printf '%s\n' 'vex receive-pack WAL E2E: default-clone index contains an OID absent from the raw receive map' >&2
+	exit 1
+}
+raw_members_after_default=$(mysql_query "SELECT COUNT(*) FROM received_pack_objects WHERE repo_id = UNHEX('$repo_id') AND pack_id = UNHEX('$pack_mysql_id');")
+[ "$raw_members_after_default" = "$expected_members" ] || {
+	printf 'vex receive-pack WAL E2E: default-clone publication changed raw membership (%s != %s)\n' \
+		"$raw_members_after_default" "$expected_members" >&2
+	exit 1
+}
+
+# Same content, generation, and S3 keys must be idempotent: a second builder
+# may win or lose a concurrent metadata race, but it must leave one sealed
+# partial envelope rather than attempting to overwrite a raw/full envelope.
+default_repeat_output=$(VEX_COMPOSE_NO_BUILD=1 VEX_COMPOSE_ALREADY_UP=1 \
+	"$root/scripts/vex/build-pack.sh" --default-clone-from-receive "$repo_name")
+case "$default_repeat_output" in
+*"vex build-pack: PASS repository=$repo_name"*' pack='*' objects='*' pack_key='*' idx_key='*) ;;
+*)
+	printf 'vex receive-pack WAL E2E: default-clone builder was not idempotent: %s\n' \
+		"$default_repeat_output" >&2
+	exit 1
+	;;
+esac
+default_rows_after_repeat=$(mysql_query "SELECT COUNT(*) FROM pack_envelopes WHERE repo_id = UNHEX('$repo_id') AND source_kind = 'derived' AND state = 'sealed' AND is_full_snapshot = FALSE AND covering_generation = $covering_generation;")
+[ "$default_rows_after_repeat" = 1 ] || {
+	printf 'vex receive-pack WAL E2E: idempotent default-clone build left %s partial envelopes\n' \
+		"$default_rows_after_repeat" >&2
+	exit 1
+}
+selection_after_default=$(mysql_query "SELECT LOWER(LEFT(HEX(pack_id), $oid_hex_len)) FROM pack_envelopes AS p WHERE p.repo_id = UNHEX('$repo_id') AND p.state = 'sealed' AND p.is_full_snapshot = TRUE AND p.idx_key IS NOT NULL AND p.covering_generation = (SELECT MAX(generation) FROM generations AS g WHERE g.repo_id = UNHEX('$repo_id') AND g.state = 'sealed') ORDER BY (p.source_kind = 'derived') DESC, p.sealed_at DESC, p.pack_id LIMIT 1;")
+[ "$selection_after_default" = "$compact_pack_id" ] || {
+	printf 'vex receive-pack WAL E2E: partial default-clone envelope changed global full relay selection (%s != %s)\n' \
+		"$selection_after_default" "$compact_pack_id" >&2
+	exit 1
+}
+
 local_refs=$("$stock_git" --git-dir="$mirror" \
 	for-each-ref --format='%(objectname)%09%(refname)' | LC_ALL=C sort)
 remote_refs=$(git_https ls-remote --refs "$origin" | LC_ALL=C sort)
@@ -502,5 +645,6 @@ grep -Eq 'clone< version 2$' "$scratch/v2.trace" || {
 }
 
 restore_gateway
-printf 'vex receive-pack WAL E2E: PASS stock non-thin initial mirror refs=%s objects=%s raw_pack=%s compact_pack=%s; raw MySQL map retained, compact S3 pack/idx selected, and protocol-v0/v2 annotated-tag fsck clones received the compact pack without git-pack-objects for %s\n' \
-	"$expected_refs" "$expected_members" "$pack_id" "$compact_pack_id" "$origin"
+printf 'vex receive-pack WAL E2E: PASS stock non-thin initial mirror refs=%s raw_objects=%s default_objects=%s raw_pack=%s compact_pack=%s default_pack=%s; raw MySQL map retained, the default heads/tags index is exact and partial, compact S3 pack/idx remains globally selected, and protocol-v0/v2 annotated-tag fsck clones received the compact pack without git-pack-objects for %s\n' \
+	"$expected_refs" "$expected_members" "$default_expected_members" "$pack_id" \
+	"$compact_pack_id" "$default_pack_id" "$origin"

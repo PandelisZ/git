@@ -7,7 +7,10 @@
 # durable, debounced rebuild request created by a prior receive.  The explicit
 # --from-receive mode is a narrow post-seed compactor: it keeps the sealed raw
 # receive pack and its membership map canonical, then publishes an additional
-# compact full-snapshot artifact for clone relay.
+# compact full-snapshot artifact for complete-clone relay.  The separate
+# --default-clone-from-receive mode builds only the closure advertised by
+# refs/heads and refs/tags, for a relay path that must not expose arbitrary
+# server-side namespaces as default clone content.
 set -euo pipefail
 
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
@@ -16,11 +19,11 @@ docker_dir="$repo_root/vex/docker"
 env_file="$docker_dir/.env"
 
 usage() {
-	printf '%s\n' 'usage: scripts/vex/build-pack.sh [--due|--from-receive] <repository.git>'
+	printf '%s\n' 'usage: scripts/vex/build-pack.sh [--due|--from-receive|--default-clone-from-receive] <repository.git>'
 }
 
 due_only=0
-from_receive=0
+receive_mode=
 case "$#" in
 1) repo_name=$1 ;;
 2)
@@ -28,7 +31,10 @@ case "$#" in
 		due_only=1
 		repo_name=$2
 	elif [ "$1" = --from-receive ]; then
-		from_receive=1
+		receive_mode=full
+		repo_name=$2
+	elif [ "$1" = --default-clone-from-receive ]; then
+		receive_mode=default-clone
 		repo_name=$2
 	else
 		usage >&2
@@ -129,7 +135,15 @@ esac
 raw_pack_id=
 raw_pack_id_padded=
 raw_members=
-if [ "$from_receive" -eq 1 ]; then
+if [ -n "$receive_mode" ]; then
+	case "$receive_mode" in
+	full) receive_mode_flag=from-receive ;;
+	default-clone) receive_mode_flag=default-clone-from-receive ;;
+	*)
+		printf 'vex build-pack: invalid receive artifact mode: %s\n' "$receive_mode" >&2
+		exit 2
+		;;
+	esac
 	raw_count=$(mysql_query "
 		SELECT COUNT(*)
 		  FROM pack_envelopes
@@ -139,8 +153,8 @@ if [ "$from_receive" -eq 1 ]; then
 		   AND is_full_snapshot = TRUE
 		   AND covering_generation = $covering_generation;")
 	[ "$raw_count" = 1 ] || {
-		printf 'vex build-pack: --from-receive requires exactly one sealed raw full snapshot at generation %s for %s (found %s)\n' \
-			"$covering_generation" "$repo_name" "$raw_count" >&2
+		printf 'vex build-pack: --%s requires exactly one sealed raw full snapshot at generation %s for %s (found %s)\n' \
+			"$receive_mode_flag" "$covering_generation" "$repo_name" "$raw_count" >&2
 		exit 1
 	}
 	IFS=$'\t' read -r raw_pack_id raw_generation raw_members <<EOF
@@ -218,7 +232,7 @@ cleanup() {
 	# uploaded, the loser must not delete the winner's immutable S3 pair during
 	# its cleanup.  Retain an unregistered raw-derived pair as an orphan for the
 	# normal S3 sweep rather than risk a published envelope pointing at nothing.
-	if [ "${from_receive:-0}" != 1 ] && [ "${pack_registered:-0}" != 1 ] && [ "${#uploaded_keys[@]}" -gt 0 ]; then
+	if [ -z "${receive_mode:-}" ] && [ "${pack_registered:-0}" != 1 ] && [ "${#uploaded_keys[@]}" -gt 0 ]; then
 		"${compose[@]}" run --rm --no-deps -T --entrypoint /bin/sh \
 			-e "VEX_PACK_DELETE_KEYS=${uploaded_keys[*]}" minio-init -c '
 				set -eu
@@ -250,18 +264,55 @@ build_info=$("${compose[@]}" exec -T git-http /bin/sh -ec '
 	set -eu
 	repo=$1
 	work=$2
-	from_receive=$3
+	receive_mode=$3
 	mkdir -p "$work"
-	/opt/vex-git/git --git-dir="/srv/git/$repo" rev-list --objects --no-object-names --all >"$work/oids"
+	case "$receive_mode" in
+	"")
+		/opt/vex-git/git --git-dir="/srv/git/$repo" rev-list --objects --no-object-names --all >"$work/oids"
+		;;
+	full)
+		/opt/vex-git/git --git-dir="/srv/git/$repo" rev-list --objects --no-object-names --all >"$work/oids"
+		;;
+	default-clone)
+		# This is the exact default-clone root policy.  Feed ref object IDs to
+		# rev-list rather than peeling tags ourselves: it retains annotated tag
+		# objects as members while walking their target closure.
+		/opt/vex-git/git --git-dir="/srv/git/$repo" for-each-ref \
+			--format="%(objectname)" refs/heads refs/tags >"$work/default-roots"
+		test -s "$work/default-roots"
+		/opt/vex-git/git --git-dir="/srv/git/$repo" rev-list \
+			--objects --no-object-names --stdin <"$work/default-roots" \
+			>"$work/default-closure-oids"
+		test -s "$work/default-closure-oids"
+		cp "$work/default-closure-oids" "$work/oids"
+		;;
+	*)
+		printf "vex build-pack: invalid receive artifact mode: %s\\n" "$receive_mode" >&2
+		exit 2
+		;;
+	esac
 	test -s "$work/oids"
-	/opt/vex-git/git --git-dir="/srv/git/$repo" pack-objects --stdout --revs \
-		--no-reuse-object --no-reuse-delta --threads=1 <"$work/oids" >"$work/pack"
+	if test "$receive_mode" = default-clone
+	then
+		# This is a relay cache rather than the canonical raw receive pack.  Let
+		# pack-objects reuse its cached raw representation and use OFS deltas to
+		# reduce the S3 payload.  Four threads cap the CPU fan-out; window memory
+		# remains bounded for a cloud-scale heads/tags closure.
+		/opt/vex-git/git --git-dir="/srv/git/$repo" pack-objects --stdout --revs \
+			--threads=4 --window-memory=256m --delta-base-offset --include-tag \
+			<"$work/oids" >"$work/pack"
+	else
+		# Preserve the complete snapshot and generic builder representation: the
+		# receive-derived full artifact remains a deterministic raw-map verifier.
+		/opt/vex-git/git --git-dir="/srv/git/$repo" pack-objects --stdout --revs \
+			--no-reuse-object --no-reuse-delta --threads=1 <"$work/oids" >"$work/pack"
+	fi
 	pack_id=$(/opt/vex-git/git index-pack -o "$work/pack.idx" "$work/pack")
 	object_count=$(wc -l <"$work/oids" | tr -d "[:space:]")
-	if test "$from_receive" = 1
+	if test -n "$receive_mode"
 	then
-		# The index is the authoritative membership surface for the compact
-		# artifact.  Do not infer its object set merely from pack-objects input.
+		# The index is the authoritative membership surface for receive-derived
+		# artifacts.  Do not infer its object set merely from pack-objects input.
 		/opt/vex-git/git show-index <"$work/pack.idx" | awk "{ print \$2 }" >"$work/pack-oids"
 		test -s "$work/pack-oids"
 		object_count=$(wc -l <"$work/pack-oids" | tr -d "[:space:]")
@@ -269,7 +320,7 @@ build_info=$("${compose[@]}" exec -T git-http /bin/sh -ec '
 	printf "%s\t%s\t%s\t%s\t%s\n" "$pack_id" "$object_count" \
 		"$(wc -c <"$work/pack" | tr -d "[:space:]")" \
 		"$(wc -c <"$work/pack.idx" | tr -d "[:space:]")" "$work"
-' sh "$repo_name" "$remote_work" "$from_receive")
+' sh "$repo_name" "$remote_work" "$receive_mode")
 
 IFS=$'\t' read -r pack_id object_count pack_bytes idx_bytes built_remote_work <<<"$build_info"
 [ "$built_remote_work" = "$remote_work" ] || {
@@ -292,7 +343,7 @@ case "$object_count:$pack_bytes:$idx_bytes" in
 esac
 
 membership_name=oids
-if [ "$from_receive" -eq 1 ]; then
+if [ -n "$receive_mode" ]; then
 	membership_name=pack-oids
 fi
 docker cp "$git_container:$remote_work/$membership_name" "$local_work/oids"
@@ -307,7 +358,36 @@ invalid_oids=$(LC_ALL=C grep -Evc "^[0-9a-f]{$oid_hex_length}$" "$local_work/oid
 	printf 'vex build-pack: manifest has %s invalid object id(s)\n' "$invalid_oids" >&2
 	exit 1
 }
-if [ "$from_receive" -eq 1 ] && [ "$raw_members" != "$object_count" ]; then
+if [ "$receive_mode" = default-clone ]; then
+	docker cp "$git_container:$remote_work/default-closure-oids" \
+		"$local_work/default-closure-oids"
+	closure_count=$(wc -l <"$local_work/default-closure-oids" | tr -d '[:space:]')
+	[ "$closure_count" -gt 0 ] || {
+		printf '%s\n' 'vex build-pack: default clone closure is empty' >&2
+		exit 1
+	}
+	invalid_closure_oids=$(LC_ALL=C grep -Evc "^[0-9a-f]{$oid_hex_length}$" \
+		"$local_work/default-closure-oids" || true)
+	[ "$invalid_closure_oids" = 0 ] || {
+		printf 'vex build-pack: default clone closure has %s invalid object id(s)\n' \
+			"$invalid_closure_oids" >&2
+		exit 1
+	}
+	LC_ALL=C sort -u "$local_work/default-closure-oids" >"$local_work/default-closure.sorted"
+	LC_ALL=C sort -u "$local_work/oids" >"$local_work/pack-oids.sorted"
+	closure_unique_count=$(wc -l <"$local_work/default-closure.sorted" | tr -d '[:space:]')
+	index_unique_count=$(wc -l <"$local_work/pack-oids.sorted" | tr -d '[:space:]')
+	[ "$closure_count" = "$closure_unique_count" ] &&
+		[ "$object_count" = "$index_unique_count" ] || {
+		printf 'vex build-pack: default clone closure/index contains duplicate object id(s)\n' >&2
+		exit 1
+	}
+	cmp -s "$local_work/default-closure.sorted" "$local_work/pack-oids.sorted" || {
+		printf 'vex build-pack: default clone pack index does not exactly match the heads/tags closure\n' >&2
+		exit 1
+	}
+fi
+if [ "$receive_mode" = full ] && [ "$raw_members" != "$object_count" ]; then
 	printf 'vex build-pack: compact index has %s objects but the raw receive map has %s for %s\n' \
 		"$object_count" "$raw_members" "$repo_name" >&2
 	exit 1
@@ -316,7 +396,7 @@ fi
 pack_id_padded="$pack_id$oid_padding"
 pack_key="git/v1/$repo_id/packs/$pack_id.pack"
 idx_key="git/v1/$repo_id/packs/$pack_id.idx"
-if [ "$from_receive" -eq 1 ]; then
+if [ "$receive_mode" = full ]; then
 	existing_envelopes=$(mysql_query "
 		SELECT COUNT(*)
 		  FROM pack_envelopes
@@ -370,7 +450,7 @@ else
 	oid_sql='UNHEX(oid_hex)'
 	candidate_oid_sql='UNHEX(candidate.oid_hex)'
 fi
-if [ "$from_receive" -eq 1 ]; then
+if [ "$receive_mode" = full ]; then
 	# A raw receive seed deliberately has no `objects` rows: its canonical
 	# payload is the sealed raw pack and `received_pack_objects` is its complete
 	# membership map.  Validate the compact pack's *index* against that map in
@@ -446,6 +526,107 @@ if [ "$from_receive" -eq 1 ]; then
 	1) ;;
 	*)
 		printf 'vex build-pack: raw compact validation/publication failed (rows=%s, raw_members=%s, compact_members=%s)\n' \
+			"$registered_count" "$raw_members" "$object_count" >&2
+		exit 1
+		;;
+	esac
+elif [ "$receive_mode" = default-clone ]; then
+	# The partial artifact is intentionally a separate envelope, not a
+	# replacement for the raw receive pack or the full derived snapshot.  Its
+	# local exact-index/closure check above establishes the advertised object
+	# set; this transaction establishes that every one of those indexed OIDs was
+	# durably received in the canonical raw pack.  `pack_objects` must stay
+	# empty because it has an FK to loose `objects` payloads, which raw receive
+	# ingestion deliberately does not create.
+	#
+	# The immutable S3 keys are content-addressed.  An identical concurrent
+	# builder may have inserted this exact derived envelope first, so the
+	# duplicate-key branch is a no-op and the final predicate accepts only the
+	# same sealed partial shape.  A collision with a raw/full envelope cannot be
+	# overwritten and therefore fails the predicate safely.
+	registered_count=$(mysql_admin_query "
+		CREATE TEMPORARY TABLE vex_pack_input (
+			oid_hex CHAR($oid_hex_length) BINARY NOT NULL PRIMARY KEY
+		) ENGINE=InnoDB;
+		LOAD DATA INFILE '$mysql_manifest'
+			INTO TABLE vex_pack_input
+			LINES TERMINATED BY '\\n' (oid_hex);
+		START TRANSACTION;
+		SET @vex_repository_lock = NULL;
+		SELECT repo_id INTO @vex_repository_lock
+		  FROM repositories
+		 WHERE repo_id = UNHEX('$repo_id')
+		 FOR UPDATE;
+		SELECT COALESCE(MAX(generation), 0) INTO @vex_current_generation
+		  FROM generations
+		 WHERE repo_id = UNHEX('$repo_id')
+		   AND state = 'sealed';
+		SELECT COUNT(*) INTO @vex_raw_envelopes
+		  FROM pack_envelopes
+		 WHERE repo_id = UNHEX('$repo_id')
+		   AND source_kind = 'receive'
+		   AND state = 'sealed'
+		   AND is_full_snapshot = TRUE
+		   AND covering_generation = $covering_generation;
+		SELECT COUNT(*) INTO @vex_selected_raw_envelopes
+		  FROM pack_envelopes
+		 WHERE repo_id = UNHEX('$repo_id')
+		   AND pack_id = UNHEX('$raw_pack_id_padded')
+		   AND source_kind = 'receive'
+		   AND state = 'sealed'
+		   AND is_full_snapshot = TRUE
+		   AND covering_generation = $covering_generation;
+		SELECT COUNT(*) INTO @vex_raw_members
+		  FROM received_pack_objects
+		 WHERE repo_id = UNHEX('$repo_id')
+		   AND pack_id = UNHEX('$raw_pack_id_padded');
+		SELECT COUNT(*) INTO @vex_default_members FROM vex_pack_input;
+		SELECT COUNT(*) INTO @vex_default_missing
+		  FROM vex_pack_input AS candidate
+		  LEFT JOIN received_pack_objects AS raw
+		    ON raw.repo_id = UNHEX('$repo_id')
+		   AND raw.pack_id = UNHEX('$raw_pack_id_padded')
+		   AND raw.oid = $candidate_oid_sql
+		 WHERE raw.oid IS NULL;
+		INSERT INTO pack_envelopes
+			(repo_id, pack_id, pack_key, idx_key, bitmap_key, covering_generation,
+			 state, source_kind, receive_generation, is_full_snapshot, sealed_at)
+		SELECT UNHEX('$repo_id'), UNHEX('$pack_id_padded'), '$pack_key', '$idx_key',
+		       NULL, $covering_generation, 'sealed', 'derived', NULL, FALSE,
+		       CURRENT_TIMESTAMP(6)
+		 WHERE @vex_repository_lock IS NOT NULL
+		   AND @vex_current_generation = $covering_generation
+		   AND @vex_raw_envelopes = 1
+		   AND @vex_selected_raw_envelopes = 1
+		   AND @vex_raw_members = $raw_members
+		   AND @vex_default_members = $object_count
+		   AND @vex_default_missing = 0
+		ON DUPLICATE KEY UPDATE
+			pack_id = VALUES(pack_id);
+		SELECT COUNT(*) INTO @vex_published_rows
+		  FROM pack_envelopes AS p
+		 WHERE p.repo_id = UNHEX('$repo_id')
+		   AND p.pack_id = UNHEX('$pack_id_padded')
+		   AND p.pack_key = '$pack_key'
+		   AND p.idx_key = '$idx_key'
+		   AND p.covering_generation = $covering_generation
+		   AND p.state = 'sealed'
+		   AND p.source_kind = 'derived'
+		   AND p.receive_generation IS NULL
+		   AND p.is_full_snapshot = FALSE
+		   AND @vex_repository_lock IS NOT NULL
+		   AND @vex_current_generation = $covering_generation
+		   AND @vex_raw_envelopes = 1
+		   AND @vex_selected_raw_envelopes = 1
+		   AND @vex_raw_members = $raw_members
+		   AND @vex_default_members = $object_count
+		   AND @vex_default_missing = 0;
+		COMMIT;
+		SELECT @vex_published_rows;")
+	case "$registered_count" in
+	1) ;;
+	*)
+		printf 'vex build-pack: default clone validation/publication failed (rows=%s, raw_members=%s, default_members=%s)\n' \
 			"$registered_count" "$raw_members" "$object_count" >&2
 		exit 1
 		;;
