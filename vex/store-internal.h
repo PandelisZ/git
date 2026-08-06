@@ -145,6 +145,15 @@ struct vex_epoch {
 	size_t pending_stages_alloc;
 	size_t pending_stage_bytes;
 	unsigned int flushing_pending_stages:1;
+	/*
+	 * The receive-pack WAL path stages one immutable pack/idx pair rather than
+	 * an unbounded number of loose S3 objects.  Its membership remains in
+	 * MySQL; this transient handle tells ref publication/compensation which
+	 * pack epoch protocol to use.
+	 */
+	struct object_id receive_pack_id;
+	unsigned int receive_pack_staged:1;
+	unsigned int receive_pack_promoted:1;
 };
 
 struct vex_ref_transaction {

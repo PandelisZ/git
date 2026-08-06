@@ -582,8 +582,12 @@ static int vex_be_transaction_finish(struct ref_store *ref_store,
 	/* commit retains the transaction allocation; abort releases it after commit. */
 	vex_ref_transaction_abort(data->transaction);
 	data->transaction = NULL;
-	if (data->receive_transaction)
-		odb_vex_receive_transaction_finish(data->receive_transaction);
+	if (data->receive_transaction) {
+		if (ret)
+			odb_vex_receive_transaction_abort(data->receive_transaction);
+		else
+			odb_vex_receive_transaction_finish(data->receive_transaction);
+	}
 	if (data->epoch)
 		vex_epoch_free(data->epoch);
 	free(data);

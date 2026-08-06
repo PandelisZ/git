@@ -1,6 +1,7 @@
 #include "git-compat-util.h"
 #include "abspath.h"
 #include "config.h"
+#include "dir.h"
 #include "hash.h"
 #include "hex.h"
 #include "lockfile.h"
@@ -1118,8 +1119,29 @@ static int odb_transaction_vex_write_object_stream(struct odb_transaction *base,
 }
 
 static void vex_transaction_release_receive_pack_wal(
+		struct odb_source_vex *source,
 		struct odb_transaction_vex *transaction)
 {
+	char *expected = NULL;
+	struct strbuf path = STRBUF_INIT;
+
+	if (!transaction->receive_pack_objects_path)
+		return;
+	if (source && transaction->epoch)
+		expected = vex_source_receive_pack_objects_path(source,
+							     vex_epoch_id(transaction->epoch));
+	if (expected && !strcmp(expected, transaction->receive_pack_objects_path)) {
+		/* No child can use this receive cache after the parent transaction ends. */
+		if (source->receive_pack_path &&
+		    !strcmp(expected, source->receive_pack_path))
+			vex_source_release_receive_pack_cache(source);
+		strbuf_addstr(&path, expected);
+		if (remove_dir_recursively(&path, 0))
+			trace_printf("vex: could not remove completed receive pack WAL %s",
+				     expected);
+	}
+	strbuf_release(&path);
+	free(expected);
 	free(transaction->receive_pack_objects_path);
 	transaction->receive_pack_objects_path = NULL;
 }
@@ -1146,9 +1168,9 @@ static int odb_transaction_vex_commit(struct odb_transaction *base)
 		ret = vex_store_flush_staged(source->store, transaction->epoch);
 		if (ret)
 			error(_("unable to flush Vex receive object batch"));
+		vex_transaction_release_receive_pack_wal(source, transaction);
 		vex_epoch_detach(transaction->epoch);
 		transaction->epoch = NULL;
-		vex_transaction_release_receive_pack_wal(transaction);
 		return ret;
 	}
 	if (transaction->receive_handoff) {
@@ -1159,9 +1181,9 @@ static int odb_transaction_vex_commit(struct odb_transaction *base)
 		} else {
 			ret = 0;
 		}
+		vex_transaction_release_receive_pack_wal(source, transaction);
 		vex_epoch_detach(transaction->epoch);
 		transaction->epoch = NULL;
-		vex_transaction_release_receive_pack_wal(transaction);
 		return ret;
 	}
 
@@ -1174,9 +1196,9 @@ static int odb_transaction_vex_commit(struct odb_transaction *base)
 		vex_epoch_compensate(transaction->epoch);
 		error(_("unable to publish Vex object transaction"));
 	}
+	vex_transaction_release_receive_pack_wal(source, transaction);
 	vex_epoch_free(transaction->epoch);
 	transaction->epoch = NULL;
-	vex_transaction_release_receive_pack_wal(transaction);
 	return ret;
 }
 
@@ -1318,10 +1340,18 @@ int odb_vex_receive_transaction_adopt_pack(
 	expected = vex_source_receive_pack_objects_path(source,
 						    vex_epoch_id(transaction->epoch));
 	if (!expected || strcmp(expected, objects_dir) ||
-	    vex_source_install_receive_pack_cache(source, expected, pack_id))
+	    vex_source_install_receive_pack_cache(source, expected, pack_id)) {
+		vex_source_release_receive_pack_cache(source);
 		goto out;
-	transaction->receive_pack_objects_path = expected;
-	expected = NULL;
+	}
+	/* Retain the derived path even if S3/metadata staging fails, so the
+	 * terminal receive cleanup can reclaim this ephemeral index-pack WAL. */
+	transaction->receive_pack_objects_path = xstrdup(expected);
+	if (vex_store_stage_receive_pack(source->store, transaction->epoch,
+					 pack_id, expected)) {
+		vex_source_release_receive_pack_cache(source);
+		goto out;
+	}
 	oidcpy(&transaction->receive_pack_id, pack_id);
 	transaction->receive_pack_ready = 1;
 	ret = 0;
@@ -1347,6 +1377,12 @@ int odb_vex_receive_transaction_attach(struct odb_transaction *base,
 	ret = vex_epoch_attach(store, vex_epoch_id(transaction->epoch), epoch);
 	if (ret)
 		return -1;
+	if (transaction->receive_pack_ready &&
+	    vex_epoch_adopt_receive_pack(*epoch, &transaction->receive_pack_id)) {
+		vex_epoch_detach(*epoch);
+		*epoch = NULL;
+		return -1;
+	}
 	return 1;
 }
 

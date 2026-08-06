@@ -268,6 +268,22 @@ int vex_store_stage_object(struct vex_store *store,
  * no-op.
  */
 int vex_store_flush_staged(struct vex_store *store, struct vex_epoch *epoch);
+
+/*
+ * Register the one indexed pack produced by the explicit receive-pack WAL
+ * path.  Its bytes are staged as a validated S3 pack/idx pair, while a
+ * bounded local verify-pack pass bulk-loads only OID/type/size metadata.
+ * The first implementation accepts a full snapshot only; an existing
+ * repository is rejected at the metadata publication boundary.
+ */
+int vex_store_stage_receive_pack(struct vex_store *store,
+				 struct vex_epoch *epoch,
+				 const struct object_id *pack_id,
+				 const char *objects_dir);
+
+/* Mark an attached receive epoch so the ref transaction uses its raw pack. */
+int vex_epoch_adopt_receive_pack(struct vex_epoch *epoch,
+				 const struct object_id *pack_id);
 /* Returns 1 when a published object exists, 0 when it does not, or an error. */
 int vex_store_has_object(struct vex_store *store,
 			   const struct object_id *oid);

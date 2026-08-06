@@ -127,6 +127,9 @@ services:
       # Test-only receive-worker crash injection.
       GIT_VEX_TEST_KILL_AT: ${GIT_VEX_TEST_KILL_AT:-}
       GIT_VEX_TEST_EPOCH_RECOVERY_SECONDS: ${GIT_VEX_TEST_EPOCH_RECOVERY_SECONDS:-}
+      # Opt-in first-seed fast path: receive-pack indexes one complete pack
+      # into the durable scratch WAL instead of staging every object byte.
+      GIT_VEX_RECEIVE_PACK_WAL: ${GIT_VEX_RECEIVE_PACK_WAL:-}
       GIT_VEX_SCRATCH: /var/git-scratch
       GIT_VEX_REPO_GIT_GIT_UUID: ${GIT_VEX_REPO_GIT_GIT_UUID}
       VEX_GIT_HTTP_COMMAND: ${VEX_GIT_HTTP_COMMAND:-/usr/local/lib/vex-git-http/vex_mysql_s3_http.py}
