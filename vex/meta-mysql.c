@@ -1566,6 +1566,30 @@ static int ensure_receive_pack_schema(struct vex_meta_mysql *db)
 }
 
 /*
+ * Existing Compose volumes predate the optional OID-to-pack-offset index.
+ * The map is intentionally independent of `objects`: a raw receive envelope
+ * can be indexed before (or without) a per-object metadata import.  Keep the
+ * migration additive so restarting a gateway never rewrites pack metadata.
+ */
+static int ensure_pack_object_offsets_table(struct vex_meta_mysql *db)
+{
+	static const char create_sql[] =
+		"CREATE TABLE IF NOT EXISTS pack_object_offsets ("
+		"repo_id BINARY(16) NOT NULL, "
+		"pack_id BINARY(32) NOT NULL, "
+		"oid BINARY(32) NOT NULL, "
+		"pack_offset BIGINT UNSIGNED NOT NULL, "
+		"PRIMARY KEY (repo_id, pack_id, oid), "
+		"KEY pack_object_offsets_lookup (repo_id, oid, pack_id), "
+		"CONSTRAINT pack_object_offsets_pack_fk "
+		"FOREIGN KEY (repo_id, pack_id) REFERENCES "
+		"pack_envelopes (repo_id, pack_id)"
+		") ENGINE=InnoDB";
+
+	return mysql_exec(db, create_sql);
+}
+
+/*
  * Existing Compose volumes predate live receive heartbeats.  Keep this
  * additive migration here as well as schema.sql so a normal gateway restart
  * gains the protection without resetting durable repository metadata.
@@ -1622,7 +1646,7 @@ int vex_meta_mysql_schema_check(struct vex_meta_mysql *db,
 		"WHERE table_schema = DATABASE() AND table_name IN "
 		"('repositories','generations','objects','generation_objects',"
 		"'commit_parents','refs','ref_updates','object_pins',"
-		"'pack_envelopes','pack_objects','clone_leases',"
+		"'pack_envelopes','pack_objects','pack_object_offsets','clone_leases',"
 		"'received_pack_objects','pack_rebuild_requests',"
 		"'object_sweep_tombstones')";
 	static const char blob_key_sql[] =
@@ -1647,6 +1671,47 @@ int vex_meta_mysql_schema_check(struct vex_meta_mysql *db,
 		"(column_name = 'oid' AND data_type = 'binary') OR "
 		"(column_name = 'obj_type' AND data_type = 'tinyint') OR "
 		"(column_name = 'size' AND data_type = 'bigint'))";
+	static const char pack_object_offset_columns_sql[] =
+		"SELECT COUNT(*) FROM information_schema.columns "
+		"WHERE table_schema = DATABASE() "
+		"AND table_name = 'pack_object_offsets' AND ("
+		"(column_name = 'repo_id' AND data_type = 'binary' "
+		"AND character_maximum_length = 16 AND is_nullable = 'NO') OR "
+		"(column_name = 'pack_id' AND data_type = 'binary' "
+		"AND character_maximum_length = 32 AND is_nullable = 'NO') OR "
+		"(column_name = 'oid' AND data_type = 'binary' "
+		"AND character_maximum_length = 32 AND is_nullable = 'NO') OR "
+		"(column_name = 'pack_offset' AND column_type = 'bigint unsigned' "
+		"AND is_nullable = 'NO'))";
+	static const char pack_object_offset_lookup_index_sql[] =
+		"SELECT COUNT(*) = 3 AND COALESCE(SUM(CASE "
+		"WHEN seq_in_index = 1 AND column_name = 'repo_id' "
+		"AND non_unique = 1 THEN 1 "
+		"WHEN seq_in_index = 2 AND column_name = 'oid' "
+		"AND non_unique = 1 THEN 1 "
+		"WHEN seq_in_index = 3 AND column_name = 'pack_id' "
+		"AND non_unique = 1 THEN 1 "
+		"ELSE 0 END), 0) = 3 "
+		"FROM information_schema.statistics "
+		"WHERE table_schema = DATABASE() "
+		"AND table_name = 'pack_object_offsets' "
+		"AND index_name = 'pack_object_offsets_lookup'";
+	static const char pack_object_offset_fk_sql[] =
+		"SELECT COUNT(*) = 2 AND COALESCE(SUM(CASE "
+		"WHEN constraint_name = 'pack_object_offsets_pack_fk' "
+		"AND ((ordinal_position = 1 AND column_name = 'repo_id' "
+		"AND referenced_table_schema = DATABASE() "
+		"AND referenced_table_name = 'pack_envelopes' "
+		"AND referenced_column_name = 'repo_id') OR "
+		"(ordinal_position = 2 AND column_name = 'pack_id' "
+		"AND referenced_table_schema = DATABASE() "
+		"AND referenced_table_name = 'pack_envelopes' "
+		"AND referenced_column_name = 'pack_id')) THEN 1 "
+		"ELSE 0 END), 0) = 2 "
+		"FROM information_schema.key_column_usage "
+		"WHERE constraint_schema = DATABASE() "
+		"AND table_name = 'pack_object_offsets' "
+		"AND referenced_table_name IS NOT NULL";
 	static const char rebuild_request_lease_columns_sql[] =
 		"SELECT COUNT(*) FROM information_schema.columns "
 		"WHERE table_schema = DATABASE() "
@@ -1678,6 +1743,9 @@ int vex_meta_mysql_schema_check(struct vex_meta_mysql *db,
 	uint64_t heartbeat;
 	uint64_t receive_columns;
 	uint64_t received_object_columns;
+	uint64_t pack_object_offset_columns;
+	uint64_t pack_object_offset_lookup_index;
+	uint64_t pack_object_offset_fk;
 	uint64_t rebuild_request_lease_columns;
 	uint64_t rebuild_request_claimable_index;
 	int found;
@@ -1703,14 +1771,17 @@ int vex_meta_mysql_schema_check(struct vex_meta_mysql *db,
 	ret = ensure_receive_pack_schema(db);
 	if (ret)
 		return ret;
+	ret = ensure_pack_object_offsets_table(db);
+	if (ret)
+		return ret;
 	ret = query_one_u64(db, table_sql, &tables, &found);
 	if (ret)
 		return ret;
-	if (!found || tables != 14) {
+	if (!found || tables != 15) {
 		if (table_count)
 			*table_count = found && tables <= UINT_MAX ? tables : 0;
 		return set_error(db, VEX_META_MYSQL_ERR_SCHEMA,
-				 "expected 14 Vex metadata tables, found %" PRIu64,
+				 "expected 15 Vex metadata tables, found %" PRIu64,
 				 found ? tables : 0);
 	}
 	ret = query_one_u64(db, blob_key_sql, &blob_key, &found);
@@ -1738,6 +1809,27 @@ int vex_meta_mysql_schema_check(struct vex_meta_mysql *db,
 	if (!found || received_object_columns != 5)
 		return set_error(db, VEX_META_MYSQL_ERR_SCHEMA,
 				 "received_pack_objects metadata schema is incomplete");
+	ret = query_one_u64(db, pack_object_offset_columns_sql,
+				    &pack_object_offset_columns, &found);
+	if (ret)
+		return ret;
+	if (!found || pack_object_offset_columns != 4)
+		return set_error(db, VEX_META_MYSQL_ERR_SCHEMA,
+				 "pack_object_offsets metadata schema is incomplete");
+	ret = query_one_u64(db, pack_object_offset_lookup_index_sql,
+				    &pack_object_offset_lookup_index, &found);
+	if (ret)
+		return ret;
+	if (!found || pack_object_offset_lookup_index != 1)
+		return set_error(db, VEX_META_MYSQL_ERR_SCHEMA,
+				 "pack_object_offsets OID lookup index is incomplete");
+	ret = query_one_u64(db, pack_object_offset_fk_sql,
+				    &pack_object_offset_fk, &found);
+	if (ret)
+		return ret;
+	if (!found || pack_object_offset_fk != 1)
+		return set_error(db, VEX_META_MYSQL_ERR_SCHEMA,
+				 "pack_object_offsets must reference only pack_envelopes");
 	ret = query_one_u64(db, rebuild_request_lease_columns_sql,
 				    &rebuild_request_lease_columns, &found);
 	if (ret)

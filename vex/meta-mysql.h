@@ -183,7 +183,7 @@ const char *vex_meta_mysql_error(const struct vex_meta_mysql *db);
 
 int vex_meta_mysql_ping(struct vex_meta_mysql *db);
 
-/* Verify the fourteen Vex metadata tables and their payload-free key columns. */
+/* Verify the fifteen Vex metadata tables and their payload-free key columns. */
 int vex_meta_mysql_schema_check(struct vex_meta_mysql *db,
 				unsigned int *table_count);
 

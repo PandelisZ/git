@@ -164,6 +164,21 @@ CREATE TABLE IF NOT EXISTS pack_objects (
 		REFERENCES objects (repo_id, oid)
 ) ENGINE=InnoDB;
 
+-- A pack-level worker may record OID byte offsets without treating the pack
+-- as an object payload store.  This map deliberately references only its
+-- immutable envelope: raw receive packs need to remain indexable before (or
+-- without) materializing every member as an `objects` row.
+CREATE TABLE IF NOT EXISTS pack_object_offsets (
+	repo_id BINARY(16) NOT NULL,
+	pack_id BINARY(32) NOT NULL,
+	oid BINARY(32) NOT NULL,
+	pack_offset BIGINT UNSIGNED NOT NULL,
+	PRIMARY KEY (repo_id, pack_id, oid),
+	KEY pack_object_offsets_lookup (repo_id, oid, pack_id),
+	CONSTRAINT pack_object_offsets_pack_fk FOREIGN KEY (repo_id, pack_id)
+		REFERENCES pack_envelopes (repo_id, pack_id)
+) ENGINE=InnoDB;
+
 -- The receive pack's object map is intentionally separate from pack_objects:
 -- the latter has an FK to objects and therefore represents only derived
 -- cache packs.  This table lets one bulk metadata import record a raw pack's
