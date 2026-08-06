@@ -638,6 +638,17 @@ int vex_meta_mysql_state_load(struct vex_meta_mysql *db, const char *repo_id,
 	return mysql_unavailable();
 }
 
+int vex_meta_mysql_state_load_refs(struct vex_meta_mysql *db, const char *repo_id,
+				    const struct git_hash_algo *hash_algo,
+				    struct vex_meta_state *state)
+{
+	(void)db;
+	(void)repo_id;
+	(void)hash_algo;
+	(void)state;
+	return mysql_unavailable();
+}
+
 int vex_meta_mysql_state_save_locked(struct vex_meta_mysql *db,
 				      const char *repo_id,
 				      const struct git_hash_algo *hash_algo,
@@ -4879,6 +4890,27 @@ out:
 	return ret;
 }
 
+int vex_meta_mysql_state_load_refs(struct vex_meta_mysql *db, const char *repo_id,
+				    const struct git_hash_algo *hash_algo,
+				    struct vex_meta_state *state)
+{
+	char *repo = NULL;
+	int ret;
+
+	if (!db || !db->mysql || !repo_id || !hash_algo || !state)
+		return VEX_META_MYSQL_ERR_INVALID;
+	repo = sql_repo_literal(repo_id, NULL);
+	if (!repo)
+		return set_error(db, VEX_META_MYSQL_ERR_INVALID,
+				 "invalid Vex repository UUID");
+	vex_meta_state_init(state);
+	if ((ret = state_verify_repository(db, repo, hash_algo)) ||
+	    (ret = state_load_refs(db, repo, hash_algo, state)))
+		vex_meta_state_release(state);
+	free(repo);
+	return ret;
+}
+
 static int state_update_target_from_row(const char *oid,
 					unsigned long oid_length,
 					const char *symref,
@@ -7108,6 +7140,17 @@ int vex_meta_mysql_state_refresh_receive_heartbeat_locked(
 int vex_meta_mysql_state_load(struct vex_meta_mysql *db, const char *repo_id,
 			       const struct git_hash_algo *hash_algo,
 			       struct vex_meta_state *state)
+{
+	(void)repo_id;
+	(void)hash_algo;
+	(void)state;
+	return set_error(db, VEX_META_MYSQL_ERR_STATE,
+			 "Vex MySQL store adapter was not compiled into this binary");
+}
+
+int vex_meta_mysql_state_load_refs(struct vex_meta_mysql *db, const char *repo_id,
+				    const struct git_hash_algo *hash_algo,
+				    struct vex_meta_state *state)
 {
 	(void)repo_id;
 	(void)hash_algo;

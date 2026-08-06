@@ -341,6 +341,15 @@ static int meta_load(struct vex_store *store, struct vex_meta_state *state)
 	return vex_meta_fs_load(store->meta, state);
 }
 
+/* Ref reads need neither object reachability nor ref-audit history. */
+static int meta_load_refs(struct vex_store *store, struct vex_meta_state *state)
+{
+	if (store->backend == VEX_STORE_BACKEND_MYSQL_S3)
+		return meta_mysql_result(vex_meta_mysql_state_load_refs(
+				store->meta_mysql, store->repo_id, store->hash_algo, state));
+	return meta_load(store, state);
+}
+
 static int meta_save_locked(struct vex_store *store,
 				    struct vex_meta_lock *lock,
 				    const struct vex_meta_state *state)
@@ -3485,7 +3494,7 @@ int vex_ref_read(struct vex_store *store, const char *refname, struct vex_ref *r
 	if (!store || !refname || !ref)
 		return VEX_STORE_ERR_INVALID;
 	memset(ref, 0, sizeof(*ref));
-	if ((ret = meta_load(store, &state)))
+	if ((ret = meta_load_refs(store, &state)))
 		return ret;
 	found = find_ref(&state, refname);
 	if (!found) {
@@ -3534,7 +3543,7 @@ int vex_ref_iterate(struct vex_store *store, const char *prefix,
 		return VEX_STORE_ERR_INVALID;
 	if (!prefix)
 		prefix = "";
-	if ((ret = meta_load(store, &state)))
+	if ((ret = meta_load_refs(store, &state)))
 		return ret;
 	ALLOC_ARRAY(refs, state.refs_nr);
 	for (i = 0; i < state.refs_nr; i++)

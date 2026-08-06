@@ -495,6 +495,10 @@ int vex_meta_mysql_state_commit_locked(struct vex_meta_mysql *db);
 int vex_meta_mysql_state_load(struct vex_meta_mysql *db, const char *repo_id,
 			       const struct git_hash_algo *hash_algo,
 			       struct vex_meta_state *state);
+/* Load just the public ref projection for read-only ref backend operations. */
+int vex_meta_mysql_state_load_refs(struct vex_meta_mysql *db, const char *repo_id,
+				    const struct git_hash_algo *hash_algo,
+				    struct vex_meta_state *state);
 int vex_meta_mysql_state_save_locked(struct vex_meta_mysql *db,
 				      const char *repo_id,
 				      const struct git_hash_algo *hash_algo,
