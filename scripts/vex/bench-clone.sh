@@ -25,7 +25,7 @@ is retained for small local measurement smoke tests.
 Core options:
   --runs N                         measured clones per source (default: 5)
   --warmups N                      recorded warmups per source (default: 1)
-  --git-config FILE                private Git config (CA/auth, never persisted)
+  --git-config FILE                private Vex/disk Git config (CA/auth, never persisted)
   --compose-file FILE              Compose file to identify in the artifact
   --compose-project NAME           Compose project identity (default: vex)
   --seed-manifest FILE             immutable seed evidence to hash and attach
@@ -83,6 +83,7 @@ fetch_runs=''
 require_fetch_gate=0
 max_fetch_ratio=2.0
 restore_fetch_branch=1
+private_git_config=0
 
 case "${BENCH_INCLUDE_GITHUB:-}" in
 1|true|yes|on) include_github=1 ;;
@@ -357,6 +358,7 @@ if [ -n "$git_config" ]; then
 	git_config=$(CDPATH= cd -- "$(dirname -- "$git_config")" && pwd -P)/$(basename -- "$git_config")
 	export GIT_CONFIG_GLOBAL="$git_config"
 	export GIT_CONFIG_NOSYSTEM=1
+	private_git_config=1
 fi
 if [ ! -f "$compose_file" ]; then
 	die "--compose-file is not a file: $compose_file"
@@ -414,7 +416,8 @@ python3 - "$stock_git" "$origin" "$disk_source" "$disk_kind" "$branch" \
 	"$compose_project" "$seed_manifest" "$fixture" "$include_github" \
 	"$github_origin" "$require_disk_gate" "$require_github" "$require_stable" \
 	"$max_disk_ratio" "$max_github_ratio" "$max_cv_percent" "$fetch_after_push" \
-	"$fetch_runs" "$require_fetch_gate" "$max_fetch_ratio" "$restore_fetch_branch" <<'PY'
+	"$fetch_runs" "$require_fetch_gate" "$max_fetch_ratio" "$restore_fetch_branch" \
+	"$private_git_config" <<'PY'
 import hashlib
 import json
 import math
@@ -461,6 +464,7 @@ from urllib.parse import urlsplit, urlunsplit
 	require_fetch_text,
 	max_fetch_ratio_text,
 	restore_fetch_text,
+	private_git_config_text,
 ) = sys.argv[1:]
 
 runs = int(runs_text)
@@ -473,6 +477,7 @@ fetch_after_push = fetch_after_push_text == "1"
 fetch_runs = int(fetch_runs_text)
 require_fetch_gate = require_fetch_text == "1"
 restore_fetch_branch = restore_fetch_text == "1"
+private_git_config = private_git_config_text == "1"
 max_disk_ratio = float(max_disk_ratio_text)
 max_github_ratio = float(max_github_ratio_text)
 max_cv_percent = float(max_cv_percent_text)
@@ -597,13 +602,58 @@ def command_display(args: list[str]) -> list[str]:
 	return [redact_text(str(arg)) for arg in args]
 
 
-def run_checked(args: list[str], action: str, *, capture: bool = False) -> str:
+def github_control_environment() -> Optional[dict[str, str]]:
+	"""Keep a supplied Vex CA/auth config out of public GitHub controls."""
+	if not (include_github and private_git_config):
+		return None
+
+	# `--git-config` is deliberately scoped to Vex and its disk control.  An
+	# explicit empty global config also prevents a command-scope config injected
+	# through GIT_CONFIG_COUNT from carrying an auth header into GitHub.
+	config = scratch / "github-control.gitconfig"
+	config.write_text("", encoding="utf-8")
+	config.chmod(0o600)
+	environment = os.environ.copy()
+	for name in list(environment):
+		if (
+			name in {
+				"GIT_ASKPASS",
+				"GIT_CONFIG_COUNT",
+				"GIT_CONFIG_GLOBAL",
+				"GIT_CONFIG_NOSYSTEM",
+				"GIT_CONFIG_PARAMETERS",
+				"GIT_CONFIG_SYSTEM",
+				"GIT_CREDENTIAL_HELPER",
+				"GIT_HTTP_EXTRA_HEADER",
+				"GIT_SSL_CAINFO",
+				"GIT_SSL_CAPATH",
+				"GIT_SSL_NO_VERIFY",
+				"GIT_TERMINAL_PROMPT",
+				"SSH_ASKPASS",
+			}
+			or name.startswith("GIT_CONFIG_KEY_")
+			or name.startswith("GIT_CONFIG_VALUE_")
+		):
+			environment.pop(name)
+	environment["GIT_CONFIG_GLOBAL"] = str(config)
+	environment["GIT_CONFIG_NOSYSTEM"] = "1"
+	environment["GIT_TERMINAL_PROMPT"] = "0"
+	return environment
+
+
+github_git_env = github_control_environment()
+
+
+def run_checked(
+	args: list[str], action: str, *, capture: bool = False, env: Optional[dict[str, str]] = None
+) -> str:
 	completed = subprocess.run(
 		args,
 		stdout=subprocess.PIPE if capture else subprocess.DEVNULL,
 		stderr=subprocess.PIPE,
 		text=True,
 		check=False,
+		env=env,
 	)
 	if completed.returncode:
 		stderr = redact_text(completed.stderr.strip())
@@ -694,11 +744,12 @@ def environment_identity() -> dict[str, object]:
 	}
 
 
-def remote_tip(source: str, label: str) -> str:
+def remote_tip(source: str, label: str, *, env: Optional[dict[str, str]] = None) -> str:
 	result = run_checked(
 		[stock_git, "ls-remote", source, refname],
 		"read {} benchmark ref".format(label),
 		capture=True,
+		env=env,
 	).strip().splitlines()
 	if len(result) != 1:
 		raise BenchmarkError(
@@ -766,6 +817,7 @@ def clone_once(
 	iteration: int,
 	expected_tip: str,
 	phase: str,
+	git_env: Optional[dict[str, str]] = None,
 ) -> dict[str, object]:
 	destination = scratch / "{}-{}-{}".format(phase, series, iteration + 1)
 	command = clone_command(source, source_kind, destination)
@@ -782,12 +834,13 @@ def clone_once(
 	}
 	started = time.perf_counter_ns()
 	try:
-		run_checked(command, "{} clone {}".format(series, iteration + 1))
+		run_checked(command, "{} clone {}".format(series, iteration + 1), env=git_env)
 		record["elapsed_ms"] = round((time.perf_counter_ns() - started) / 1_000_000, 3)
 		actual_tip = run_checked(
 			[stock_git, "-C", str(destination), "rev-parse", "HEAD"],
 			"verify {} clone {} tip".format(series, iteration + 1),
 			capture=True,
+			env=git_env,
 		).strip()
 		record["tip"] = actual_tip
 		if actual_tip != expected_tip:
@@ -799,6 +852,7 @@ def clone_once(
 		run_checked(
 			[stock_git, "-C", str(destination), "fsck", "--no-progress"],
 			"fsck {} clone {}".format(series, iteration + 1),
+			env=git_env,
 		)
 		record["fsck"] = "clean"
 		record["status"] = "passed"
@@ -1256,7 +1310,7 @@ try:
 		"disk_control": (disk_source, disk_kind),
 	}
 	if include_github:
-		github_tip = remote_tip(github_origin, "GitHub")
+		github_tip = remote_tip(github_origin, "GitHub", env=github_git_env)
 		payload["sources"]["github"]["ref_oid"] = github_tip
 		if github_tip != expected_tip:
 			raise BenchmarkError(
@@ -1270,7 +1324,15 @@ try:
 	for iteration in range(warmups_count):
 		for series, (source, source_kind) in series_sources.items():
 			warmups.append(
-				clone_once(series, source, source_kind, iteration, expected_tip, "warmup")
+				clone_once(
+					series,
+					source,
+					source_kind,
+					iteration,
+					expected_tip,
+					"warmup",
+					github_git_env if series == "github" else None,
+				)
 			)
 	payload["warmups"] = warmups
 
@@ -1283,14 +1345,22 @@ try:
 		for series in order:
 			source, source_kind = series_sources[series]
 			measured[series].append(
-				clone_once(series, source, source_kind, iteration, expected_tip, "measured")
+				clone_once(
+					series,
+					source,
+					source_kind,
+					iteration,
+					expected_tip,
+					"measured",
+					github_git_env if series == "github" else None,
+				)
 			)
 
 	if remote_tip(origin, "Vex") != expected_tip:
 		raise BenchmarkError("Vex benchmark ref {} changed while clone samples were collected".format(refname))
 	if source_tip(disk_source, disk_kind, "disk-control") != expected_tip:
 		raise BenchmarkError("disk-control benchmark ref {} changed while clone samples were collected".format(refname))
-	if include_github and remote_tip(github_origin, "GitHub") != expected_tip:
+	if include_github and remote_tip(github_origin, "GitHub", env=github_git_env) != expected_tip:
 		raise BenchmarkError("GitHub benchmark ref {} changed while clone samples were collected".format(refname))
 	payload["ref"]["stable_across_clone_measurement"] = True
 	payload["sample_order"] = sample_order
