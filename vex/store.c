@@ -392,6 +392,7 @@ static int meta_commit_locked(struct vex_store *store, struct vex_meta_lock *loc
 
 static int meta_ensure(struct vex_store *store)
 {
+	const char *repository_name;
 	int ret;
 
 	if (store->backend != VEX_STORE_BACKEND_MYSQL_S3)
@@ -409,8 +410,16 @@ static int meta_ensure(struct vex_store *store)
 		if (ret)
 			return ret;
 	}
+	/*
+	 * Smart-HTTP supplies this only after resolving a bounded, validated route.
+	 * Direct callers retain the historic unnamed-row behavior when it is absent.
+	 */
+	repository_name = getenv("GIT_VEX_REPOSITORY_NAME");
+	if (repository_name && !*repository_name)
+		repository_name = NULL;
 	return meta_mysql_result(vex_meta_mysql_ensure_repository(
-		store->meta_mysql, store->repo_id, store->hash_algo->name, NULL));
+		store->meta_mysql, store->repo_id, store->hash_algo->name,
+		repository_name));
 }
 
 static int load_locked(struct vex_store *store, struct vex_meta_lock *lock,

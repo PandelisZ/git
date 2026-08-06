@@ -93,16 +93,18 @@ if [ -e "$repo_path" ]; then
 	}
 	# Exercise the Vex ref store so gateway startup validates/migrates the
 	# shared schema before it marks subsequent CGI children schema-ready.
-	"$git_binary" --git-dir="$repo_path" for-each-ref --count=1 >/dev/null
+	GIT_VEX_REPOSITORY_NAME="$repo_name" \
+		"$git_binary" --git-dir="$repo_path" for-each-ref --count=1 >/dev/null
 	printf 'vex-init-mysql-s3-repo: Vex MySQL+S3 repository already exists: %s\n' "$repo_name"
 	exit 0
 fi
 
 mkdir -p "$(dirname "$repo_path")"
-GIT_REFERENCE_BACKEND="$expected_uri" \
+GIT_REFERENCE_BACKEND="$expected_uri" GIT_VEX_REPOSITORY_NAME="$repo_name" \
 	"$git_binary" init --bare --initial-branch=main --ref-format=vex "$repo_path" >/dev/null
 "$git_binary" --git-dir="$repo_path" config http.receivepack true
 "$git_binary" --git-dir="$repo_path" config daemon.export ok
-"$git_binary" --git-dir="$repo_path" for-each-ref --count=1 >/dev/null
+GIT_VEX_REPOSITORY_NAME="$repo_name" \
+	"$git_binary" --git-dir="$repo_path" for-each-ref --count=1 >/dev/null
 printf 'vex-init-mysql-s3-repo: initialized Vex MySQL+S3 repository %s (%s)\n' \
 	"$repo_name" "$expected_uri"

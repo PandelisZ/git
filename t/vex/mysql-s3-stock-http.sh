@@ -181,6 +181,14 @@ vex://????????????????????????????????)
 	;;
 esac
 
+repository_name=$("${compose[@]}" exec -T mysql \
+	mysql --protocol=TCP -h 127.0.0.1 -u "$MYSQL_USER" -p"$MYSQL_PASSWORD" -N -B "$MYSQL_DATABASE" \
+	-e "SELECT name FROM repositories WHERE repo_id = UNHEX('$repo_id');")
+[ "$repository_name" = "$repo_name" ] || {
+	printf 'vex mysql-s3 E2E: repository route name was not persisted in MySQL metadata\n' >&2
+	exit 1
+}
+
 ref_rows=$("${compose[@]}" exec -T mysql \
 	mysql --protocol=TCP -h 127.0.0.1 -u "$MYSQL_USER" -p"$MYSQL_PASSWORD" -N -B "$MYSQL_DATABASE" \
 	-e "SELECT COUNT(*) FROM refs WHERE repo_id = UNHEX('$repo_id') AND refname = 'refs/heads/main';")

@@ -542,6 +542,7 @@ def cgi_environment_for_repository(
         "GIT_ALTERNATE_OBJECT_DIRECTORIES",
         "GIT_REFERENCE_BACKEND",
         "GIT_VEX_GATEWAY_READ_READY",
+        "GIT_VEX_REPOSITORY_NAME",
     ):
         environ.pop(key, None)
 
@@ -549,6 +550,11 @@ def cgi_environment_for_repository(
         project_root = ROOT
         path_info = unquote(path)
         environ["GIT_REFERENCE_BACKEND"] = repository.uri
+        # `repository.name` came from the bounded, component-validated route
+        # resolver above. Preserve that canonical route as metadata for the
+        # Vex store, and never allow a listener-level environment value to
+        # name a different repository.
+        environ["GIT_VEX_REPOSITORY_NAME"] = repository.name
         # The gateway completed its schema/bucket readiness check before this
         # listener started.  A read-only upload-pack child may reuse that fact;
         # C retains metadata verification and direct callers/writers retain

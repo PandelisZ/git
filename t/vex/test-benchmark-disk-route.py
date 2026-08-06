@@ -47,6 +47,7 @@ def main() -> int:
     previous_run = gateway.subprocess.run
     previous_resolver = gateway.repository_for_path
     previous_reference_backend = os.environ.get("GIT_REFERENCE_BACKEND")
+    previous_repository_name = os.environ.get("GIT_VEX_REPOSITORY_NAME")
     try:
         with tempfile.TemporaryDirectory(prefix="vex-benchmark-disk-route-") as directory:
             root = Path(directory)
@@ -59,6 +60,7 @@ def main() -> int:
             gateway.BENCH_DISK_ROOT = root
             gateway.subprocess.run = reader
             os.environ["GIT_REFERENCE_BACKEND"] = "vex://stale"
+            os.environ["GIT_VEX_REPOSITORY_NAME"] = "stale.git"
 
             repository, is_benchmark_namespace = gateway.repository_for_request(
                 gateway.BENCH_DISK_ROUTE + "/info/refs",
@@ -82,6 +84,7 @@ def main() -> int:
             assert disk_env["GIT_PROJECT_ROOT"] == str(root)
             assert disk_env["PATH_INFO"] == "/git-git-disk.git/info/refs"
             assert "GIT_REFERENCE_BACKEND" not in disk_env
+            assert "GIT_VEX_REPOSITORY_NAME" not in disk_env
 
             vex_repository = gateway.VexRepository(
                 name="fixture.git",
@@ -101,6 +104,7 @@ def main() -> int:
             assert vex_env["GIT_PROJECT_ROOT"] == str(gateway.ROOT)
             assert vex_env["PATH_INFO"] == "/fixture.git/info/refs"
             assert vex_env["GIT_REFERENCE_BACKEND"] == vex_repository.uri
+            assert vex_env["GIT_VEX_REPOSITORY_NAME"] == vex_repository.name
 
             # Reserved-but-invalid paths must stop at the benchmark boundary;
             # they must never become a normal Vex repository lookup.
@@ -138,6 +142,10 @@ def main() -> int:
             os.environ.pop("GIT_REFERENCE_BACKEND", None)
         else:
             os.environ["GIT_REFERENCE_BACKEND"] = previous_reference_backend
+        if previous_repository_name is None:
+            os.environ.pop("GIT_VEX_REPOSITORY_NAME", None)
+        else:
+            os.environ["GIT_VEX_REPOSITORY_NAME"] = previous_repository_name
     return 0
 
 
