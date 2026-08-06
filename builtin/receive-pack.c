@@ -2359,11 +2359,102 @@ static void push_header_arg(struct strvec *args, struct pack_header *hdr)
 		     ntohl(hdr->hdr_version), ntohl(hdr->hdr_entries));
 }
 
+/*
+ * index-pack writes exactly one fixed-width report before any optional
+ * progress/footer data: "pack\\t<oid>\\n" or "keep\\t<oid>\\n".  The
+ * receive-pack WAL path needs the pack id, rather than only the .keep path
+ * that index_pack_lockfile() returns for the regular object directory.
+ */
+static int read_index_pack_report(int fd, struct object_id *pack_id)
+{
+	char report[GIT_MAX_HEXSZ + 6];
+	const char *oid_hex;
+	const size_t len = the_hash_algo->hexsz + 6;
+
+	if (read_in_full(fd, report, len) != len || report[len - 1] != '\n')
+		return -1;
+	report[len - 1] = '\0';
+	if (!skip_prefix(report, "pack\t", &oid_hex) &&
+	    !skip_prefix(report, "keep\t", &oid_hex))
+		return -1;
+	if (strlen(oid_hex) != the_hash_algo->hexsz ||
+	    get_oid_hex_algop(oid_hex, pack_id, the_hash_algo))
+		return -1;
+	return 0;
+}
+
+static const char *unpack_vex_pack_wal(int err_fd, struct pack_header *hdr,
+				       struct child_process *child,
+				       struct odb_transaction *transaction,
+				       int fsck_objects)
+{
+	char hostname[HOST_NAME_MAX + 1];
+	struct strbuf objects_dir = STRBUF_INIT;
+	struct object_id pack_id;
+	int status;
+	int report_ok;
+
+	if (odb_vex_receive_transaction_prepare_pack_wal(transaction,
+						 &objects_dir))
+		return "unable to prepare Vex receive pack WAL";
+
+	strvec_pushl(&child->args, "index-pack", "--stdin", NULL);
+	push_header_arg(&child->args, hdr);
+	strvec_pushf(&child->env, "%s=%s", DB_ENVIRONMENT, objects_dir.buf);
+
+	if (xgethostname(hostname, sizeof(hostname)))
+		xsnprintf(hostname, sizeof(hostname), "localhost");
+	strvec_pushf(&child->args,
+		     "--keep=receive-pack Vex WAL %"PRIuMAX" on %s",
+		     (uintmax_t)getpid(), hostname);
+
+	if (!quiet && err_fd)
+		strvec_push(&child->args, "--show-resolving-progress");
+	if (use_sideband)
+		strvec_push(&child->args, "--report-end-of-input");
+	if (fsck_objects)
+		strvec_pushf(&child->args, "--strict%s", fsck_msg_types.buf);
+	if (!reject_thin)
+		strvec_push(&child->args, "--fix-thin");
+	if (max_input_size)
+		strvec_pushf(&child->args, "--max-input-size=%"PRIuMAX,
+			     (uintmax_t)max_input_size);
+	child->out = -1;
+	child->err = err_fd;
+	child->git_cmd = 1;
+	status = start_command(child);
+	if (status) {
+		strbuf_release(&objects_dir);
+		return "index-pack fork failed";
+	}
+
+	report_ok = !read_index_pack_report(child->out, &pack_id);
+	close(child->out);
+	child->out = -1;
+	status = finish_command(child);
+	if (!report_ok) {
+		strbuf_release(&objects_dir);
+		return "invalid index-pack output";
+	}
+	if (status) {
+		strbuf_release(&objects_dir);
+		return "index-pack abnormal exit";
+	}
+	if (odb_vex_receive_transaction_adopt_pack(transaction, objects_dir.buf,
+					     &pack_id)) {
+		strbuf_release(&objects_dir);
+		return "unable to adopt Vex receive pack WAL";
+	}
+	strbuf_release(&objects_dir);
+	return NULL;
+}
+
 static const char *unpack(int err_fd, struct shallow_info *si,
 			  struct odb_transaction *transaction)
 {
 	struct pack_header hdr;
 	const char *hdr_err;
+	const int vex_pack_wal = odb_vex_receive_pack_wal_enabled(transaction);
 	int status;
 	struct child_process child = CHILD_PROCESS_INIT;
 	int fsck_objects = (receive_fsck_objects >= 0
@@ -2386,6 +2477,10 @@ static const char *unpack(int err_fd, struct shallow_info *si,
 	}
 
 	odb_transaction_env(transaction, &child.env);
+
+	if (vex_pack_wal)
+		return unpack_vex_pack_wal(err_fd, &hdr, &child, transaction,
+					   fsck_objects);
 
 	/*
 	 * Vex stores canonical object bytes outside the thin gitdir.  index-pack
