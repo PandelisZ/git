@@ -355,13 +355,17 @@ static int run_curl_parallel(struct vex_blob_s3 *blob,
 
 	xsnprintf(parallel, sizeof(parallel), "%u", VEX_S3_BATCH_PARALLEL);
 	/*
-	 * Put global output controls before the config's `next` sections.  curl
-	 * otherwise restores its progress meter for later transfers and leaks
-	 * transport progress into receive-pack's smart-HTTP sideband.
+	 * curl 7.88 (the runtime version in the gateway image) can still write its
+	 * parallel progress meter after a config-file `next`, even with `silent`
+	 * set for each transfer.  Direct the whole batch transport diagnostic
+	 * stream away from Git's stderr: receive-pack must never forward a curl
+	 * progress line as smart-HTTP sideband output.  The caller gets a precise
+	 * success/failure result from curl's exit status, so this does not hide a
+	 * storage failure from the transaction.
 	 */
 	strvec_pushl(&curl.args, "curl", "--silent", "--show-error", "--fail",
-		     "--parallel", "--parallel-max", parallel, "--config",
-		     config_file->filename.buf, NULL);
+		     "--stderr", "/dev/null", "--parallel", "--parallel-max",
+		     parallel, "--config", config_file->filename.buf, NULL);
 	if (blob->ca_file)
 		strvec_pushl(&curl.args, "--cacert", blob->ca_file, NULL);
 	if (blob->insecure_tls)
