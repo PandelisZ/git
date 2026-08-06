@@ -20,7 +20,8 @@ usage: scripts/vex/seed-git-git.sh [--mirror PATH] [--upstream URL] [--refresh]
 Import a faithful git/git mirror into an already-active Vex MySQL+S3 Compose
 repository at git/git.git, make a matching local disk-control bare repository,
 seal the incoming immutable Vex pack/idx pair, write the passed raw-ingest
-receipt t/vex/out/seed-raw-ingest-receipt.json, and then write
+receipt t/vex/out/seed-raw-ingest-receipt.json, restore the normal gateway,
+ensure the full and default-clone derived S3 relay artifacts, and then write
 t/vex/out/seed-manifest.json.
 
 The import itself is a normal stock-Git HTTPS `push --mirror`. The first-pack
@@ -463,9 +464,8 @@ s3_object_bytes() {
 s3_object_exists() {
 	local object_key=$1
 
-	# This is a metadata-only final-key check. Keep it in raw_ingest so the
-	# availability gate proves the promoted S3 pair without charging a full pack
-	# body read to the server seed budget.
+	# This is a metadata-only final-key check. Callers can use it in the raw
+	# gate or after it, without charging any S3 body read to the seed workflow.
 	"${compose[@]}" run --rm --no-deps -T --entrypoint /bin/sh \
 		-e "VEX_MANIFEST_KEY=$object_key" minio-init -c '
 			set -eu
@@ -496,7 +496,9 @@ disk_control=$(absolute_path "$disk_control")
 
 scratch=$(mktemp -d "${TMPDIR:-/tmp}/vex-seed-git-git.XXXXXX")
 phase_timings_tsv="$scratch/phase-timings.tsv"
+derived_artifacts_tsv="$scratch/derived-artifacts.tsv"
 : >"$phase_timings_tsv"
+: >"$derived_artifacts_tsv"
 five_minute_seed_budget_seconds=300
 
 record_phase() {
@@ -655,6 +657,106 @@ try:
 finally:
     temporary.unlink(missing_ok=True)
 PY
+}
+
+current_sealed_generation() {
+	local generation
+
+	generation=$(mysql_query "
+		SELECT COALESCE(MAX(generation), 0)
+		  FROM generations
+		 WHERE repo_id = UNHEX('$repo_id')
+		   AND state = 'sealed';")
+	require_uint 'current sealed generation' "$generation"
+	[ "$generation" -gt 0 ] || die 'Vex repository has no sealed generation'
+	printf '%s\n' "$generation"
+}
+
+# Ensure one exact current-generation derived artifact without allowing a
+# previous seed run to silently make this run's raw receipt mean something
+# different.  This always runs after the raw receipt and normal gateway
+# restoration.  Full artifacts are deliberately preflight-reused: their
+# builder refuses to overwrite a content-addressed envelope, while the
+# narrower default-clone builder additionally has a duplicate-key no-op.
+ensure_derived_artifact() {
+	local label=$1 full_snapshot=$2 build_flag=$3
+	local current_generation rows outcome
+	local artifact_id artifact_generation artifact_key artifact_idx_key
+
+	current_generation=$(current_sealed_generation)
+	[ "$current_generation" = "$pack_generation" ] ||
+		die "sealed generation advanced before $label derived artifact ($current_generation != $pack_generation)"
+	rows=$(mysql_query "
+		SELECT COUNT(*)
+		  FROM pack_envelopes
+		 WHERE repo_id = UNHEX('$repo_id')
+		   AND source_kind = 'derived'
+		   AND state = 'sealed'
+		   AND receive_generation IS NULL
+		   AND is_full_snapshot = $full_snapshot
+		   AND covering_generation = $pack_generation
+		   AND pack_key IS NOT NULL
+		   AND idx_key IS NOT NULL;")
+	case "$rows" in
+	0)
+		VEX_COMPOSE_NO_BUILD=1 VEX_COMPOSE_ALREADY_UP=1 \
+			"$repo_root/scripts/vex/build-pack.sh" "$build_flag" git/git.git
+		outcome=built
+		;;
+	1)
+		outcome=reused
+		;;
+	*)
+		die "expected at most one $label derived artifact at generation $pack_generation, found $rows"
+		;;
+	esac
+
+	current_generation=$(current_sealed_generation)
+	[ "$current_generation" = "$pack_generation" ] ||
+		die "sealed generation advanced while ensuring $label derived artifact ($current_generation != $pack_generation)"
+	rows=$(mysql_query "
+		SELECT COUNT(*)
+		  FROM pack_envelopes
+		 WHERE repo_id = UNHEX('$repo_id')
+		   AND source_kind = 'derived'
+		   AND state = 'sealed'
+		   AND receive_generation IS NULL
+		   AND is_full_snapshot = $full_snapshot
+		   AND covering_generation = $pack_generation
+		   AND pack_key IS NOT NULL
+		   AND idx_key IS NOT NULL;")
+	[ "$rows" = 1 ] ||
+		die "expected exactly one $label derived artifact after ensure, found $rows"
+	IFS=$'\t' read -r artifact_id artifact_generation artifact_key artifact_idx_key <<EOF
+$(mysql_query "
+	SELECT LOWER(LEFT(HEX(pack_id), $source_oid_hex_length)), covering_generation,
+	       pack_key, idx_key
+	  FROM pack_envelopes
+	 WHERE repo_id = UNHEX('$repo_id')
+	   AND source_kind = 'derived'
+	   AND state = 'sealed'
+	   AND receive_generation IS NULL
+	   AND is_full_snapshot = $full_snapshot
+	   AND covering_generation = $pack_generation
+	 ORDER BY sealed_at DESC, pack_id
+	 LIMIT 1;")
+EOF
+	case "$artifact_id" in
+	????????????????????????????????????????|????????????????????????????????????????????????????????????????) ;;
+	*) die "$label derived artifact returned an invalid pack id: $artifact_id" ;;
+	esac
+	case "$artifact_id" in *[!0-9a-f]*) die "$label derived artifact id is not lowercase hexadecimal: $artifact_id" ;; esac
+	[ "$artifact_generation" = "$pack_generation" ] ||
+		die "$label derived artifact has the wrong generation: $artifact_generation"
+	[ "$artifact_key" = "git/v1/$repo_id/packs/$artifact_id.pack" ] ||
+		die "$label derived artifact has a non-canonical pack key: $artifact_key"
+	[ "$artifact_idx_key" = "git/v1/$repo_id/packs/$artifact_id.idx" ] ||
+		die "$label derived artifact has a non-canonical index key: $artifact_idx_key"
+	s3_object_exists "$artifact_key"
+	s3_object_exists "$artifact_idx_key"
+	printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+		"$label" "$outcome" "$artifact_id" "$artifact_generation" \
+		"$artifact_key" "$artifact_idx_key" >>"$derived_artifacts_tsv"
 }
 
 ensure_args=(--mirror "$mirror" --upstream "$upstream")
@@ -848,6 +950,21 @@ restore_gateway_limits || die 'git-http gateway limits could not be restored aft
 phase_finished_ns=$(monotonic_ns)
 record_phase gateway_restore "$phase_started_ns" "$phase_finished_ns"
 
+# The raw receipt above is the only five-minute claim.  Build/reuse the two
+# derived immutable relay shapes only after normal gateway limits are back:
+# the full snapshot preserves the general direct-relay path, and the smaller
+# heads/tags closure serves normal default clones without changing ref
+# advertisement or canonical raw-pack retention.
+phase_started_ns=$(monotonic_ns)
+ensure_derived_artifact full_snapshot TRUE --from-receive
+phase_finished_ns=$(monotonic_ns)
+record_phase derived_full_snapshot "$phase_started_ns" "$phase_finished_ns"
+
+phase_started_ns=$(monotonic_ns)
+ensure_derived_artifact default_clone FALSE --default-clone-from-receive
+phase_finished_ns=$(monotonic_ns)
+record_phase derived_default_clone "$phase_started_ns" "$phase_finished_ns"
+
 # A disk control is intentionally a separate bare repository: --no-local
 # prevents hardlink/reference shortcuts, and the documented full repack makes
 # the baseline's pack layout explicit and reproducible. It follows the raw
@@ -903,7 +1020,7 @@ python3 - "$manifest" "$source_refs" "$target_refs" \
 	"$pack_id" "$pack_key" "$idx_key" "$pack_object_count" "$pack_generation" \
 	"$pack_bytes" "$idx_bytes" "$pack_sha256" "$disk_control" "$disk_origin" "$images_tsv" \
 	"$compose_file" "${COMPOSE_PROJECT_NAME:-vex}" "$stock_git_version" "$phase_timings_tsv" \
-	"$raw_ingest_mode" "$five_minute_seed_budget_seconds" <<'PY'
+	"$raw_ingest_mode" "$five_minute_seed_budget_seconds" "$derived_artifacts_tsv" <<'PY'
 import hashlib
 import json
 import os
@@ -943,6 +1060,7 @@ from urllib.parse import urlsplit, urlunsplit
     phase_timings_name,
     raw_ingest_mode,
     raw_ingest_budget_seconds,
+    derived_artifacts_name,
 ) = sys.argv[1:]
 
 
@@ -999,6 +1117,50 @@ def load_phase_timings(path_name: str) -> dict[str, float]:
     return timings
 
 
+def load_derived_artifacts(path_name: str) -> dict[str, object]:
+    expected_shapes = {"full_snapshot": True, "default_clone": False}
+    artifacts: dict[str, object] = {}
+    expected_id_length = len(source_head_oid)
+    prefix = "git/v1/{}/packs/".format(repository_id)
+
+    for raw_line in Path(path_name).read_text(encoding="utf-8").splitlines():
+        fields = raw_line.split("\t")
+        if len(fields) != 6:
+            raise SystemExit("vex seed-git-git: invalid derived artifact record: {}".format(raw_line))
+        label, outcome, artifact_id, generation_text, pack_key, idx_key = fields
+        if label not in expected_shapes or label in artifacts:
+            raise SystemExit("vex seed-git-git: invalid duplicate derived artifact: {}".format(label))
+        if outcome not in {"built", "reused"}:
+            raise SystemExit("vex seed-git-git: invalid derived artifact outcome: {}".format(outcome))
+        if len(artifact_id) != expected_id_length or any(
+            char not in "0123456789abcdef" for char in artifact_id
+        ):
+            raise SystemExit("vex seed-git-git: invalid derived artifact id: {}".format(artifact_id))
+        try:
+            generation = int(generation_text)
+        except ValueError as error:
+            raise SystemExit("vex seed-git-git: invalid derived artifact generation") from error
+        if generation != int(pack_generation) or generation < 1:
+            raise SystemExit("vex seed-git-git: derived artifact generation does not match raw receipt")
+        if pack_key != prefix + artifact_id + ".pack" or idx_key != prefix + artifact_id + ".idx":
+            raise SystemExit("vex seed-git-git: derived artifact keys are non-canonical")
+        artifacts[label] = {
+            "covering_generation": generation,
+            "id": artifact_id,
+            "idx_key": idx_key,
+            "is_full_snapshot": expected_shapes[label],
+            "key": pack_key,
+            "outcome": outcome,
+            "s3_stat_verified": True,
+            "source_kind": "derived",
+            "state": "sealed",
+        }
+
+    if set(artifacts) != set(expected_shapes):
+        raise SystemExit("vex seed-git-git: missing derived artifact shape")
+    return artifacts
+
+
 disk_control = Path(disk_control_name)
 disk_pack_dir = disk_control / "objects" / "pack"
 disk_packs = []
@@ -1027,6 +1189,7 @@ for raw_line in Path(images_name).read_text(encoding="utf-8").splitlines():
 created_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 default_branch = source_head_ref[len("refs/heads/"):]
 phase_timings = load_phase_timings(phase_timings_name)
+derived_artifacts = load_derived_artifacts(derived_artifacts_name)
 
 payload = {
     "commit_count": int(source_commit_count),
@@ -1090,6 +1253,7 @@ payload = {
             "object_count": int(pack_object_count),
             "sha256": pack_sha256,
         },
+        "derived_artifacts": derived_artifacts,
         "repository": "git/git.git",
         "repository_id": repository_id,
         "refs": ref_facts(target_refs_name),
