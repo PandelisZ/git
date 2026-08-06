@@ -124,8 +124,10 @@ CREATE TABLE IF NOT EXISTS object_pins (
 		REFERENCES objects (repo_id, oid)
 ) ENGINE=InnoDB;
 
--- Immutable derived-pack metadata.  The bytes and idx/bitmap payloads use
--- blob keys; a pack never becomes a second object-byte source of truth.
+-- Immutable pack metadata.  Derived packs are an optional read cache; a
+-- `receive` envelope is a canonical S3 pack/idx pair for the narrow
+-- full-mirror seed path.  In either case, MySQL stores only keys and object
+-- metadata -- never a pack, index, or object payload.
 CREATE TABLE IF NOT EXISTS pack_envelopes (
 	repo_id BINARY(16) NOT NULL,
 	pack_id BINARY(32) NOT NULL,
@@ -134,11 +136,18 @@ CREATE TABLE IF NOT EXISTS pack_envelopes (
 	bitmap_key VARBINARY(512) NULL,
 	covering_generation BIGINT UNSIGNED NOT NULL,
 	state ENUM('building', 'sealed', 'obsolete', 'deleted') NOT NULL,
+	source_kind ENUM('derived', 'receive') NOT NULL DEFAULT 'derived',
+	-- Set only for a raw receive envelope, so recovery can find its epoch
+	-- without treating `covering_generation` as a derived-cache contract.
+	receive_generation BIGINT UNSIGNED NULL,
+	-- A raw incremental pack must never be selected as a complete clone seed.
+	is_full_snapshot BOOLEAN NOT NULL DEFAULT TRUE,
 	created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
 	sealed_at DATETIME(6) NULL,
 	obsolete_at DATETIME(6) NULL,
 	PRIMARY KEY (repo_id, pack_id),
 	KEY pack_envelopes_covering (repo_id, state, covering_generation),
+	KEY pack_envelopes_receive (repo_id, source_kind, state, receive_generation),
 	CONSTRAINT pack_envelopes_repo_fk FOREIGN KEY (repo_id)
 		REFERENCES repositories (repo_id)
 ) ENGINE=InnoDB;
@@ -153,6 +162,23 @@ CREATE TABLE IF NOT EXISTS pack_objects (
 		REFERENCES pack_envelopes (repo_id, pack_id),
 	CONSTRAINT pack_objects_object_fk FOREIGN KEY (repo_id, oid)
 		REFERENCES objects (repo_id, oid)
+) ENGINE=InnoDB;
+
+-- The receive pack's object map is intentionally separate from pack_objects:
+-- the latter has an FK to objects and therefore represents only derived
+-- cache packs.  This table lets one bulk metadata import record a raw pack's
+-- membership without writing 847k loose-object records.  Envelope state is
+-- the visibility bit for every member; offsets remain authoritative in .idx.
+CREATE TABLE IF NOT EXISTS received_pack_objects (
+	repo_id BINARY(16) NOT NULL,
+	pack_id BINARY(32) NOT NULL,
+	oid BINARY(32) NOT NULL,
+	obj_type TINYINT UNSIGNED NOT NULL,
+	size BIGINT UNSIGNED NOT NULL,
+	PRIMARY KEY (repo_id, pack_id, oid),
+	KEY received_pack_objects_lookup (repo_id, oid, pack_id),
+	CONSTRAINT received_pack_objects_pack_fk FOREIGN KEY (repo_id, pack_id)
+		REFERENCES pack_envelopes (repo_id, pack_id)
 ) ENGINE=InnoDB;
 
 -- A live upload-pack/cache reader leases one immutable pack while it may

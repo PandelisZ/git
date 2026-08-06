@@ -15,6 +15,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 
 static int hex_value(unsigned char c)
 {
@@ -302,6 +303,47 @@ int vex_meta_mysql_stage_objects(
 	return mysql_unavailable();
 }
 
+int vex_meta_mysql_receive_pack_stage_manifest(
+	struct vex_meta_mysql *db, const char *repo_id, uint64_t generation,
+	const struct git_hash_algo *hash_algo,
+	const struct vex_meta_mysql_receive_pack *pack,
+	const char *manifest_path, uint64_t expected_members)
+{
+	(void)db;
+	(void)repo_id;
+	(void)generation;
+	(void)hash_algo;
+	(void)pack;
+	(void)manifest_path;
+	(void)expected_members;
+	return mysql_unavailable();
+}
+
+int vex_meta_mysql_receive_pack_object_get_visible(
+	struct vex_meta_mysql *db, const char *repo_id,
+	const unsigned char *oid, size_t oid_len, uint64_t visible_generation,
+	struct vex_meta_mysql_receive_pack_object *object)
+{
+	(void)db;
+	(void)repo_id;
+	(void)oid;
+	(void)oid_len;
+	(void)visible_generation;
+	if (object)
+		memset(object, 0, sizeof(*object));
+	return mysql_unavailable();
+}
+
+void vex_meta_mysql_receive_pack_object_release(
+	struct vex_meta_mysql_receive_pack_object *object)
+{
+	if (!object)
+		return;
+	free(object->pack_key);
+	free(object->idx_key);
+	memset(object, 0, sizeof(*object));
+}
+
 int vex_meta_mysql_stage_commit_parents(
 	struct vex_meta_mysql *db, const char *repo_id,
 	const struct vex_meta_mysql_commit_parent *parents, size_t parents_nr)
@@ -381,6 +423,44 @@ int vex_meta_mysql_epoch_seal(struct vex_meta_mysql *db,
 	(void)db;
 	(void)repo_id;
 	(void)generation;
+	return mysql_unavailable();
+}
+
+int vex_meta_mysql_receive_pack_seal_locked(
+	struct vex_meta_mysql *db, const char *repo_id, uint64_t generation,
+	const struct git_hash_algo *hash_algo,
+	const struct vex_ref_update *updates, size_t updates_nr)
+{
+	(void)db;
+	(void)repo_id;
+	(void)generation;
+	(void)hash_algo;
+	(void)updates;
+	(void)updates_nr;
+	return mysql_unavailable();
+}
+
+int vex_meta_mysql_receive_pack_get_building_locked(
+	struct vex_meta_mysql *db, const char *repo_id, uint64_t generation,
+	unsigned char out_pack_id[VEX_META_MYSQL_OID_BYTES])
+{
+	(void)db;
+	(void)repo_id;
+	(void)generation;
+	if (out_pack_id)
+		memset(out_pack_id, 0, VEX_META_MYSQL_OID_BYTES);
+	return mysql_unavailable();
+}
+
+int vex_meta_mysql_receive_pack_abort_locked(
+	struct vex_meta_mysql *db, const char *repo_id, uint64_t generation,
+	unsigned char out_pack_id[VEX_META_MYSQL_OID_BYTES])
+{
+	(void)db;
+	(void)repo_id;
+	(void)generation;
+	if (out_pack_id)
+		memset(out_pack_id, 0, VEX_META_MYSQL_OID_BYTES);
 	return mysql_unavailable();
 }
 
@@ -952,6 +1032,7 @@ int vex_meta_mysql_open(struct vex_meta_mysql **out,
 			const struct vex_meta_mysql_options *opts)
 {
 	struct vex_meta_mysql *db;
+	unsigned int local_infile = 1;
 
 	if (!out || !opts || !opts->user || !opts->database)
 		return VEX_META_MYSQL_ERR_INVALID;
@@ -963,6 +1044,20 @@ int vex_meta_mysql_open(struct vex_meta_mysql **out,
 	if (!db->mysql) {
 		free(db);
 		return VEX_META_MYSQL_ERR_NOMEM;
+	}
+	/*
+	 * The direct receive-pack path bulk-loads a trusted local manifest into a
+	 * temporary table.  Enable only the client capability here; the server
+	 * still independently controls local_infile and rejects it unless the
+	 * deployment deliberately enables the feature.
+	 */
+	if (mysql_options(db->mysql, MYSQL_OPT_LOCAL_INFILE, &local_infile)) {
+		set_error(db, VEX_META_MYSQL_ERR_CONNECT,
+			  "MySQL LOCAL INFILE client setup failed: %s",
+			  mysql_error(db->mysql));
+		mysql_close(db->mysql);
+		free(db);
+		return VEX_META_MYSQL_ERR_CONNECT;
 	}
 	/* Keep one explicit connection per metadata transaction; do not reconnect
 	 * underneath an in-flight epoch or ref CAS. */
@@ -1151,6 +1246,119 @@ static int ensure_sweep_tombstones_table(struct vex_meta_mysql *db)
 }
 
 /*
+ * A raw receive pack has a different retention contract from a derived pack:
+ * its S3 pair is canonical for the narrow full-mirror seed, so its members
+ * must not be forced through objects/generation_objects just to make a pack
+ * selectable.  Keep this additive migration in the driver for existing
+ * Compose volumes as well as schema.sql for fresh databases.
+ */
+static int ensure_receive_pack_schema(struct vex_meta_mysql *db)
+{
+	static const char lock_sql[] =
+		"SELECT GET_LOCK('vex-schema-receive-pack-v1', 5)";
+	static const char unlock_sql[] =
+		"SELECT RELEASE_LOCK('vex-schema-receive-pack-v1')";
+	static const char source_kind_column_sql[] =
+		"SELECT COUNT(*) FROM information_schema.columns "
+		"WHERE table_schema = DATABASE() AND table_name = 'pack_envelopes' "
+		"AND column_name = 'source_kind'";
+	static const char receive_generation_column_sql[] =
+		"SELECT COUNT(*) FROM information_schema.columns "
+		"WHERE table_schema = DATABASE() AND table_name = 'pack_envelopes' "
+		"AND column_name = 'receive_generation'";
+	static const char full_snapshot_column_sql[] =
+		"SELECT COUNT(*) FROM information_schema.columns "
+		"WHERE table_schema = DATABASE() AND table_name = 'pack_envelopes' "
+		"AND column_name = 'is_full_snapshot'";
+	static const char receive_index_sql[] =
+		"SELECT COUNT(DISTINCT index_name) FROM information_schema.statistics "
+		"WHERE table_schema = DATABASE() AND table_name = 'pack_envelopes' "
+		"AND index_name = 'pack_envelopes_receive'";
+	static const char add_source_kind_sql[] =
+		"ALTER TABLE pack_envelopes ADD COLUMN source_kind "
+		"ENUM('derived', 'receive') NOT NULL DEFAULT 'derived' AFTER state";
+	static const char add_receive_generation_sql[] =
+		"ALTER TABLE pack_envelopes ADD COLUMN receive_generation "
+		"BIGINT UNSIGNED NULL AFTER source_kind";
+	static const char add_full_snapshot_sql[] =
+		"ALTER TABLE pack_envelopes ADD COLUMN is_full_snapshot "
+		"BOOLEAN NOT NULL DEFAULT TRUE AFTER receive_generation";
+	static const char add_receive_index_sql[] =
+		"ALTER TABLE pack_envelopes ADD INDEX pack_envelopes_receive "
+		"(repo_id, source_kind, state, receive_generation)";
+	static const char create_received_objects_sql[] =
+		"CREATE TABLE IF NOT EXISTS received_pack_objects ("
+		"repo_id BINARY(16) NOT NULL, "
+		"pack_id BINARY(32) NOT NULL, "
+		"oid BINARY(32) NOT NULL, "
+		"obj_type TINYINT UNSIGNED NOT NULL, "
+		"size BIGINT UNSIGNED NOT NULL, "
+		"PRIMARY KEY (repo_id, pack_id, oid), "
+		"KEY received_pack_objects_lookup (repo_id, oid, pack_id), "
+		"CONSTRAINT received_pack_objects_pack_fk "
+		"FOREIGN KEY (repo_id, pack_id) REFERENCES "
+		"pack_envelopes (repo_id, pack_id)"
+		") ENGINE=InnoDB";
+	uint64_t locked;
+	uint64_t columns;
+	uint64_t indexes;
+	uint64_t released;
+	int found;
+	int lock_found;
+	int release_found;
+	int ret;
+	int release_ret;
+
+	ret = query_one_u64(db, lock_sql, &locked, &lock_found);
+	if (ret)
+		return ret;
+	if (!lock_found || locked != 1)
+		return set_error(db, VEX_META_MYSQL_ERR_CONFLICT,
+				 "timed out acquiring receive-pack schema migration lock");
+
+	ret = query_one_u64(db, source_kind_column_sql, &columns, &found);
+	if (!ret && (!found || columns > 1))
+		ret = set_error(db, VEX_META_MYSQL_ERR_SCHEMA,
+				"invalid Vex receive-pack source_kind schema");
+	if (!ret && !columns)
+		ret = mysql_exec(db, add_source_kind_sql);
+	if (!ret)
+		ret = query_one_u64(db, receive_generation_column_sql, &columns,
+					    &found);
+	if (!ret && (!found || columns > 1))
+		ret = set_error(db, VEX_META_MYSQL_ERR_SCHEMA,
+				"invalid Vex receive-pack generation schema");
+	if (!ret && !columns)
+		ret = mysql_exec(db, add_receive_generation_sql);
+	if (!ret)
+		ret = query_one_u64(db, full_snapshot_column_sql, &columns, &found);
+	if (!ret && (!found || columns > 1))
+		ret = set_error(db, VEX_META_MYSQL_ERR_SCHEMA,
+				"invalid Vex receive-pack snapshot schema");
+	if (!ret && !columns)
+		ret = mysql_exec(db, add_full_snapshot_sql);
+	if (!ret)
+		ret = query_one_u64(db, receive_index_sql, &indexes, &found);
+	if (!ret && (!found || indexes > 1))
+		ret = set_error(db, VEX_META_MYSQL_ERR_SCHEMA,
+				"invalid Vex receive-pack envelope index");
+	if (!ret && !indexes)
+		ret = mysql_exec(db, add_receive_index_sql);
+	if (!ret)
+		ret = mysql_exec(db, create_received_objects_sql);
+
+	release_ret = query_one_u64(db, unlock_sql, &released, &release_found);
+	if (!ret && (release_ret || !release_found || released != 1)) {
+		if (release_ret)
+			ret = release_ret;
+		else
+			ret = set_error(db, VEX_META_MYSQL_ERR_STATE,
+					"lost receive-pack schema migration lock");
+	}
+	return ret;
+}
+
+/*
  * Existing Compose volumes predate live receive heartbeats.  Keep this
  * additive migration here as well as schema.sql so a normal gateway restart
  * gains the protection without resetting durable repository metadata.
@@ -1208,7 +1416,8 @@ int vex_meta_mysql_schema_check(struct vex_meta_mysql *db,
 		"('repositories','generations','objects','generation_objects',"
 		"'commit_parents','refs','ref_updates','object_pins',"
 		"'pack_envelopes','pack_objects','clone_leases',"
-		"'pack_rebuild_requests','object_sweep_tombstones')";
+		"'received_pack_objects','pack_rebuild_requests',"
+		"'object_sweep_tombstones')";
 	static const char blob_key_sql[] =
 		"SELECT COUNT(*) FROM information_schema.columns "
 		"WHERE table_schema = DATABASE() AND table_name = 'objects' "
@@ -1217,9 +1426,25 @@ int vex_meta_mysql_schema_check(struct vex_meta_mysql *db,
 		"SELECT COUNT(*) FROM information_schema.columns "
 		"WHERE table_schema = DATABASE() AND table_name = 'generations' "
 		"AND column_name = 'receive_heartbeat_at' AND data_type = 'datetime'";
+	static const char receive_columns_sql[] =
+		"SELECT COUNT(*) FROM information_schema.columns "
+		"WHERE table_schema = DATABASE() AND table_name = 'pack_envelopes' "
+		"AND ((column_name = 'source_kind' AND data_type = 'enum') OR "
+		"(column_name = 'receive_generation' AND data_type = 'bigint') OR "
+		"(column_name = 'is_full_snapshot' AND data_type = 'tinyint'))";
+	static const char received_object_columns_sql[] =
+		"SELECT COUNT(*) FROM information_schema.columns "
+		"WHERE table_schema = DATABASE() AND table_name = 'received_pack_objects' "
+		"AND ((column_name = 'repo_id' AND data_type = 'binary') OR "
+		"(column_name = 'pack_id' AND data_type = 'binary') OR "
+		"(column_name = 'oid' AND data_type = 'binary') OR "
+		"(column_name = 'obj_type' AND data_type = 'tinyint') OR "
+		"(column_name = 'size' AND data_type = 'bigint'))";
 	uint64_t tables;
 	uint64_t blob_key;
 	uint64_t heartbeat;
+	uint64_t receive_columns;
+	uint64_t received_object_columns;
 	int found;
 	int ret;
 
@@ -1237,14 +1462,17 @@ int vex_meta_mysql_schema_check(struct vex_meta_mysql *db,
 	ret = ensure_sweep_tombstones_table(db);
 	if (ret)
 		return ret;
+	ret = ensure_receive_pack_schema(db);
+	if (ret)
+		return ret;
 	ret = query_one_u64(db, table_sql, &tables, &found);
 	if (ret)
 		return ret;
-	if (!found || tables != 13) {
+	if (!found || tables != 14) {
 		if (table_count)
 			*table_count = found && tables <= UINT_MAX ? tables : 0;
 		return set_error(db, VEX_META_MYSQL_ERR_SCHEMA,
-				 "expected 13 Vex metadata tables, found %" PRIu64,
+				 "expected 14 Vex metadata tables, found %" PRIu64,
 				 found ? tables : 0);
 	}
 	ret = query_one_u64(db, blob_key_sql, &blob_key, &found);
@@ -1259,6 +1487,19 @@ int vex_meta_mysql_schema_check(struct vex_meta_mysql *db,
 	if (!found || heartbeat != 1)
 		return set_error(db, VEX_META_MYSQL_ERR_SCHEMA,
 				 "generations.receive_heartbeat_at is not durable datetime metadata");
+	ret = query_one_u64(db, receive_columns_sql, &receive_columns, &found);
+	if (ret)
+		return ret;
+	if (!found || receive_columns != 3)
+		return set_error(db, VEX_META_MYSQL_ERR_SCHEMA,
+				 "pack_envelopes receive metadata schema is incomplete");
+	ret = query_one_u64(db, received_object_columns_sql,
+				    &received_object_columns, &found);
+	if (ret)
+		return ret;
+	if (!found || received_object_columns != 5)
+		return set_error(db, VEX_META_MYSQL_ERR_SCHEMA,
+				 "received_pack_objects metadata schema is incomplete");
 	ret = ensure_ref_updates_id_index(db);
 	if (ret)
 		return ret;
@@ -1511,6 +1752,36 @@ int vex_meta_mysql_epoch_abort(struct vex_meta_mysql *db,
 				"cannot abort a non-open Vex generation");
 		goto out;
 	}
+
+	/* A raw receive map has no objects/generation_objects rows to clean up. */
+	sql = vex_format("DELETE rpo FROM received_pack_objects AS rpo "
+			 "INNER JOIN pack_envelopes AS p ON p.repo_id = rpo.repo_id "
+			 "AND p.pack_id = rpo.pack_id WHERE p.repo_id = %s "
+			 "AND p.source_kind = 'receive' AND p.state = 'building' "
+			 "AND p.receive_generation = %" PRIu64, repo, generation);
+	if (!sql) {
+		ret = set_error(db, VEX_META_MYSQL_ERR_NOMEM,
+				"could not allocate raw receive-pack compensation query");
+		goto out;
+	}
+	ret = mysql_exec(db, sql);
+	free(sql);
+	sql = NULL;
+	if (ret)
+		goto out;
+	sql = vex_format("DELETE FROM pack_envelopes WHERE repo_id = %s "
+			 "AND source_kind = 'receive' AND state = 'building' "
+			 "AND receive_generation = %" PRIu64, repo, generation);
+	if (!sql) {
+		ret = set_error(db, VEX_META_MYSQL_ERR_NOMEM,
+				"could not allocate raw receive-pack envelope compensation");
+		goto out;
+	}
+	ret = mysql_exec(db, sql);
+	free(sql);
+	sql = NULL;
+	if (ret)
+		goto out;
 
 	/*
 	 * First remove graph rows for objects which are solely claimed by this
@@ -3219,7 +3490,8 @@ static int for_each_oid_query(struct vex_meta_mysql *db, const char *repo_id,
 				"invalid Vex repository UUID");
 		goto out;
 	}
-	sql = vex_format(query_format, repo);
+	/* Some root sets UNION legacy and raw received-pack membership. */
+	sql = vex_format(query_format, repo, repo);
 	if (!sql) {
 		ret = set_error(db, VEX_META_MYSQL_ERR_NOMEM,
 				"could not allocate Vex %s query", context);
@@ -3266,10 +3538,17 @@ int vex_meta_mysql_for_each_active_pack_object(struct vex_meta_mysql *db,
 						void *cb_data)
 {
 	static const char query_format[] =
-		"SELECT DISTINCT po.oid FROM pack_envelopes AS p "
-		"INNER JOIN pack_objects AS po "
+		"SELECT DISTINCT roots.oid FROM ("
+		"SELECT po.oid FROM pack_envelopes AS p INNER JOIN pack_objects AS po "
 		"ON po.repo_id = p.repo_id AND po.pack_id = p.pack_id "
-		"WHERE p.repo_id = %s AND p.state = 'sealed' ORDER BY po.oid";
+		"WHERE p.repo_id = %s AND p.state = 'sealed' "
+		"UNION ALL "
+		"SELECT rpo.oid FROM pack_envelopes AS p "
+		"INNER JOIN received_pack_objects AS rpo "
+		"ON rpo.repo_id = p.repo_id AND rpo.pack_id = p.pack_id "
+		"WHERE p.repo_id = %s AND p.source_kind = 'receive' "
+		"AND p.state IN ('sealed', 'obsolete')"
+		") AS roots ORDER BY roots.oid";
 
 	return for_each_oid_query(db, repo_id, query_format, fn, cb_data,
 				  "MySQL active-pack root read failed");
@@ -3280,11 +3559,16 @@ int vex_meta_mysql_for_each_active_clone_lease_object(
 					vex_meta_mysql_oid_iter_fn fn, void *cb_data)
 {
 	static const char query_format[] =
-		"SELECT DISTINCT po.oid FROM clone_leases AS l "
-		"INNER JOIN pack_objects AS po "
+		"SELECT DISTINCT roots.oid FROM ("
+		"SELECT po.oid FROM clone_leases AS l INNER JOIN pack_objects AS po "
 		"ON po.repo_id = l.repo_id AND po.pack_id = l.pack_id "
 		"WHERE l.repo_id = %s AND l.expires_at > CURRENT_TIMESTAMP(6) "
-		"ORDER BY po.oid";
+		"UNION ALL "
+		"SELECT rpo.oid FROM clone_leases AS l "
+		"INNER JOIN received_pack_objects AS rpo "
+		"ON rpo.repo_id = l.repo_id AND rpo.pack_id = l.pack_id "
+		"WHERE l.repo_id = %s AND l.expires_at > CURRENT_TIMESTAMP(6)"
+		") AS roots ORDER BY roots.oid";
 
 	return for_each_oid_query(db, repo_id, query_format, fn, cb_data,
 				  "MySQL active-clone-lease root read failed");
@@ -3541,7 +3825,8 @@ int vex_meta_mysql_current_sealed_pack(struct vex_meta_mysql *db,
 	sql = vex_format("SELECT p.pack_id, p.pack_key, p.idx_key, "
 			 "p.covering_generation FROM pack_envelopes AS p "
 			 "WHERE p.repo_id = %s AND p.state = 'sealed' "
-			 "AND p.idx_key IS NOT NULL AND p.covering_generation = "
+			 "AND p.is_full_snapshot = TRUE AND p.idx_key IS NOT NULL "
+			 "AND p.covering_generation = "
 			 "(SELECT MAX(g.generation) FROM generations AS g "
 			 "WHERE g.repo_id = %s AND g.state = 'sealed') "
 			 "ORDER BY p.sealed_at DESC, p.pack_id LIMIT 1",
@@ -3609,7 +3894,7 @@ void vex_meta_mysql_pack_release(struct vex_meta_mysql_pack *pack)
 }
 
 static int state_verify_repository(struct vex_meta_mysql *db, const char *repo,
-				   const struct git_hash_algo *hash_algo)
+			   const struct git_hash_algo *hash_algo)
 {
 	char *sql = NULL;
 	char value[32];
@@ -3630,6 +3915,422 @@ static int state_verify_repository(struct vex_meta_mysql *db, const char *repo,
 		return set_error(db, VEX_META_MYSQL_ERR_CONFLICT,
 				 "Vex repository hash algorithm does not match store");
 	return VEX_META_MYSQL_OK;
+}
+
+static int receive_pack_manifest_path_valid(struct vex_meta_mysql *db,
+					    const char *manifest_path)
+{
+	struct stat st;
+
+	/* LOCAL INFILE must never be a general-purpose server-side file reader. */
+	if (!manifest_path || manifest_path[0] != '/' ||
+	    strpbrk(manifest_path, "\r\n"))
+		return set_error(db, VEX_META_MYSQL_ERR_INVALID,
+				 "Vex receive manifest must be an absolute safe path");
+	if (lstat(manifest_path, &st) || !S_ISREG(st.st_mode))
+		return set_error(db, VEX_META_MYSQL_ERR_INVALID,
+				 "Vex receive manifest must be a regular non-symlink file");
+	return VEX_META_MYSQL_OK;
+}
+
+static int receive_pack_manifest_count(struct vex_meta_mysql *db,
+				       uint64_t *members)
+{
+	int found;
+	int ret;
+
+	ret = query_one_u64(db, "SELECT COUNT(*) FROM vex_receive_pack_manifest",
+			    members, &found);
+	if (ret)
+		return ret;
+	if (!found)
+		return set_error(db, VEX_META_MYSQL_ERR,
+				 "MySQL did not return Vex receive manifest count");
+	return VEX_META_MYSQL_OK;
+}
+
+/*
+ * Import the metadata-only object map for a first full mirror.  The local
+ * pack/idx pair has already been validated and staged in S3; this method
+ * receives only a trusted TSV manifest and never reads Git payload bytes.
+ */
+int vex_meta_mysql_receive_pack_stage_manifest(
+	struct vex_meta_mysql *db, const char *repo_id, uint64_t generation,
+	const struct git_hash_algo *hash_algo,
+	const struct vex_meta_mysql_receive_pack *pack,
+	const char *manifest_path, uint64_t expected_members)
+{
+	static const char create_manifest_table_sql[] =
+		"CREATE TEMPORARY TABLE vex_receive_pack_manifest ("
+		"oid_hex VARBINARY(64) NOT NULL, "
+		"obj_type_text VARBINARY(8) NOT NULL, "
+		"size_text VARBINARY(32) NOT NULL, "
+		"PRIMARY KEY (oid_hex)"
+		") ENGINE=InnoDB";
+	static const char *const seed_tables[] = {
+		"refs", "objects", "pack_envelopes",
+	};
+	char *repo = NULL;
+	char *pack_id = NULL;
+	char *pack_key = NULL;
+	char *idx_key = NULL;
+	char *manifest = NULL;
+	char *sql = NULL;
+	unsigned char normalized_pack[VEX_META_MYSQL_OID_BYTES];
+	uint64_t members;
+	uint64_t invalid_rows;
+	uint64_t count;
+	int found;
+	int in_transaction = 0;
+	int temp_table = 0;
+	int ret = VEX_META_MYSQL_ERR;
+	size_t table_i;
+
+	if (!db || !db->mysql || db->state_transaction || !generation ||
+	    !hash_algo || (hash_algo->rawsz != 20 && hash_algo->rawsz != 32) ||
+	    !pack || !pack->full_snapshot || !expected_members ||
+	    !pack->pack_key || !*pack->pack_key || !pack->idx_key || !*pack->idx_key ||
+	    strlen(pack->pack_key) > 512 || strlen(pack->idx_key) > 512 ||
+	    normalize_oid(pack->pack_id, pack->pack_id_len, normalized_pack))
+		return VEX_META_MYSQL_ERR_INVALID;
+	if ((ret = receive_pack_manifest_path_valid(db, manifest_path)))
+		return ret;
+
+	repo = sql_repo_literal(repo_id, NULL);
+	pack_id = sql_hex_literal(normalized_pack, sizeof(normalized_pack));
+	pack_key = sql_quote(db, pack->pack_key);
+	idx_key = sql_quote(db, pack->idx_key);
+	manifest = sql_quote(db, manifest_path);
+	if (!repo || !pack_id || !pack_key || !idx_key || !manifest) {
+		ret = set_error(db, VEX_META_MYSQL_ERR_NOMEM,
+				"could not encode Vex receive-pack metadata");
+		goto out;
+	}
+
+	/* A connection-local table keeps LOAD DATA outside the repository lock. */
+	ret = mysql_exec(db, "DROP TEMPORARY TABLE IF EXISTS vex_receive_pack_manifest");
+	if (ret)
+		goto out;
+	ret = mysql_exec(db, create_manifest_table_sql);
+	if (ret)
+		goto out;
+	temp_table = 1;
+	sql = vex_format("LOAD DATA LOCAL INFILE %s INTO TABLE vex_receive_pack_manifest "
+			 "CHARACTER SET ascii FIELDS TERMINATED BY '\\t' ESCAPED BY '' "
+			 "LINES TERMINATED BY '\\n' (oid_hex, obj_type_text, size_text)",
+			 manifest);
+	if (!sql) {
+		ret = set_error(db, VEX_META_MYSQL_ERR_NOMEM,
+				"could not allocate Vex receive manifest bulk-load query");
+		goto out;
+	}
+	ret = mysql_exec(db, sql);
+	free(sql);
+	sql = NULL;
+	if (ret) {
+		ret = set_error(db, VEX_META_MYSQL_ERR,
+				"MySQL LOCAL INFILE receive manifest load failed: %s",
+				mysql_error(db->mysql));
+		goto out;
+	}
+
+	/* Reject loose parsing: accepted rows are exact canonical Git metadata. */
+	sql = vex_format("SELECT COUNT(*) FROM vex_receive_pack_manifest WHERE "
+			 "LENGTH(oid_hex) <> %u OR NOT REGEXP_LIKE("
+			 "CONVERT(oid_hex USING utf8mb4), '^[0-9a-f]+$', 'c') OR "
+			 "NOT REGEXP_LIKE(CONVERT(obj_type_text USING utf8mb4), "
+			 "'^[1-4]$', 'c') OR NOT REGEXP_LIKE("
+			 "CONVERT(size_text USING utf8mb4), '^[0-9]+$', 'c') OR "
+			 "LENGTH(size_text) > 20 OR "
+			 "(LENGTH(size_text) = 20 AND size_text > '18446744073709551615')",
+			 hash_algo->hexsz);
+	if (!sql) {
+		ret = set_error(db, VEX_META_MYSQL_ERR_NOMEM,
+				"could not allocate Vex receive manifest validation query");
+		goto out;
+	}
+	ret = query_one_u64(db, sql, &invalid_rows, &found);
+	free(sql);
+	sql = NULL;
+	if (ret)
+		goto out;
+	if (!found || invalid_rows) {
+		ret = set_error(db, VEX_META_MYSQL_ERR_INVALID,
+				"Vex receive manifest has invalid object metadata");
+		goto out;
+	}
+	if ((ret = receive_pack_manifest_count(db, &members)))
+		goto out;
+	if (members != expected_members) {
+		ret = set_error(db, VEX_META_MYSQL_ERR_CONFLICT,
+				"Vex receive manifest count does not match indexed pack");
+		goto out;
+	}
+
+	ret = mysql_begin(db);
+	if (ret)
+		goto out;
+	in_transaction = 1;
+	if ((ret = require_repository_locked(db, repo)) ||
+	    (ret = state_verify_repository(db, repo, hash_algo)))
+		goto out;
+
+	/* A committed retry is okay only for the identical still-building pair. */
+	sql = vex_format("SELECT COUNT(*) FROM pack_envelopes WHERE repo_id = %s "
+			 "AND pack_id = %s", repo, pack_id);
+	if (!sql) {
+		ret = set_error(db, VEX_META_MYSQL_ERR_NOMEM,
+				"could not allocate Vex receive-pack duplicate query");
+		goto out;
+	}
+	ret = query_one_u64(db, sql, &count, &found);
+	free(sql);
+	sql = NULL;
+	if (ret)
+		goto out;
+	if (!found) {
+		ret = set_error(db, VEX_META_MYSQL_ERR,
+				"MySQL did not return Vex receive-pack duplicate count");
+		goto out;
+	}
+	if (count) {
+		sql = vex_format("SELECT COUNT(*) FROM pack_envelopes WHERE repo_id = %s "
+			 "AND pack_id = %s AND state = 'building' AND source_kind = 'receive' "
+			 "AND receive_generation = %" PRIu64 " AND is_full_snapshot = TRUE "
+			 "AND pack_key = %s AND idx_key = %s", repo, pack_id, generation,
+			 pack_key, idx_key);
+		if (!sql) {
+			ret = set_error(db, VEX_META_MYSQL_ERR_NOMEM,
+					"could not allocate Vex receive-pack retry query");
+			goto out;
+		}
+		ret = query_one_u64(db, sql, &count, &found);
+		free(sql);
+		sql = NULL;
+		if (ret)
+			goto out;
+		if (!found || count != 1) {
+			ret = set_error(db, VEX_META_MYSQL_ERR_CONFLICT,
+					"Vex receive pack identifier already has incompatible metadata");
+			goto out;
+		}
+		sql = vex_format("SELECT COUNT(*) FROM received_pack_objects WHERE "
+			 "repo_id = %s AND pack_id = %s", repo, pack_id);
+		if (!sql) {
+			ret = set_error(db, VEX_META_MYSQL_ERR_NOMEM,
+					"could not allocate Vex receive-pack retry member query");
+			goto out;
+		}
+		ret = query_one_u64(db, sql, &count, &found);
+		free(sql);
+		sql = NULL;
+		if (ret)
+			goto out;
+		if (!found || count != expected_members) {
+			ret = set_error(db, VEX_META_MYSQL_ERR_STATE,
+					"Vex receive pack retry has incomplete member metadata");
+			goto out;
+		}
+		ret = vex_mysql_commit(db);
+		if (!ret)
+			in_transaction = 0;
+		goto out;
+	}
+
+	/* First-seed gate: no existing ref/object/pack may make this incomplete. */
+	sql = vex_format("SELECT COUNT(*) FROM generations WHERE repo_id = %s "
+			 "AND generation = %" PRIu64 " AND state = 'open'", repo, generation);
+	if (!sql) {
+		ret = set_error(db, VEX_META_MYSQL_ERR_NOMEM,
+				"could not allocate Vex receive generation check");
+		goto out;
+	}
+	ret = query_one_u64(db, sql, &count, &found);
+	free(sql);
+	sql = NULL;
+	if (ret)
+		goto out;
+	if (!found || count != 1) {
+		ret = set_error(db, VEX_META_MYSQL_ERR_STATE,
+				"cannot stage a raw pack in a non-open Vex generation");
+		goto out;
+	}
+	for (table_i = 0; table_i < ARRAY_SIZE(seed_tables); table_i++) {
+		sql = vex_format("SELECT COUNT(*) FROM %s WHERE repo_id = %s", seed_tables[table_i],
+				 repo);
+		if (!sql) {
+			ret = set_error(db, VEX_META_MYSQL_ERR_NOMEM,
+					"could not allocate Vex full-seed emptiness check");
+			goto out;
+		}
+		ret = query_one_u64(db, sql, &count, &found);
+		free(sql);
+		sql = NULL;
+		if (ret)
+			goto out;
+		if (!found || count) {
+			ret = set_error(db, VEX_META_MYSQL_ERR_CONFLICT,
+					"raw receive-pack full snapshot requires an empty Vex repository");
+			goto out;
+		}
+	}
+
+	sql = vex_format("INSERT INTO pack_envelopes "
+			 "(repo_id, pack_id, pack_key, idx_key, bitmap_key, covering_generation, "
+			 "state, source_kind, receive_generation, is_full_snapshot) VALUES "
+			 "(%s, %s, %s, %s, NULL, %" PRIu64 ", 'building', 'receive', "
+			 "%" PRIu64 ", TRUE)", repo, pack_id, pack_key, idx_key,
+			 generation, generation);
+	if (!sql) {
+		ret = set_error(db, VEX_META_MYSQL_ERR_NOMEM,
+				"could not allocate Vex receive-pack envelope insert");
+		goto out;
+	}
+	ret = mysql_exec(db, sql);
+	free(sql);
+	sql = NULL;
+	if (ret)
+		goto out;
+
+	sql = vex_format("INSERT INTO received_pack_objects "
+			 "(repo_id, pack_id, oid, obj_type, size) SELECT %s, %s, %s, "
+			 "CAST(obj_type_text AS UNSIGNED), CAST(size_text AS UNSIGNED) "
+			 "FROM vex_receive_pack_manifest", repo, pack_id,
+			 hash_algo->rawsz == 20 ?
+			 "CONCAT(UNHEX(oid_hex), REPEAT(X'00', 12))" : "UNHEX(oid_hex)");
+	if (!sql) {
+		ret = set_error(db, VEX_META_MYSQL_ERR_NOMEM,
+				"could not allocate Vex receive-pack member bulk insert");
+		goto out;
+	}
+	ret = mysql_exec(db, sql);
+	free(sql);
+	sql = NULL;
+	if (ret)
+		goto out;
+	if (mysql_affected_rows(db->mysql) != expected_members) {
+		ret = set_error(db, VEX_META_MYSQL_ERR_STATE,
+				"Vex receive pack inserted an unexpected number of members");
+		goto out;
+	}
+	ret = vex_mysql_commit(db);
+	if (!ret)
+		in_transaction = 0;
+
+out:
+	free(sql);
+	if (in_transaction)
+		vex_mysql_rollback(db);
+	if (temp_table)
+		(void)mysql_exec(db, "DROP TEMPORARY TABLE IF EXISTS vex_receive_pack_manifest");
+	free(manifest);
+	free(idx_key);
+	free(pack_key);
+	free(pack_id);
+	free(repo);
+	return ret;
+}
+
+int vex_meta_mysql_receive_pack_object_get_visible(
+	struct vex_meta_mysql *db, const char *repo_id,
+	const unsigned char *oid, size_t oid_len, uint64_t visible_generation,
+	struct vex_meta_mysql_receive_pack_object *object)
+{
+	char *repo = NULL;
+	char *object_id = NULL;
+	char *sql = NULL;
+	MYSQL_RES *res = NULL;
+	MYSQL_ROW row;
+	unsigned long *lengths;
+	uint64_t object_type;
+	uint64_t size;
+	uint64_t generation;
+	char *pack_key = NULL;
+	char *idx_key = NULL;
+	int ret = VEX_META_MYSQL_ERR;
+
+	if (!db || !db->mysql || !object)
+		return VEX_META_MYSQL_ERR_INVALID;
+	memset(object, 0, sizeof(*object));
+	repo = sql_repo_literal(repo_id, NULL);
+	object_id = sql_oid_literal(oid, oid_len);
+	if (!repo || !object_id) {
+		ret = set_error(db, VEX_META_MYSQL_ERR_INVALID,
+				"invalid Vex received-pack object lookup");
+		goto out;
+	}
+	sql = vex_format("SELECT rpo.obj_type, rpo.size, p.pack_id, p.pack_key, "
+			 "p.idx_key, p.receive_generation FROM received_pack_objects AS rpo "
+			 "INNER JOIN pack_envelopes AS p ON p.repo_id = rpo.repo_id "
+			 "AND p.pack_id = rpo.pack_id WHERE rpo.repo_id = %s "
+			 "AND rpo.oid = %s AND (p.state IN ('sealed', 'obsolete') OR "
+			 "(p.state = 'building' AND p.receive_generation = %" PRIu64 ")) "
+			 "ORDER BY p.state = 'sealed' DESC, p.sealed_at DESC, p.pack_id LIMIT 1",
+			 repo, object_id, visible_generation);
+	if (!sql) {
+		ret = set_error(db, VEX_META_MYSQL_ERR_NOMEM,
+				"could not allocate Vex received-pack object lookup");
+		goto out;
+	}
+	ret = state_query_result(db, sql, &res);
+	if (ret)
+		goto out;
+	if (mysql_num_fields(res) != 6) {
+		ret = set_error(db, VEX_META_MYSQL_ERR,
+				"MySQL returned invalid Vex received-pack object metadata");
+		goto out;
+	}
+	row = mysql_fetch_row(res);
+	if (!row) {
+		ret = VEX_META_MYSQL_ERR_NOT_FOUND;
+		goto out;
+	}
+	lengths = mysql_fetch_lengths(res);
+	if (!row[0] || !row[1] || !row[2] || !row[3] || !row[4] || !row[5] ||
+	    !lengths || lengths[2] != VEX_META_MYSQL_OID_BYTES ||
+	    !lengths[3] || lengths[3] > 512 || !lengths[4] || lengths[4] > 512 ||
+	    parse_u64(row[0], &object_type) || object_type < 1 || object_type > 4 ||
+	    parse_u64(row[1], &size) || parse_u64(row[5], &generation) || !generation) {
+		ret = set_error(db, VEX_META_MYSQL_ERR,
+				"MySQL returned malformed Vex received-pack object metadata");
+		goto out;
+	}
+	pack_key = state_row_text(row[3], lengths[3]);
+	idx_key = state_row_text(row[4], lengths[4]);
+	if (!pack_key || !idx_key) {
+		ret = set_error(db, VEX_META_MYSQL_ERR,
+				"MySQL returned unsafe Vex received-pack keys");
+		goto out;
+	}
+	object->object_type = (unsigned int)object_type;
+	object->size = size;
+	object->generation = generation;
+	memcpy(object->pack_id, row[2], sizeof(object->pack_id));
+	object->pack_key = pack_key;
+	object->idx_key = idx_key;
+	pack_key = NULL;
+	idx_key = NULL;
+	ret = VEX_META_MYSQL_OK;
+
+out:
+	free(idx_key);
+	free(pack_key);
+	if (res)
+		mysql_free_result(res);
+	free(sql);
+	free(object_id);
+	free(repo);
+	return ret;
+}
+
+void vex_meta_mysql_receive_pack_object_release(
+	struct vex_meta_mysql_receive_pack_object *object)
+{
+	if (!object)
+		return;
+	free(object->pack_key);
+	free(object->idx_key);
+	memset(object, 0, sizeof(*object));
 }
 
 int vex_meta_mysql_state_lock(struct vex_meta_mysql *db, const char *repo_id)
@@ -4961,6 +5662,432 @@ static int state_target_literals(struct vex_meta_mysql *db,
 	return VEX_META_MYSQL_OK;
 }
 
+static int receive_pack_find_building_sql_locked(
+		struct vex_meta_mysql *db, const char *repo, uint64_t generation,
+		unsigned char pack_id[VEX_META_MYSQL_OID_BYTES])
+{
+	char *sql = NULL;
+	MYSQL_RES *res = NULL;
+	MYSQL_ROW row;
+	unsigned long *lengths;
+	int ret = VEX_META_MYSQL_ERR;
+
+	memset(pack_id, 0, VEX_META_MYSQL_OID_BYTES);
+	sql = vex_format("SELECT pack_id FROM pack_envelopes WHERE repo_id = %s "
+			 "AND source_kind = 'receive' AND state = 'building' "
+			 "AND receive_generation = %" PRIu64 " "
+			 "AND is_full_snapshot = TRUE FOR UPDATE", repo, generation);
+	if (!sql)
+		return set_error(db, VEX_META_MYSQL_ERR_NOMEM,
+				 "could not allocate Vex building receive-pack query");
+	ret = state_query_result(db, sql, &res);
+	if (ret)
+		goto out;
+	if (mysql_num_fields(res) != 1) {
+		ret = set_error(db, VEX_META_MYSQL_ERR,
+				"MySQL returned invalid building receive-pack metadata");
+		goto out;
+	}
+	row = mysql_fetch_row(res);
+	if (!row) {
+		ret = VEX_META_MYSQL_ERR_NOT_FOUND;
+		goto out;
+	}
+	lengths = mysql_fetch_lengths(res);
+	if (!lengths || lengths[0] != VEX_META_MYSQL_OID_BYTES) {
+		ret = set_error(db, VEX_META_MYSQL_ERR,
+				"MySQL returned malformed building receive-pack identifier");
+		goto out;
+	}
+	memcpy(pack_id, row[0], VEX_META_MYSQL_OID_BYTES);
+	if (mysql_fetch_row(res)) {
+		ret = set_error(db, VEX_META_MYSQL_ERR_STATE,
+				"Vex generation has more than one building receive pack");
+		goto out;
+	}
+	ret = VEX_META_MYSQL_OK;
+
+out:
+	if (res)
+		mysql_free_result(res);
+	free(sql);
+	return ret;
+}
+
+int vex_meta_mysql_receive_pack_get_building_locked(
+	struct vex_meta_mysql *db, const char *repo_id, uint64_t generation,
+	unsigned char out_pack_id[VEX_META_MYSQL_OID_BYTES])
+{
+	char *repo = NULL;
+	int ret;
+
+	if (out_pack_id)
+		memset(out_pack_id, 0, VEX_META_MYSQL_OID_BYTES);
+	if (!db || !db->mysql || !db->state_transaction || !generation ||
+	    !out_pack_id)
+		return VEX_META_MYSQL_ERR_INVALID;
+	repo = sql_repo_literal(repo_id, NULL);
+	if (!repo)
+		return set_error(db, VEX_META_MYSQL_ERR_INVALID,
+				 "invalid Vex repository UUID for raw receive-pack lookup");
+	ret = receive_pack_find_building_sql_locked(db, repo, generation,
+					    out_pack_id);
+	free(repo);
+	return ret;
+}
+
+static int receive_pack_require_empty_refs_locked(struct vex_meta_mysql *db,
+						    const char *repo)
+{
+	char *sql;
+	uint64_t refs;
+	int found;
+	int ret;
+
+	sql = vex_format("SELECT COUNT(*) FROM refs WHERE repo_id = %s", repo);
+	if (!sql)
+		return set_error(db, VEX_META_MYSQL_ERR_NOMEM,
+				 "could not allocate Vex full-seed ref check");
+	ret = query_one_u64(db, sql, &refs, &found);
+	free(sql);
+	if (ret)
+		return ret;
+	if (!found)
+		return set_error(db, VEX_META_MYSQL_ERR,
+				 "MySQL did not return Vex full-seed ref count");
+	if (refs)
+		return set_error(db, VEX_META_MYSQL_ERR_CONFLICT,
+				 "raw receive-pack full snapshot requires zero existing refs");
+	return VEX_META_MYSQL_OK;
+}
+
+static int receive_pack_require_member_locked(struct vex_meta_mysql *db,
+					       const char *repo,
+					       const unsigned char pack_id[VEX_META_MYSQL_OID_BYTES],
+					       const struct object_id *oid,
+					       const struct git_hash_algo *hash_algo)
+{
+	char *pack = NULL;
+	char *object = NULL;
+	char *sql = NULL;
+	uint64_t members;
+	int found;
+	int ret;
+
+	pack = sql_hex_literal(pack_id, VEX_META_MYSQL_OID_BYTES);
+	object = state_oid_literal(oid, hash_algo);
+	if (!pack || !object) {
+		ret = set_error(db, VEX_META_MYSQL_ERR_INVALID,
+				"invalid Vex raw receive-pack ref target");
+		goto out;
+	}
+	sql = vex_format("SELECT COUNT(*) FROM received_pack_objects WHERE "
+			 "repo_id = %s AND pack_id = %s AND oid = %s", repo, pack, object);
+	if (!sql) {
+		ret = set_error(db, VEX_META_MYSQL_ERR_NOMEM,
+				"could not allocate Vex raw receive-pack membership query");
+		goto out;
+	}
+	ret = query_one_u64(db, sql, &members, &found);
+	if (ret)
+		goto out;
+	if (!found || members != 1)
+		ret = set_error(db, VEX_META_MYSQL_ERR_NOT_FOUND,
+				"Vex ref target is absent from the building receive pack");
+
+out:
+	free(sql);
+	free(object);
+	free(pack);
+	return ret;
+}
+
+static int receive_pack_seed_update_valid(struct vex_meta_mysql *db,
+					  const struct vex_ref_update *update)
+{
+	if (!update || !update->refname || !*update->refname ||
+	    strlen(update->refname) > 1024 ||
+	    update->old_target.type != VEX_REF_TARGET_NONE ||
+	    update->expected_version || update->new_target.type != VEX_REF_TARGET_OID ||
+	    (update->actor && strlen(update->actor) > 255) ||
+	    (update->reason && strlen(update->reason) > 32) ||
+	    (update->message && strlen(update->message) > 1024) ||
+	    (update->is_fast_forward != -1 && update->is_fast_forward != 0 &&
+	     update->is_fast_forward != 1))
+		return set_error(db, VEX_META_MYSQL_ERR_INVALID,
+				 "raw receive-pack seed supports only new OID refs");
+	return VEX_META_MYSQL_OK;
+}
+
+static int receive_pack_insert_ref_locked(
+		struct vex_meta_mysql *db, const char *repo,
+		const struct vex_ref_update *update,
+		const struct git_hash_algo *hash_algo)
+{
+	char *refname = NULL;
+	char *object = NULL;
+	char *actor = NULL;
+	char *push_id = NULL;
+	char *reason = NULL;
+	char *message = NULL;
+	char *sql = NULL;
+	const char *is_ff;
+	int ret = VEX_META_MYSQL_ERR;
+
+	if ((ret = receive_pack_seed_update_valid(db, update)))
+		return ret;
+	refname = sql_quote(db, update->refname);
+	object = state_oid_literal(&update->new_target.oid, hash_algo);
+	actor = sql_quote(db, update->actor);
+	push_id = state_uuid_literal_or_null(update->push_id);
+	reason = sql_quote(db, update->reason ? update->reason : "receive seed");
+	message = sql_quote(db, update->message);
+	if (!refname || !object || !actor || !push_id || !reason || !message) {
+		ret = set_error(db, VEX_META_MYSQL_ERR_NOMEM,
+				"could not encode Vex raw receive-pack ref metadata");
+		goto out;
+	}
+	sql = vex_format("INSERT INTO refs "
+			 "(repo_id, refname, is_symbolic, target_oid, symref_target, "
+			 "peeled_oid, version) VALUES (%s, %s, FALSE, %s, NULL, NULL, 1)",
+			 repo, refname, object);
+	if (!sql) {
+		ret = set_error(db, VEX_META_MYSQL_ERR_NOMEM,
+				"could not allocate Vex raw receive-pack ref insert");
+		goto out;
+	}
+	ret = mysql_exec(db, sql);
+	free(sql);
+	sql = NULL;
+	if (ret)
+		goto out;
+	is_ff = update->is_fast_forward < 0 ? "NULL" :
+		(update->is_fast_forward ? "TRUE" : "FALSE");
+	sql = vex_format("INSERT INTO ref_updates "
+			 "(repo_id, refname, old_oid, new_oid, old_target, new_target, "
+			 "is_ff, actor, push_id, reason, message) VALUES "
+			 "(%s, %s, NULL, %s, NULL, NULL, %s, %s, %s, %s, %s)",
+			 repo, refname, object, is_ff, actor, push_id, reason, message);
+	if (!sql) {
+		ret = set_error(db, VEX_META_MYSQL_ERR_NOMEM,
+				"could not allocate Vex raw receive-pack ref audit insert");
+		goto out;
+	}
+	ret = mysql_exec(db, sql);
+
+out:
+	free(sql);
+	free(message);
+	free(reason);
+	free(push_id);
+	free(actor);
+	free(object);
+	free(refname);
+	return ret;
+}
+
+int vex_meta_mysql_receive_pack_seal_locked(
+	struct vex_meta_mysql *db, const char *repo_id, uint64_t generation,
+	const struct git_hash_algo *hash_algo,
+	const struct vex_ref_update *updates, size_t updates_nr)
+{
+	char *repo = NULL;
+	char *pack = NULL;
+	char *sql = NULL;
+	unsigned char pack_id[VEX_META_MYSQL_OID_BYTES];
+	uint64_t count;
+	int found;
+	int ret = VEX_META_MYSQL_ERR;
+	size_t i;
+
+	if (!db || !db->mysql || !db->state_transaction || !generation ||
+	    !hash_algo || (hash_algo->rawsz != 20 && hash_algo->rawsz != 32) ||
+	    (!updates && updates_nr))
+		return VEX_META_MYSQL_ERR_INVALID;
+	repo = sql_repo_literal(repo_id, NULL);
+	if (!repo) {
+		ret = set_error(db, VEX_META_MYSQL_ERR_INVALID,
+				"invalid Vex repository UUID for raw receive-pack seal");
+		goto out;
+	}
+	if ((ret = state_verify_repository(db, repo, hash_algo)))
+		goto out;
+	sql = vex_format("SELECT COUNT(*) FROM generations WHERE repo_id = %s "
+			 "AND generation = %" PRIu64 " AND state = 'open' FOR UPDATE",
+			 repo, generation);
+	if (!sql) {
+		ret = set_error(db, VEX_META_MYSQL_ERR_NOMEM,
+				"could not allocate raw receive-pack generation seal check");
+		goto out;
+	}
+	ret = query_one_u64(db, sql, &count, &found);
+	free(sql);
+	sql = NULL;
+	if (ret)
+		goto out;
+	if (!found || count != 1) {
+		ret = set_error(db, VEX_META_MYSQL_ERR_STATE,
+				"cannot seal a missing or non-open raw receive generation");
+		goto out;
+	}
+	if ((ret = receive_pack_find_building_sql_locked(db, repo, generation, pack_id)) ||
+	    (ret = receive_pack_require_empty_refs_locked(db, repo)))
+		goto out;
+	for (i = 0; i < updates_nr; i++) {
+		if ((ret = receive_pack_seed_update_valid(db, &updates[i])) ||
+		    (ret = receive_pack_require_member_locked(db, repo, pack_id,
+						      &updates[i].new_target.oid,
+						      hash_algo)) ||
+		    (ret = receive_pack_insert_ref_locked(db, repo, &updates[i], hash_algo)))
+			goto out;
+	}
+	pack = sql_hex_literal(pack_id, sizeof(pack_id));
+	if (!pack) {
+		ret = set_error(db, VEX_META_MYSQL_ERR_NOMEM,
+				"could not encode raw receive-pack identifier for seal");
+		goto out;
+	}
+	sql = vex_format("UPDATE pack_envelopes SET state = 'sealed', "
+			 "sealed_at = CURRENT_TIMESTAMP(6) WHERE repo_id = %s "
+			 "AND pack_id = %s AND source_kind = 'receive' "
+			 "AND state = 'building' AND receive_generation = %" PRIu64,
+			 repo, pack, generation);
+	if (!sql) {
+		ret = set_error(db, VEX_META_MYSQL_ERR_NOMEM,
+				"could not allocate raw receive-pack envelope seal");
+		goto out;
+	}
+	ret = mysql_exec(db, sql);
+	free(sql);
+	sql = NULL;
+	if (ret)
+		goto out;
+	if (mysql_affected_rows(db->mysql) != 1) {
+		ret = set_error(db, VEX_META_MYSQL_ERR_STATE,
+				"building raw receive-pack changed before seal");
+		goto out;
+	}
+	sql = vex_format("UPDATE generations SET state = 'sealed', "
+			 "sealed_at = CURRENT_TIMESTAMP(6) WHERE repo_id = %s "
+			 "AND generation = %" PRIu64 " AND state = 'open'", repo, generation);
+	if (!sql) {
+		ret = set_error(db, VEX_META_MYSQL_ERR_NOMEM,
+				"could not allocate raw receive generation seal");
+		goto out;
+	}
+	ret = mysql_exec(db, sql);
+	free(sql);
+	sql = NULL;
+	if (ret)
+		goto out;
+	if (mysql_affected_rows(db->mysql) != 1) {
+		ret = set_error(db, VEX_META_MYSQL_ERR_STATE,
+				"raw receive generation changed before seal");
+		goto out;
+	}
+	/* A full raw pair is already a current clone seed; no derived build needed. */
+	sql = vex_format("DELETE FROM pack_rebuild_requests WHERE repo_id = %s "
+			 "AND target_generation <= %" PRIu64, repo, generation);
+	if (!sql) {
+		ret = set_error(db, VEX_META_MYSQL_ERR_NOMEM,
+				"could not allocate raw receive-pack rebuild clear");
+		goto out;
+	}
+	ret = mysql_exec(db, sql);
+
+out:
+	free(sql);
+	free(pack);
+	free(repo);
+	return ret;
+}
+
+int vex_meta_mysql_receive_pack_abort_locked(
+	struct vex_meta_mysql *db, const char *repo_id, uint64_t generation,
+	unsigned char out_pack_id[VEX_META_MYSQL_OID_BYTES])
+{
+	char *repo = NULL;
+	char *pack = NULL;
+	char *sql = NULL;
+	unsigned char pack_id[VEX_META_MYSQL_OID_BYTES];
+	int ret = VEX_META_MYSQL_ERR;
+
+	if (out_pack_id)
+		memset(out_pack_id, 0, VEX_META_MYSQL_OID_BYTES);
+	if (!db || !db->mysql || !db->state_transaction || !generation ||
+	    !out_pack_id)
+		return VEX_META_MYSQL_ERR_INVALID;
+	repo = sql_repo_literal(repo_id, NULL);
+	if (!repo) {
+		ret = set_error(db, VEX_META_MYSQL_ERR_INVALID,
+				"invalid Vex repository UUID for raw receive-pack abort");
+		goto out;
+	}
+	if ((ret = receive_pack_find_building_sql_locked(db, repo, generation, pack_id)))
+		goto out;
+	pack = sql_hex_literal(pack_id, sizeof(pack_id));
+	if (!pack) {
+		ret = set_error(db, VEX_META_MYSQL_ERR_NOMEM,
+				"could not encode raw receive-pack identifier for abort");
+		goto out;
+	}
+	sql = vex_format("DELETE FROM received_pack_objects WHERE repo_id = %s "
+			 "AND pack_id = %s", repo, pack);
+	if (!sql) {
+		ret = set_error(db, VEX_META_MYSQL_ERR_NOMEM,
+				"could not allocate raw receive-pack member cleanup");
+		goto out;
+	}
+	ret = mysql_exec(db, sql);
+	free(sql);
+	sql = NULL;
+	if (ret)
+		goto out;
+	sql = vex_format("DELETE FROM pack_envelopes WHERE repo_id = %s "
+			 "AND pack_id = %s AND source_kind = 'receive' "
+			 "AND state = 'building' AND receive_generation = %" PRIu64,
+			 repo, pack, generation);
+	if (!sql) {
+		ret = set_error(db, VEX_META_MYSQL_ERR_NOMEM,
+				"could not allocate raw receive-pack envelope cleanup");
+		goto out;
+	}
+	ret = mysql_exec(db, sql);
+	free(sql);
+	sql = NULL;
+	if (ret)
+		goto out;
+	if (mysql_affected_rows(db->mysql) != 1) {
+		ret = set_error(db, VEX_META_MYSQL_ERR_STATE,
+				"building raw receive-pack changed before abort");
+		goto out;
+	}
+	sql = vex_format("UPDATE generations SET state = 'aborted' "
+			 "WHERE repo_id = %s AND generation = %" PRIu64 " "
+			 "AND state = 'open'", repo, generation);
+	if (!sql) {
+		ret = set_error(db, VEX_META_MYSQL_ERR_NOMEM,
+				"could not allocate raw receive generation abort");
+		goto out;
+	}
+	ret = mysql_exec(db, sql);
+	if (ret)
+		goto out;
+	if (mysql_affected_rows(db->mysql) != 1) {
+		ret = set_error(db, VEX_META_MYSQL_ERR_STATE,
+				"raw receive generation changed before abort");
+		goto out;
+	}
+	memcpy(out_pack_id, pack_id, sizeof(pack_id));
+	ret = VEX_META_MYSQL_OK;
+
+out:
+	free(sql);
+	free(pack);
+	free(repo);
+	return ret;
+}
+
 static int state_insert_refs(struct vex_meta_mysql *db, const char *repo,
 			     const struct git_hash_algo *hash_algo,
 			     const struct vex_meta_state *state)
@@ -5087,14 +6214,17 @@ out:
 }
 
 int vex_meta_mysql_state_save_locked(struct vex_meta_mysql *db,
-				      const char *repo_id,
-				      const struct git_hash_algo *hash_algo,
-				      const struct vex_meta_state *state)
+			      const char *repo_id,
+			      const struct git_hash_algo *hash_algo,
+			      const struct vex_meta_state *state)
 {
 	char *repo;
+	char *raw_sql = NULL;
 	struct vex_meta_mysql_saved_pins pins = { 0 };
 	struct vex_meta_mysql_saved_packs packs = { 0 };
 	uint64_t sealed_generation;
+	uint64_t raw_receive_packs;
+	int raw_found;
 	int has_current_pack;
 	int ret;
 
@@ -5105,6 +6235,29 @@ int vex_meta_mysql_state_save_locked(struct vex_meta_mysql *db,
 	if (!repo)
 		return set_error(db, VEX_META_MYSQL_ERR_INVALID,
 				 "invalid Vex repository UUID");
+	/*
+	 * The snapshot writer rewrites objects and pack_envelopes.  Until the
+	 * generic pack-set/read path can serve a raw base plus later loose objects,
+	 * reject rather than silently lose the canonical raw mapping or publish an
+	 * unreadable incremental generation.
+	 */
+	raw_sql = vex_format("SELECT COUNT(*) FROM pack_envelopes WHERE repo_id = %s "
+			 "AND source_kind = 'receive' AND state <> 'deleted'", repo);
+	if (!raw_sql) {
+		ret = set_error(db, VEX_META_MYSQL_ERR_NOMEM,
+				"could not allocate raw receive-pack state-save guard");
+		goto out;
+	}
+	ret = query_one_u64(db, raw_sql, &raw_receive_packs, &raw_found);
+	free(raw_sql);
+	raw_sql = NULL;
+	if (ret)
+		goto out;
+	if (!raw_found || raw_receive_packs) {
+		ret = set_error(db, VEX_META_MYSQL_ERR_STATE,
+				"legacy state save is disabled while a raw receive pack is retained");
+		goto out;
+	}
 	if ((ret = state_load_pins(db, repo, &pins)) ||
 	    (ret = state_load_packs(db, repo, &packs)))
 		goto out;
@@ -5127,7 +6280,8 @@ int vex_meta_mysql_state_save_locked(struct vex_meta_mysql *db,
 	ret = vex_mysql_commit(db);
 	if (!ret)
 		db->state_transaction = 0;
-	out:
+out:
+	free(raw_sql);
 	state_saved_packs_release(&packs);
 	state_saved_pins_release(&pins);
 	free(repo);
@@ -5155,6 +6309,85 @@ void vex_meta_mysql_pack_release(struct vex_meta_mysql_pack *pack)
 	free(pack->pack_key);
 	free(pack->idx_key);
 	memset(pack, 0, sizeof(*pack));
+}
+
+int vex_meta_mysql_receive_pack_stage_manifest(
+	struct vex_meta_mysql *db, const char *repo_id, uint64_t generation,
+	const struct git_hash_algo *hash_algo,
+	const struct vex_meta_mysql_receive_pack *pack,
+	const char *manifest_path, uint64_t expected_members)
+{
+	(void)repo_id;
+	(void)generation;
+	(void)hash_algo;
+	(void)pack;
+	(void)manifest_path;
+	(void)expected_members;
+	return set_error(db, VEX_META_MYSQL_ERR_STATE,
+			 "Vex MySQL store adapter was not compiled into this binary");
+}
+
+int vex_meta_mysql_receive_pack_object_get_visible(
+	struct vex_meta_mysql *db, const char *repo_id,
+	const unsigned char *oid, size_t oid_len, uint64_t visible_generation,
+	struct vex_meta_mysql_receive_pack_object *object)
+{
+	(void)repo_id;
+	(void)oid;
+	(void)oid_len;
+	(void)visible_generation;
+	if (object)
+		memset(object, 0, sizeof(*object));
+	return set_error(db, VEX_META_MYSQL_ERR_STATE,
+			 "Vex MySQL store adapter was not compiled into this binary");
+}
+
+void vex_meta_mysql_receive_pack_object_release(
+	struct vex_meta_mysql_receive_pack_object *object)
+{
+	if (!object)
+		return;
+	free(object->pack_key);
+	free(object->idx_key);
+	memset(object, 0, sizeof(*object));
+}
+
+int vex_meta_mysql_receive_pack_seal_locked(
+	struct vex_meta_mysql *db, const char *repo_id, uint64_t generation,
+	const struct git_hash_algo *hash_algo,
+	const struct vex_ref_update *updates, size_t updates_nr)
+{
+	(void)repo_id;
+	(void)generation;
+	(void)hash_algo;
+	(void)updates;
+	(void)updates_nr;
+	return set_error(db, VEX_META_MYSQL_ERR_STATE,
+			 "Vex MySQL store adapter was not compiled into this binary");
+}
+
+int vex_meta_mysql_receive_pack_get_building_locked(
+	struct vex_meta_mysql *db, const char *repo_id, uint64_t generation,
+	unsigned char out_pack_id[VEX_META_MYSQL_OID_BYTES])
+{
+	(void)repo_id;
+	(void)generation;
+	if (out_pack_id)
+		memset(out_pack_id, 0, VEX_META_MYSQL_OID_BYTES);
+	return set_error(db, VEX_META_MYSQL_ERR_STATE,
+			 "Vex MySQL store adapter was not compiled into this binary");
+}
+
+int vex_meta_mysql_receive_pack_abort_locked(
+	struct vex_meta_mysql *db, const char *repo_id, uint64_t generation,
+	unsigned char out_pack_id[VEX_META_MYSQL_OID_BYTES])
+{
+	(void)repo_id;
+	(void)generation;
+	if (out_pack_id)
+		memset(out_pack_id, 0, VEX_META_MYSQL_OID_BYTES);
+	return set_error(db, VEX_META_MYSQL_ERR_STATE,
+			 "Vex MySQL store adapter was not compiled into this binary");
 }
 
 int vex_meta_mysql_state_lock(struct vex_meta_mysql *db, const char *repo_id)

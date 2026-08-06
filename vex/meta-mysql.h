@@ -24,6 +24,7 @@
 struct vex_meta_mysql;
 struct vex_meta_state;
 struct git_hash_algo;
+struct vex_ref_update;
 
 enum vex_meta_mysql_result {
 	VEX_META_MYSQL_OK = 0,
@@ -99,6 +100,36 @@ struct vex_meta_mysql_pack {
 	char *idx_key;
 };
 
+/*
+ * Canonical receive-pack descriptor.  `pack_key` and `idx_key` name the
+ * final immutable blob-store components; their staging pair is deliberately
+ * not recorded here.  Pack bytes and index bytes never cross this API.
+ *
+ * The first direct path is intentionally seed-only: callers must set
+ * full_snapshot so the sealed pair is safe to select for a full clone.
+ */
+struct vex_meta_mysql_receive_pack {
+	const unsigned char *pack_id;
+	size_t pack_id_len;
+	const char *pack_key;
+	const char *idx_key;
+	unsigned int full_snapshot:1;
+};
+
+/*
+ * Metadata for one object whose canonical bytes live in a sealed raw pack.
+ * The caller can materialize `pack_key`/`idx_key` through the blob backend;
+ * release the strings with vex_meta_mysql_receive_pack_object_release().
+ */
+struct vex_meta_mysql_receive_pack_object {
+	unsigned int object_type;
+	uint64_t size;
+	uint64_t generation;
+	unsigned char pack_id[VEX_META_MYSQL_OID_BYTES];
+	char *pack_key;
+	char *idx_key;
+};
+
 struct vex_meta_mysql_options {
 	const char *host;
 	unsigned int port;
@@ -151,7 +182,7 @@ const char *vex_meta_mysql_error(const struct vex_meta_mysql *db);
 
 int vex_meta_mysql_ping(struct vex_meta_mysql *db);
 
-/* Verify the thirteen Vex metadata tables and objects.blob_key's metadata type. */
+/* Verify the fourteen Vex metadata tables and their payload-free key columns. */
 int vex_meta_mysql_schema_check(struct vex_meta_mysql *db,
 				unsigned int *table_count);
 
@@ -259,6 +290,35 @@ int vex_meta_mysql_stage_objects(
 	struct vex_meta_mysql *db, const char *repo_id, uint64_t generation,
 	const struct vex_meta_mysql_staged_object *objects, size_t objects_nr);
 
+/*
+ * Bulk-register an already-S3-staged raw receive pack without materializing
+ * individual object bytes or rows in objects/generation_objects.  The
+ * caller supplies a trusted, absolute, regular non-symlink TSV manifest:
+ *
+ *   <canonical lower-case oid hex> TAB <type 1..4> TAB <decimal size> LF
+ *
+ * SHA-1 rows use 40 hex digits and are padded only inside MySQL's BINARY(32)
+ * representation; SHA-256 rows use 64.  `expected_members` is an integrity
+ * check and permits an idempotent retry of the exact building envelope.
+ */
+int vex_meta_mysql_receive_pack_stage_manifest(
+	struct vex_meta_mysql *db, const char *repo_id, uint64_t generation,
+	const struct git_hash_algo *hash_algo,
+	const struct vex_meta_mysql_receive_pack *pack,
+	const char *manifest_path, uint64_t expected_members);
+
+/*
+ * Resolve raw-pack membership if the envelope is sealed, or if
+ * visible_generation owns the still-building receive.  Normal public reads
+ * pass zero.  This returns metadata only, never a pack payload.
+ */
+int vex_meta_mysql_receive_pack_object_get_visible(
+	struct vex_meta_mysql *db, const char *repo_id,
+	const unsigned char *oid, size_t oid_len, uint64_t visible_generation,
+	struct vex_meta_mysql_receive_pack_object *object);
+void vex_meta_mysql_receive_pack_object_release(
+	struct vex_meta_mysql_receive_pack_object *object);
+
 /* Atomically append bounded commit-parent metadata after its objects exist. */
 int vex_meta_mysql_stage_commit_parents(
 	struct vex_meta_mysql *db, const char *repo_id,
@@ -298,6 +358,33 @@ int vex_meta_mysql_add_commit_parent(struct vex_meta_mysql *db,
 /* Make every object claimed by an open generation visible, then seal it. */
 int vex_meta_mysql_epoch_seal(struct vex_meta_mysql *db,
 			      const char *repo_id, uint64_t generation);
+
+/*
+ * Direct seed publication boundary.  The caller first promotes the staged
+ * S3 pack/idx pair, then holds vex_meta_mysql_state_lock().  This verifies
+ * ref CASes and that each new OID is a member of the building raw pack,
+ * applies refs/audit rows, and atomically seals both generation and envelope.
+ * It deliberately does not call the legacy state snapshot save path.
+ */
+int vex_meta_mysql_receive_pack_seal_locked(
+	struct vex_meta_mysql *db, const char *repo_id, uint64_t generation,
+	const struct git_hash_algo *hash_algo,
+	const struct vex_ref_update *updates, size_t updates_nr);
+
+/* Return the building raw pack id for recovery before S3 compensation. */
+int vex_meta_mysql_receive_pack_get_building_locked(
+	struct vex_meta_mysql *db, const char *repo_id, uint64_t generation,
+	unsigned char out_pack_id[VEX_META_MYSQL_OID_BYTES]);
+
+/*
+ * Remove a building raw-pack mapping and abort its generation while locked.
+ * On success out_pack_id receives the normalized BINARY(32) pack id so the
+ * caller can compensate its staged/final S3 pair after committing.
+ * VEX_META_MYSQL_ERR_NOT_FOUND means this generation is not a raw-pack epoch.
+ */
+int vex_meta_mysql_receive_pack_abort_locked(
+	struct vex_meta_mysql *db, const char *repo_id, uint64_t generation,
+	unsigned char out_pack_id[VEX_META_MYSQL_OID_BYTES]);
 
 /*
  * Atomically create/update one direct ref and append its immutable audit row.

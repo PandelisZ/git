@@ -4,3 +4,7 @@ innodb_flush_log_at_trx_commit = 1
 sync_binlog = 1
 skip_name_resolve = ON
 max_connections = 200
+# The receive-pack seed path bulk-loads a driver-owned TSV manifest into a
+# temporary table.  The client pins the exact trusted file and the server
+# still receives no Git object or pack payload through MySQL.
+local_infile = ON
