@@ -1,4 +1,5 @@
 #include "git-compat-util.h"
+#include "abspath.h"
 #include "vex/blob-s3.h"
 #include "hex.h"
 #include "parse.h"
@@ -444,6 +445,136 @@ static int put_key(struct vex_blob_s3 *blob, const char *key,
 	return ret;
 }
 
+static uint32_t read_be32(const unsigned char *bytes)
+{
+	return ((uint32_t)bytes[0] << 24) |
+		((uint32_t)bytes[1] << 16) |
+		((uint32_t)bytes[2] << 8) |
+		(uint32_t)bytes[3];
+}
+
+static int read_file_at(int fd, off_t offset, void *data, size_t len)
+{
+	ssize_t bytes;
+
+	if (lseek(fd, offset, SEEK_SET) != offset)
+		return -1;
+	bytes = read_in_full(fd, data, len);
+	return bytes == (ssize_t)len ? 0 : -1;
+}
+
+/*
+ * index-pack already proves Git's complete pack/index semantics.  This is the
+ * smaller storage-boundary check: do not let an arbitrary path or a pack/idx
+ * pair that disagrees about its immutable pack checksum reach S3.
+ */
+static int validate_receive_pack_file(const struct vex_blob_s3 *blob,
+				      const char *path,
+				      const unsigned char *pack_id,
+				      int index, struct stat *st_out, int *fd_out)
+{
+	unsigned char header[12];
+	unsigned char trailer[2 * GIT_MAX_RAWSZ];
+	struct stat st;
+	off_t min_size;
+	int fd = -1;
+	int ret = VEX_BLOB_S3_ERR_INVALID;
+
+	if (!blob || !blob->hash_algo || !path || !*path ||
+	    !is_absolute_path(path) || contains_control(path) || !pack_id ||
+	    !st_out || !fd_out)
+		return VEX_BLOB_S3_ERR_INVALID;
+	fd = open_nofollow(path, O_RDONLY);
+	if (fd < 0)
+		return VEX_BLOB_S3_ERR_INVALID;
+	if (fstat(fd, &st) < 0 || !S_ISREG(st.st_mode) || st.st_size < 0) {
+		ret = VEX_BLOB_S3_ERR_INVALID;
+		goto out;
+	}
+	min_size = index ? 8 + 2 * blob->hash_algo->rawsz :
+		12 + blob->hash_algo->rawsz;
+	if (st.st_size < min_size) {
+		ret = VEX_BLOB_S3_ERR_INVALID;
+		goto out;
+	}
+	if (index) {
+		if (read_file_at(fd, 0, header, 8) ||
+		    read_file_at(fd, st.st_size - 2 * blob->hash_algo->rawsz,
+				 trailer, 2 * blob->hash_algo->rawsz)) {
+			ret = VEX_BLOB_S3_ERR;
+			goto out;
+		}
+		/* A modern idx advertises version 2; legacy v1 has no header. */
+		if ((read_be32(header) == 0xff744f63 &&
+		     read_be32(header + 4) != 2) ||
+		    memcmp(trailer, pack_id, blob->hash_algo->rawsz)) {
+			ret = VEX_BLOB_S3_ERR_INVALID;
+			goto out;
+		}
+	} else {
+		if (read_file_at(fd, 0, header, 12) ||
+		    read_file_at(fd, st.st_size - blob->hash_algo->rawsz,
+				 trailer, blob->hash_algo->rawsz)) {
+			ret = VEX_BLOB_S3_ERR;
+			goto out;
+		}
+		if (memcmp(header, "PACK", 4) ||
+		    (read_be32(header + 4) != 2 && read_be32(header + 4) != 3) ||
+		    memcmp(trailer, pack_id, blob->hash_algo->rawsz)) {
+			ret = VEX_BLOB_S3_ERR_INVALID;
+			goto out;
+		}
+	}
+	if (lseek(fd, 0, SEEK_SET) != 0) {
+		ret = VEX_BLOB_S3_ERR;
+		goto out;
+	}
+	*st_out = st;
+	*fd_out = fd;
+	fd = -1;
+	ret = VEX_BLOB_S3_OK;
+out:
+	if (fd >= 0 && close(fd) < 0 && !ret)
+		ret = VEX_BLOB_S3_ERR;
+	return ret;
+}
+
+static int validate_receive_pack_files(const struct vex_blob_s3 *blob,
+				       const unsigned char *pack_id,
+				       const char *pack_path, const char *idx_path,
+				       int fds[2])
+{
+	struct stat pack_st;
+	struct stat idx_st;
+	int ret;
+
+	if (!fds)
+		return VEX_BLOB_S3_ERR_INVALID;
+	fds[0] = -1;
+	fds[1] = -1;
+	ret = validate_receive_pack_file(blob, pack_path, pack_id, 0, &pack_st,
+					 &fds[0]);
+	if (ret)
+		goto out;
+	ret = validate_receive_pack_file(blob, idx_path, pack_id, 1, &idx_st,
+					 &fds[1]);
+	if (ret)
+		goto out;
+	if (pack_st.st_dev == idx_st.st_dev && pack_st.st_ino == idx_st.st_ino) {
+		ret = VEX_BLOB_S3_ERR_INVALID;
+		goto out;
+	}
+	return VEX_BLOB_S3_OK;
+out:
+	if (fds[1] >= 0)
+		close(fds[1]);
+	if (fds[0] >= 0)
+		close(fds[0]);
+	fds[0] = -1;
+	fds[1] = -1;
+	return ret;
+}
+
 static int read_key(struct vex_blob_s3 *blob, const char *key,
 		    void **data, unsigned long *size)
 {
@@ -513,19 +644,58 @@ static int download_key(struct vex_blob_s3 *blob, const char *key,
 	return ret;
 }
 
-static int derived_pack_key(const struct vex_blob_s3 *blob,
-			    const unsigned char *pack_id, size_t pack_id_len,
-			    int index, struct strbuf *key)
+static const char *receive_pack_component_suffix(
+		enum vex_blob_s3_pack_component component)
+{
+	switch (component) {
+	case VEX_BLOB_S3_PACK_COMPONENT_PACK:
+		return "pack";
+	case VEX_BLOB_S3_PACK_COMPONENT_IDX:
+		return "idx";
+	}
+	return NULL;
+}
+
+static int receive_pack_component_key(const struct vex_blob_s3 *blob,
+				      uint64_t epoch, int staging,
+				      const unsigned char *pack_id,
+				      size_t pack_id_len,
+				      enum vex_blob_s3_pack_component component,
+				      struct strbuf *key)
 {
 	char hex[GIT_MAX_HEXSZ + 1];
+	const char *suffix = receive_pack_component_suffix(component);
 
-	if (!blob || !blob->hash_algo || !pack_id ||
-	    pack_id_len != blob->hash_algo->rawsz || !key)
+	if (!blob || !blob->hash_algo || !blob->repo_id || !pack_id || !key ||
+	    pack_id_len != blob->hash_algo->rawsz || !suffix ||
+	    (staging && !epoch))
 		return VEX_BLOB_S3_ERR_INVALID;
 	hash_to_hex_algop_r(hex, pack_id, blob->hash_algo);
-	strbuf_addf(key, "git/v1/%s/packs/%s.%s", blob->repo_id, hex,
-		    index ? "idx" : "pack");
+	if (staging)
+		strbuf_addf(key, "git/v1/%s/staging/%"PRIu64"/packs/%s.%s",
+			    blob->repo_id, epoch, hex, suffix);
+	else
+		strbuf_addf(key, "git/v1/%s/packs/%s.%s", blob->repo_id, hex,
+			    suffix);
 	return VEX_BLOB_S3_OK;
+}
+
+int vex_blob_s3_receive_pack_staging_key(
+	const struct vex_blob_s3 *blob, uint64_t epoch,
+	const unsigned char *pack_id, size_t pack_id_len,
+	enum vex_blob_s3_pack_component component, struct strbuf *key)
+{
+	return receive_pack_component_key(blob, epoch, 1, pack_id, pack_id_len,
+				  component, key);
+}
+
+int vex_blob_s3_receive_pack_final_key(
+	const struct vex_blob_s3 *blob, const unsigned char *pack_id,
+	size_t pack_id_len, enum vex_blob_s3_pack_component component,
+	struct strbuf *key)
+{
+	return receive_pack_component_key(blob, 0, 0, pack_id, pack_id_len,
+				  component, key);
 }
 
 int vex_blob_s3_open(struct vex_blob_s3 **blob_out,
@@ -746,6 +916,74 @@ cleanup:
 	return ret;
 }
 
+int vex_blob_s3_stage_receive_pack(struct vex_blob_s3 *blob, uint64_t epoch,
+	const unsigned char *pack_id, size_t pack_id_len,
+	const char *pack_path, const char *idx_path)
+{
+	static const enum vex_blob_s3_pack_component components[] = {
+		VEX_BLOB_S3_PACK_COMPONENT_PACK,
+		VEX_BLOB_S3_PACK_COMPONENT_IDX,
+	};
+	static const char content_type[] = "Content-Type: application/octet-stream";
+	struct vex_s3_batch_request requests[ARRAY_SIZE(components)] = { 0 };
+	struct strbuf keys[ARRAY_SIZE(components)] = {
+		STRBUF_INIT, STRBUF_INIT,
+	};
+	struct strbuf urls[ARRAY_SIZE(components)] = {
+		STRBUF_INIT, STRBUF_INIT,
+	};
+	struct strbuf sources[ARRAY_SIZE(components)] = {
+		STRBUF_INIT, STRBUF_INIT,
+	};
+	int fds[ARRAY_SIZE(components)] = { -1, -1 };
+	size_t i;
+	int ret;
+
+	if (!blob || !pack_path || !idx_path)
+		return VEX_BLOB_S3_ERR_INVALID;
+	for (i = 0; i < ARRAY_SIZE(components); i++) {
+		ret = vex_blob_s3_receive_pack_staging_key(blob, epoch, pack_id,
+						    pack_id_len, components[i], &keys[i]);
+		if (ret)
+			goto out;
+	}
+	ret = validate_receive_pack_files(blob, pack_id, pack_path, idx_path,
+					 fds);
+	if (ret)
+		goto out;
+	for (i = 0; i < ARRAY_SIZE(components); i++) {
+		ret = make_url(blob, keys[i].buf, &urls[i]);
+		if (ret)
+			goto out;
+		/*
+		 * Upload the exact regular file descriptor whose pack trailer or idx
+		 * footer we just checked.  run_curl_parallel() intentionally leaves
+		 * these descriptors open across exec, and /dev/fd gives curl a fresh
+		 * reader starting at the offset reset by validation.
+		 */
+		strbuf_addf(&sources[i], "/dev/fd/%d", fds[i]);
+		requests[i].method = "PUT";
+		requests[i].url = urls[i].buf;
+		requests[i].input_file = sources[i].buf;
+		requests[i].header = content_type;
+	}
+	ret = run_curl_parallel(blob, requests, ARRAY_SIZE(requests));
+	if (ret) {
+		/* No metadata may be written until both direct-file PUTs succeed. */
+		(void)vex_blob_s3_delete_receive_pack_staging(blob, epoch, pack_id,
+							      pack_id_len);
+	}
+out:
+	for (i = 0; i < ARRAY_SIZE(components); i++) {
+		if (fds[i] >= 0)
+			close(fds[i]);
+		strbuf_release(&sources[i]);
+		strbuf_release(&urls[i]);
+		strbuf_release(&keys[i]);
+	}
+	return ret;
+}
+
 int vex_blob_s3_delete_staging(struct vex_blob_s3 *blob, uint64_t epoch,
 			       const struct object_id *oid)
 {
@@ -772,6 +1010,64 @@ int vex_blob_s3_delete_final(struct vex_blob_s3 *blob,
 		ret = delete_key(blob, key.buf);
 	strbuf_release(&key);
 	return ret;
+}
+
+static int delete_receive_pack_components(struct vex_blob_s3 *blob,
+					  uint64_t epoch, int staging,
+					  const unsigned char *pack_id,
+					  size_t pack_id_len)
+{
+	static const enum vex_blob_s3_pack_component components[] = {
+		VEX_BLOB_S3_PACK_COMPONENT_PACK,
+		VEX_BLOB_S3_PACK_COMPONENT_IDX,
+	};
+	struct strbuf keys[ARRAY_SIZE(components)] = {
+		STRBUF_INIT, STRBUF_INIT,
+	};
+	size_t i;
+	int ret = VEX_BLOB_S3_OK;
+
+	for (i = 0; i < ARRAY_SIZE(components); i++) {
+		int key_ret = staging ?
+			vex_blob_s3_receive_pack_staging_key(blob, epoch, pack_id,
+				pack_id_len, components[i], &keys[i]) :
+			vex_blob_s3_receive_pack_final_key(blob, pack_id, pack_id_len,
+				components[i], &keys[i]);
+
+		if (key_ret) {
+			ret = key_ret;
+			goto out;
+		}
+	}
+	for (i = 0; i < ARRAY_SIZE(components); i++) {
+		int delete_ret = delete_key(blob, keys[i].buf);
+
+		/* S3 DELETE is normally 204 for a missing key; normalize 404 too. */
+		if (delete_ret == VEX_BLOB_S3_ERR_NOT_FOUND)
+			delete_ret = VEX_BLOB_S3_OK;
+		if (!ret && delete_ret)
+			ret = delete_ret;
+	}
+out:
+	for (i = 0; i < ARRAY_SIZE(components); i++)
+		strbuf_release(&keys[i]);
+	return ret;
+}
+
+int vex_blob_s3_delete_receive_pack_staging(
+	struct vex_blob_s3 *blob, uint64_t epoch,
+	const unsigned char *pack_id, size_t pack_id_len)
+{
+	return delete_receive_pack_components(blob, epoch, 1, pack_id,
+					      pack_id_len);
+}
+
+int vex_blob_s3_delete_receive_pack_final(
+	struct vex_blob_s3 *blob, const unsigned char *pack_id,
+	size_t pack_id_len)
+{
+	return delete_receive_pack_components(blob, 0, 0, pack_id,
+					      pack_id_len);
 }
 
 int vex_blob_s3_promote_object(struct vex_blob_s3 *blob, uint64_t epoch,
@@ -868,6 +1164,65 @@ done:
 	return ret;
 }
 
+int vex_blob_s3_promote_receive_pack(struct vex_blob_s3 *blob, uint64_t epoch,
+	const unsigned char *pack_id, size_t pack_id_len)
+{
+	static const enum vex_blob_s3_pack_component components[] = {
+		VEX_BLOB_S3_PACK_COMPONENT_PACK,
+		VEX_BLOB_S3_PACK_COMPONENT_IDX,
+	};
+	struct vex_s3_batch_request requests[ARRAY_SIZE(components)] = { 0 };
+	struct strbuf staging[ARRAY_SIZE(components)] = {
+		STRBUF_INIT, STRBUF_INIT,
+	};
+	struct strbuf final[ARRAY_SIZE(components)] = {
+		STRBUF_INIT, STRBUF_INIT,
+	};
+	struct strbuf final_urls[ARRAY_SIZE(components)] = {
+		STRBUF_INIT, STRBUF_INIT,
+	};
+	struct strbuf copy_sources[ARRAY_SIZE(components)] = {
+		STRBUF_INIT, STRBUF_INIT,
+	};
+	size_t i;
+	int ret;
+
+	if (blob && blob->test_fail_promote_once) {
+		blob->test_fail_promote_once = 0;
+		return VEX_BLOB_S3_ERR;
+	}
+	for (i = 0; i < ARRAY_SIZE(components); i++) {
+		ret = vex_blob_s3_receive_pack_staging_key(blob, epoch, pack_id,
+						    pack_id_len, components[i], &staging[i]);
+		if (ret)
+			goto out;
+		ret = vex_blob_s3_receive_pack_final_key(blob, pack_id, pack_id_len,
+						  components[i], &final[i]);
+		if (ret)
+			goto out;
+		ret = make_url(blob, final[i].buf, &final_urls[i]);
+		if (ret)
+			goto out;
+		strbuf_addf(&copy_sources[i], "x-amz-copy-source: /%s/%s",
+			    blob->bucket, staging[i].buf);
+		requests[i].method = "PUT";
+		requests[i].url = final_urls[i].buf;
+		requests[i].header = copy_sources[i].buf;
+	}
+	ret = run_curl_parallel(blob, requests, ARRAY_SIZE(requests));
+	if (!ret)
+		ret = vex_blob_s3_delete_receive_pack_staging(blob, epoch, pack_id,
+							      pack_id_len);
+out:
+	for (i = 0; i < ARRAY_SIZE(components); i++) {
+		strbuf_release(&copy_sources[i]);
+		strbuf_release(&final_urls[i]);
+		strbuf_release(&final[i]);
+		strbuf_release(&staging[i]);
+	}
+	return ret;
+}
+
 int vex_blob_s3_has_final(struct vex_blob_s3 *blob,
 			  const struct object_id *oid)
 {
@@ -922,7 +1277,10 @@ int vex_blob_s3_download_derived_pack(struct vex_blob_s3 *blob,
 	struct strbuf key = STRBUF_INIT;
 	int ret;
 
-	ret = derived_pack_key(blob, pack_id, pack_id_len, index, &key);
+	ret = vex_blob_s3_receive_pack_final_key(
+		blob, pack_id, pack_id_len,
+		index ? VEX_BLOB_S3_PACK_COMPONENT_IDX :
+		VEX_BLOB_S3_PACK_COMPONENT_PACK, &key);
 	if (!ret)
 		ret = download_key(blob, key.buf, destination);
 	strbuf_release(&key);

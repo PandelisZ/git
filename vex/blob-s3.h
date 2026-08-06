@@ -35,6 +35,12 @@ struct vex_blob_s3_staged_object {
 	unsigned long size;
 };
 
+/* The two immutable files that make a Git pack usable. */
+enum vex_blob_s3_pack_component {
+	VEX_BLOB_S3_PACK_COMPONENT_PACK = 0,
+	VEX_BLOB_S3_PACK_COMPONENT_IDX = 1,
+};
+
 enum vex_blob_s3_result {
 	VEX_BLOB_S3_OK = 0,
 	VEX_BLOB_S3_ERR = -1,
@@ -108,6 +114,48 @@ int vex_blob_s3_read_final(struct vex_blob_s3 *blob,
 int vex_blob_s3_read_staging(struct vex_blob_s3 *blob, uint64_t epoch,
 			     const struct object_id *oid,
 			     void **data, unsigned long *size);
+
+/*
+ * Canonical raw receive-pack storage.  A receive first writes and validates a
+ * pack/idx pair on its local WAL disk.  These APIs keep those bytes in S3,
+ * never in metadata:
+ *
+ *   git/v1/<repo>/staging/<epoch>/packs/<packid>.{pack,idx}
+ *   git/v1/<repo>/packs/<packid>.{pack,idx}
+ *
+ * `pack_id` is the raw pack checksum and must be exactly this repository's
+ * hash length.  Staging also requires a non-zero epoch.  The stage call
+ * accepts absolute regular WAL files only, verifies that the pack trailer and
+ * idx footer bind both files to `pack_id`, uploads the two files directly,
+ * and compensates both staging keys if either upload fails.  Git's full pack
+ * and index semantic verification remains the receive path's responsibility.
+ */
+int vex_blob_s3_receive_pack_staging_key(
+	const struct vex_blob_s3 *blob, uint64_t epoch,
+	const unsigned char *pack_id, size_t pack_id_len,
+	enum vex_blob_s3_pack_component component, struct strbuf *key);
+int vex_blob_s3_receive_pack_final_key(
+	const struct vex_blob_s3 *blob, const unsigned char *pack_id,
+	size_t pack_id_len, enum vex_blob_s3_pack_component component,
+	struct strbuf *key);
+int vex_blob_s3_stage_receive_pack(struct vex_blob_s3 *blob, uint64_t epoch,
+	const unsigned char *pack_id, size_t pack_id_len,
+	const char *pack_path, const char *idx_path);
+
+/*
+ * Copy both staged components to their canonical final keys, then remove the
+ * staging pair.  A failed copy or delete leaves no metadata visible and is
+ * retryable.  Final-key cleanup is only for an uncommitted pack whose
+ * metadata transaction did not seal it.
+ */
+int vex_blob_s3_promote_receive_pack(struct vex_blob_s3 *blob, uint64_t epoch,
+	const unsigned char *pack_id, size_t pack_id_len);
+int vex_blob_s3_delete_receive_pack_staging(
+	struct vex_blob_s3 *blob, uint64_t epoch,
+	const unsigned char *pack_id, size_t pack_id_len);
+int vex_blob_s3_delete_receive_pack_final(
+	struct vex_blob_s3 *blob, const unsigned char *pack_id,
+	size_t pack_id_len);
 
 /*
  * Stream one immutable derived-pack component into an already-created local
