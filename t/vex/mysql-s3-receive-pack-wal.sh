@@ -200,13 +200,26 @@ vex://????????????????????????????????)
 	;;
 esac
 
-for table in refs objects pack_envelopes received_pack_objects; do
+for table in objects pack_envelopes received_pack_objects; do
 	rows=$(mysql_query "SELECT COUNT(*) FROM $table WHERE repo_id = UNHEX('$repo_id');")
 	[ "$rows" = 0 ] || {
 		printf 'vex receive-pack WAL E2E: fresh repository has %s unexpected %s rows\n' "$rows" "$table" >&2
 		exit 1
 	}
 done
+# `git init --initial-branch=main --ref-format=vex` persists this symbolic
+# scaffold before the first object exists.  It is not a received ref and the
+# raw full-seed path must preserve it while rejecting every real existing ref.
+head_rows=$(mysql_query "SELECT COUNT(*) FROM refs WHERE repo_id = UNHEX('$repo_id') AND refname = 'HEAD' AND is_symbolic = TRUE AND target_oid IS NULL AND symref_target = 'refs/heads/main';")
+[ "$head_rows" = 1 ] || {
+	printf 'vex receive-pack WAL E2E: fresh repository lacks its expected unborn HEAD scaffold (%s rows)\n' "$head_rows" >&2
+	exit 1
+}
+other_ref_rows=$(mysql_query "SELECT COUNT(*) FROM refs WHERE repo_id = UNHEX('$repo_id') AND NOT (refname = 'HEAD' AND is_symbolic = TRUE AND target_oid IS NULL AND symref_target = 'refs/heads/main');")
+[ "$other_ref_rows" = 0 ] || {
+	printf 'vex receive-pack WAL E2E: fresh repository has %s non-HEAD refs\n' "$other_ref_rows" >&2
+	exit 1
+}
 
 # Make a small but complete mirror with a branch, an annotated tag, and a
 # side branch. `--no-thin` below is an explicit stock-client pack contract;
@@ -302,8 +315,9 @@ loose_rows=$(mysql_query "SELECT COUNT(*) FROM objects WHERE repo_id = UNHEX('$r
 	exit 1
 }
 ref_rows=$(mysql_query "SELECT COUNT(*) FROM refs WHERE repo_id = UNHEX('$repo_id');")
-[ "$ref_rows" = "$expected_refs" ] || {
-	printf 'vex receive-pack WAL E2E: sealed ref count %s differs from mirror count %s\n' "$ref_rows" "$expected_refs" >&2
+expected_ref_rows=$((expected_refs + 1))
+[ "$ref_rows" = "$expected_ref_rows" ] || {
+	printf 'vex receive-pack WAL E2E: sealed ref count %s differs from mirror plus HEAD scaffold count %s\n' "$ref_rows" "$expected_ref_rows" >&2
 	exit 1
 }
 
