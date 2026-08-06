@@ -19,7 +19,8 @@ usage: scripts/vex/seed-git-git.sh [--mirror PATH] [--upstream URL] [--refresh]
 
 Import a faithful git/git mirror into an already-active Vex MySQL+S3 Compose
 repository at git/git.git, make a matching local disk-control bare repository,
-seal the incoming immutable Vex pack/idx pair, and write
+seal the incoming immutable Vex pack/idx pair, write the passed raw-ingest
+receipt t/vex/out/seed-raw-ingest-receipt.json, and then write
 t/vex/out/seed-manifest.json.
 
 The import itself is a normal stock-Git HTTPS `push --mirror`. The first-pack
@@ -514,6 +515,148 @@ record_raw_ingest() {
 		"$seconds" "$five_minute_seed_budget_seconds" "$status" "$mode"
 }
 
+# This is intentionally a separate receipt from the full seed manifest below.
+# The raw receive-pack availability gate can succeed well before the disk
+# control, payload hashing, and benchmark-artifact work complete. Persist the
+# timed gate evidence first, so an interruption in that later work cannot lose
+# the only client-side measurement of the durable raw pack ingest.
+write_raw_ingest_receipt() {
+	local receipt=$1 started_ns=$2 finished_ns=$3 seconds=$4 mode=$5
+
+	python3 - "$receipt" "$source_refs" "$target_refs" \
+		"$source_head_ref" "$source_head_oid" "$source_hash_algo" "$source_object_count" \
+		"$target_head_ref" "$target_head_oid" "$repo_id" "$pack_id" "$pack_generation" \
+		"$pack_key" "$idx_key" "$pack_object_count" "$five_minute_seed_budget_seconds" \
+		"$started_ns" "$finished_ns" "$seconds" "$mode" \
+		"$pack_s3_stat_verified" "$idx_s3_stat_verified" <<'PY'
+import hashlib
+import json
+import os
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+
+(
+    receipt_name,
+    source_refs_name,
+    target_refs_name,
+    source_head_ref,
+    source_head_oid,
+    source_hash_algo,
+    source_object_count,
+    target_head_ref,
+    target_head_oid,
+    repository_id,
+    pack_id,
+    pack_generation,
+    pack_key,
+    idx_key,
+    pack_object_count,
+    budget_seconds,
+    started_ns_text,
+    finished_ns_text,
+    raw_ingest_seconds_text,
+    raw_ingest_mode,
+    pack_s3_stat_verified,
+    idx_s3_stat_verified,
+) = sys.argv[1:]
+
+
+def ref_facts(path_name: str) -> dict[str, object]:
+    data = Path(path_name).read_bytes()
+    return {
+        "count": len([line for line in data.splitlines() if line]),
+        "sha256": hashlib.sha256(data).hexdigest(),
+    }
+
+
+def integer(name: str, value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as error:
+        raise SystemExit("vex seed-git-git: invalid {} in raw ingest receipt".format(name)) from error
+    if parsed < 0:
+        raise SystemExit("vex seed-git-git: negative {} in raw ingest receipt".format(name))
+    return parsed
+
+
+source_refs = ref_facts(source_refs_name)
+target_refs = ref_facts(target_refs_name)
+if source_refs != target_refs:
+    raise SystemExit("vex seed-git-git: raw ingest receipt refs no longer match")
+
+source_objects = integer("source object count", source_object_count)
+map_count = integer("raw pack object map count", pack_object_count)
+if source_objects != map_count:
+    raise SystemExit("vex seed-git-git: raw ingest receipt object map differs from source")
+
+started_ns = integer("raw ingest start", started_ns_text)
+finished_ns = integer("raw ingest finish", finished_ns_text)
+if finished_ns < started_ns:
+    raise SystemExit("vex seed-git-git: raw ingest monotonic clock moved backwards")
+elapsed_ns = finished_ns - started_ns
+elapsed_seconds = elapsed_ns / 1_000_000_000
+if "{:.3f}".format(elapsed_seconds) != raw_ingest_seconds_text:
+    raise SystemExit("vex seed-git-git: raw ingest receipt duration differs from gate")
+
+if pack_s3_stat_verified != "true" or idx_s3_stat_verified != "true":
+    raise SystemExit("vex seed-git-git: raw ingest receipt requires both final S3 stat checks")
+
+receipt = Path(receipt_name)
+payload = {
+    "created_at_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+    "raw_ingest": {
+        "budget_seconds": integer("raw ingest budget", budget_seconds),
+        "client_timed": True,
+        "clock": "time.monotonic_ns",
+        "elapsed_monotonic_ns": elapsed_ns,
+        "mode": raw_ingest_mode,
+        "passed": True,
+        "raw_ingest_seconds": elapsed_seconds,
+        "started_monotonic_ns": started_ns,
+        "finished_monotonic_ns": finished_ns,
+    },
+    "schema_version": 1,
+    "source": {
+        "head": {"oid": source_head_oid, "ref": source_head_ref},
+        "object_format": source_hash_algo,
+        "objects": {"reachable_count": source_objects},
+        "refs": source_refs,
+    },
+    "target": {
+        "head": {"oid": target_head_oid, "ref": target_head_ref},
+        "refs": target_refs,
+    },
+    "vex": {
+        "final_s3_objects": {
+            "idx": {"key": idx_key, "stat_verified": True},
+            "pack": {"key": pack_key, "stat_verified": True},
+        },
+        "raw_receive_pack": {
+            "covering_generation": integer("covering generation", pack_generation),
+            "id": pack_id,
+            "is_full_snapshot": True,
+            "oid_map": {"count": map_count, "table": "received_pack_objects"},
+            "source_kind": "receive",
+            "state": "sealed",
+        },
+        "repository": "git/git.git",
+        "repository_id": repository_id,
+    },
+}
+
+receipt.parent.mkdir(parents=True, exist_ok=True)
+temporary = receipt.with_name(receipt.name + ".tmp-{}".format(os.getpid()))
+try:
+    temporary.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    os.chmod(temporary, 0o600)
+    os.replace(temporary, receipt)
+finally:
+    temporary.unlink(missing_ok=True)
+PY
+}
+
 ensure_args=(--mirror "$mirror" --upstream "$upstream")
 if [ "$refresh" -eq 1 ]; then
 	ensure_args+=(--refresh)
@@ -593,6 +736,7 @@ record_phase target_prepare "$phase_started_ns" "$phase_finished_ns"
 
 raw_ingest_mode=already-sealed
 raw_ingest_started_ns=''
+raw_ingest_finished_ns=''
 if [ "$seed_needs_push" -eq 1 ]; then
 	raw_ingest_mode=push-mirror
 	# Keep this assignment immediately adjacent to the stock client invocation:
@@ -665,8 +809,12 @@ case "$idx_key" in "git/v1/$repo_id/packs/$pack_id.idx") ;; *) die "unexpected V
 # been promoted. Verify both final keys with metadata-only S3 requests before
 # ending the availability phase; full payload hashing belongs to the manifest
 # phase below and must not consume the five-minute server-ingest budget.
+pack_s3_stat_verified=false
+idx_s3_stat_verified=false
 s3_object_exists "$pack_key"
+pack_s3_stat_verified=true
 s3_object_exists "$idx_key"
+idx_s3_stat_verified=true
 
 if [ -n "$raw_ingest_started_ns" ]; then
 	raw_ingest_finished_ns=$(monotonic_ns)
@@ -677,9 +825,17 @@ if [ -n "$raw_ingest_started_ns" ]; then
 		die "raw ingest exceeded the ${five_minute_seed_budget_seconds}-second availability budget"
 	fi
 	record_raw_ingest "$raw_ingest_seconds" PASS "$raw_ingest_mode"
+	# Write this before restoring the gateway or preparing the disk control. The
+	# receipt is the durable record of a passed raw-ingest gate even when a later
+	# artifact phase is interrupted.
+	raw_ingest_receipt="$repo_root/t/vex/out/seed-raw-ingest-receipt.json"
+	write_raw_ingest_receipt "$raw_ingest_receipt" "$raw_ingest_started_ns" \
+		"$raw_ingest_finished_ns" "$raw_ingest_seconds" "$raw_ingest_mode"
+	printf 'vex seed-git-git: raw ingest receipt=%s\n' "$raw_ingest_receipt"
 else
 	# No push was necessary: retain an explicit zero rather than presenting the
 	# verification time for an already-sealed repository as a new ingest time.
+	# Do not replace a prior client-timed receipt with this untimed observation.
 	raw_ingest_seconds=0.000
 	record_raw_ingest "$raw_ingest_seconds" PASS "$raw_ingest_mode"
 fi
