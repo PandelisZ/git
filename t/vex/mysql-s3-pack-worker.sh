@@ -122,6 +122,13 @@ for commit_number in 1 2 3; do
 	"$stock_git" -C "$client" -c commit.gpgSign=false commit -q \
 		-m "Vex pack worker fixture $commit_number"
 done
+# Force the worker through a genuine multipart S3 transfer below. Random bytes
+# keep Git from compressing the fixture below the 5 MiB S3 part threshold.
+multipart_part_bytes=$((5 * 1024 * 1024))
+dd if=/dev/urandom of="$client/multipart.bin" bs=1m count=12 2>/dev/null
+"$stock_git" -C "$client" add multipart.bin
+"$stock_git" -C "$client" -c commit.gpgSign=false commit -q \
+	-m 'Vex pack worker multipart fixture'
 "$stock_git" -C "$client" branch -M main
 tip=$("$stock_git" -C "$client" rev-parse HEAD)
 "$stock_git" -C "$client" remote add origin "$origin"
@@ -195,7 +202,9 @@ mysql_query "
 	 WHERE repo_id = UNHEX('$repo_id');" >/dev/null
 
 SECONDS=0
-worker_output=$("${compose[@]}" --profile pack-worker run --rm --no-deps pack-worker --once)
+worker_output=$(VEX_PACK_WORKER_MULTIPART_PART_BYTES="$multipart_part_bytes" \
+	VEX_PACK_WORKER_MULTIPART_CONCURRENCY=3 \
+	"${compose[@]}" --profile pack-worker run --rm --no-deps pack-worker --once)
 worker_elapsed=$SECONDS
 case "$worker_output" in
 *"vex-pack-worker: published repository=$repo_name generation="*' pack='*' objects='*) ;;
@@ -290,6 +299,23 @@ generation_objects_after=$(mysql_query "
 		mc stat "vex/$MINIO_BUCKET/$VEX_PACK_KEY" >/dev/null
 		mc stat "vex/$MINIO_BUCKET/$VEX_INDEX_KEY" >/dev/null
 	'
+pack_s3_bytes=$("${compose[@]}" run --rm --no-deps --entrypoint /bin/sh \
+	-e "VEX_PACK_KEY=$pack_key" minio-init -c '
+		set -eu
+		mc alias set vex "$MINIO_ENDPOINT" "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD" >/dev/null
+		mc cat "vex/$MINIO_BUCKET/$VEX_PACK_KEY" | wc -c | tr -d "[:space:]"
+	')
+case "$pack_s3_bytes" in
+''|*[!0-9]*)
+	printf 'vex pack-worker E2E: invalid S3 pack byte count: %s\n' "$pack_s3_bytes" >&2
+	exit 1
+	;;
+esac
+[ "$pack_s3_bytes" -gt "$multipart_part_bytes" ] || {
+	printf 'vex pack-worker E2E: pack did not cross multipart threshold (%s <= %s)\n' \
+		"$pack_s3_bytes" "$multipart_part_bytes" >&2
+	exit 1
+}
 
 # Force direct relay. A successful stock clone now proves the worker-created
 # envelope/membership is selected instead of falling back to git-pack-objects.
@@ -322,5 +348,5 @@ offsets_after_receive=$(mysql_query "
 	exit 1
 }
 
-printf 'vex pack-worker E2E: PASS worker=%ss objects=%s; immutable S3 pack/index, bulk membership/offsets, C-owned state fencing, direct stock-Git relay, and later receive preservation verified for %s\n' \
-	"$worker_elapsed" "$worker_objects" "$origin"
+printf 'vex pack-worker E2E: PASS worker=%ss objects=%s multipart_pack_bytes=%s part_bytes=%s concurrency=3; immutable S3 pack/index, bulk membership/offsets, C-owned state fencing, direct stock-Git relay, and later receive preservation verified for %s\n' \
+	"$worker_elapsed" "$worker_objects" "$pack_s3_bytes" "$multipart_part_bytes" "$origin"

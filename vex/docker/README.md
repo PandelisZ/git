@@ -48,11 +48,14 @@ docker compose -f vex/docker/compose.yaml --env-file vex/docker/.env \
 ```
 
 It builds one derived pack, performs one immutable S3 pack upload and one
-index upload (multipart above the configured part size), then bulk-loads only
-OID-to-pack-offset metadata into MySQL. It cannot change refs, ref audit rows,
-generations, or canonical object bytes. The initial worker intentionally does
-not consume the raw receive-pack WAL: that path remains synchronously sealed
-by the C receive transaction so refs never outrun durable S3 bytes.
+index upload (multipart above 64 MiB by default), then bulk-loads only
+OID-to-pack-offset metadata into MySQL. `VEX_PACK_WORKER_MULTIPART_CONCURRENCY`
+is bounded to `1..33` concurrent streaming parts (default `8`); benchmark 8,
+16, and 33 against the real blob store rather than assuming a linear speedup.
+It cannot change refs, ref audit rows, generations, or canonical object bytes.
+The initial worker intentionally does not consume the raw receive-pack WAL:
+that path remains synchronously sealed by the C receive transaction so refs
+never outrun durable S3 bytes.
 
 `scripts/vex/build-pack.sh group/repository.git` remains the explicit
 immediate builder for maintenance and comparison.

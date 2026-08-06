@@ -215,6 +215,10 @@ services:
       GIT_VEX_S3_PATH_STYLE: "1"
       GIT_VEX_S3_ACCESS_KEY: ${MINIO_ROOT_USER}
       GIT_VEX_S3_SECRET_KEY: ${MINIO_ROOT_PASSWORD}
+      # Derived packs use multipart above 64 MiB. Keep the byte streams bounded
+      # while allowing an operator to benchmark 8, 16, or 33 concurrent parts.
+      VEX_PACK_WORKER_MULTIPART_PART_BYTES: ${VEX_PACK_WORKER_MULTIPART_PART_BYTES:-67108864}
+      VEX_PACK_WORKER_MULTIPART_CONCURRENCY: ${VEX_PACK_WORKER_MULTIPART_CONCURRENCY:-8}
     command: ["--once"]
     restart: "no"
     volumes:

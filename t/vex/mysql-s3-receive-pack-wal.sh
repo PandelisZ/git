@@ -709,6 +709,81 @@ overlay_rebuild=$(mysql_query "
 	exit 1
 }
 
+# Rebuild the partial clone relay after a normal overlay. The retained raw
+# seed is older than the current generation, so this proves the builder joins
+# its immutable raw membership with the new per-object rows rather than
+# requiring a new raw receive snapshot for every ordinary push.
+overlay_default_output=$(VEX_COMPOSE_NO_BUILD=1 VEX_COMPOSE_ALREADY_UP=1 \
+	"$root/scripts/vex/build-pack.sh" --default-clone-from-receive "$repo_name")
+case "$overlay_default_output" in
+*"vex build-pack: PASS repository=$repo_name"*' pack='*' objects='*' pack_key='*' idx_key='*) ;;
+*)
+	printf 'vex receive-pack WAL E2E: mixed raw/overlay default-clone builder failed: %s\n' \
+		"$overlay_default_output" >&2
+	exit 1
+	;;
+esac
+overlay_default_rows=$(mysql_query "
+	SELECT COUNT(*) FROM pack_envelopes
+	 WHERE repo_id = UNHEX('$repo_id')
+	   AND source_kind = 'derived'
+	   AND state = 'sealed'
+	   AND is_full_snapshot = FALSE
+	   AND covering_generation = $post_seed_generation;")
+[ "$overlay_default_rows" = 1 ] || {
+	printf 'vex receive-pack WAL E2E: mixed default clone did not cover current generation (%s)\n' \
+		"$overlay_default_rows" >&2
+	exit 1
+}
+IFS=$'\t' read -r overlay_default_pack_id overlay_default_generation overlay_default_full <<EOF
+$(mysql_query "
+	SELECT LOWER(LEFT(HEX(pack_id), $oid_hex_len)), covering_generation, is_full_snapshot
+	  FROM pack_envelopes
+	 WHERE repo_id = UNHEX('$repo_id')
+	   AND source_kind = 'derived'
+	   AND state = 'sealed'
+	   AND is_full_snapshot = FALSE
+	   AND covering_generation = $post_seed_generation;")
+EOF
+[ -n "$overlay_default_pack_id" ] &&
+	[ "$overlay_default_generation" = "$post_seed_generation" ] &&
+	[ "$overlay_default_full" = 0 ] || {
+	printf 'vex receive-pack WAL E2E: mixed default-clone metadata is invalid: %s:%s:%s\n' \
+		"$overlay_default_pack_id" "$overlay_default_generation" "$overlay_default_full" >&2
+	exit 1
+}
+overlay_default_pack_mysql_id=$(mysql_oid "$overlay_default_pack_id")
+overlay_default_pack_objects=$(mysql_query "
+	SELECT COUNT(*) FROM pack_objects
+	 WHERE repo_id = UNHEX('$repo_id')
+	   AND pack_id = UNHEX('$overlay_default_pack_mysql_id');")
+[ "$overlay_default_pack_objects" = 0 ] || {
+	printf 'vex receive-pack WAL E2E: mixed default-clone envelope unexpectedly has %s pack-object rows\n' \
+		"$overlay_default_pack_objects" >&2
+	exit 1
+}
+
+# Faulting generic pack generation proves upload-pack selects this current
+# relay artifact rather than silently reconstructing the mixed closure.
+activate_gateway_relay_fault
+clone_mixed_default="$scratch/clone-mixed-default"
+git_https -c fetch.unpackLimit=1 -c protocol.version=2 \
+	clone -q --branch main "$origin" "$clone_mixed_default"
+shopt -s nullglob
+mixed_default_packs=("$clone_mixed_default"/.git/objects/pack/pack-*.pack)
+shopt -u nullglob
+[ "${#mixed_default_packs[@]}" -eq 1 ] &&
+	[ "${mixed_default_packs[0]##*/}" = "pack-$overlay_default_pack_id.pack" ] || {
+	printf '%s\n' 'vex receive-pack WAL E2E: mixed default-clone relay did not serve its selected pack' >&2
+	exit 1
+}
+[ "$("$stock_git" -C "$clone_mixed_default" rev-parse HEAD)" = "$post_seed_tip" ] || {
+	printf '%s\n' 'vex receive-pack WAL E2E: mixed default-clone relay did not reach the overlay tip' >&2
+	exit 1
+}
+"$stock_git" -C "$clone_mixed_default" fsck --no-progress >/dev/null
+restore_gateway
+
 # `pull_oid` is deliberately absent from the original heads/tags relay.  Fetch
 # it after the overlay, then publish a new branch pointing at that raw-only
 # object.  The branch update carries no new object bytes, so acceptance proves

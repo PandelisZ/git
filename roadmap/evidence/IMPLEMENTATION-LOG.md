@@ -440,3 +440,60 @@ claim. It intentionally does not consume the raw receive-pack WAL used by the
 `git/git` seed: that path already has pack-level C publication and must keep
 its synchronous S3-before-ref durability boundary until an explicit raw-pack
 handoff is implemented.
+
+## 2026-08-06 — Current clone artifact and bounded multipart transport
+
+The raw `git/git` receipt pack is `596,057,242` bytes, below S3's 5 GiB single
+PUT and CopyObject ceiling. The raw C receive path therefore remains two
+parallel pack-level staging uploads followed by its existing durable
+promotion/seal; it does not issue per-object S3 requests. A raw multipart
+rewrite is intentionally deferred because a correct implementation also needs
+multipart copy during promotion plus durable UploadId cleanup after a hard
+kill.
+
+The derived worker now exposes
+`VEX_PACK_WORKER_MULTIPART_CONCURRENCY` with a bounded `1..33` range (default
+`8`). It streams only the configured number of ranged file parts, sorts their
+ETags before completion, and aborts the upload after cancelling outstanding
+part tasks on failure. The Compose contract exposes the 64 MiB default part
+size and concurrency. Its focused E2E uses a 12 MiB incompressible blob with a
+forced 5 MiB threshold and three concurrent uploads, so the multipart path is
+actually exercised against MinIO rather than inferred from unit planning.
+
+The default-clone builder now supports a retained raw base plus later normal
+per-object overlays. It builds the current heads/tags closure, validates every
+indexed OID against either the retained raw membership map or `objects`, and
+publishes a current partial derived artifact without putting Git payloads in
+MySQL. The raw/overlay E2E forces generic `pack-objects` to fail and proves a
+stock clone plus `fsck` still succeeds through that current relay.
+
+Verified locally:
+
+```sh
+cargo test --manifest-path vex/pack-worker/Cargo.toml --locked
+# PASS: 10/10
+
+cargo clippy --manifest-path vex/pack-worker/Cargo.toml --locked \
+  --all-targets --all-features -- -D warnings
+# PASS
+
+VEX_COMPOSE_NO_BUILD=1 VEX_STOCK_GIT=/usr/bin/git \
+  t/vex/mysql-s3-receive-pack-wal.sh
+# PASS: raw base + normal overlay + current default-clone relay + stock fsck
+
+VEX_COMPOSE_NO_BUILD=1 VEX_STOCK_GIT=/usr/bin/git \
+  t/vex/mysql-s3-pack-worker.sh
+# PASS: 12 MiB fixture, 5 MiB multipart threshold, three part streams
+```
+
+After rebuilding the actual current `git/git` default-clone artifact (143.0
+MiB pack and 11.7 MiB index), the fresh five-run same-listener HTTPS control
+passed: Vex clone p50 `7151.545ms`, disk p50 `11714.118ms`, ratio `0.6105x`;
+Vex CV `2.6647%`, disk CV `2.2404%`. Receipt:
+`roadmap/evidence/perf-git-git-current-default-clone-20260806T103754Z.json`.
+
+An earlier five-run receipt with no current derived relay measured `2.7982x`
+for clone, establishing the stale-artifact cause. Its fetch samples improved
+to below the numerical target, but an unrelated probe changed the benchmark
+branch during force-with-lease restoration; the harness correctly marked that
+fetch receipt invalid. No fresh fetch or GitHub gate is claimed here.

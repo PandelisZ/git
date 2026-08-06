@@ -135,6 +135,7 @@ esac
 raw_pack_id=
 raw_pack_id_padded=
 raw_members=
+raw_generation=
 if [ -n "$receive_mode" ]; then
 	case "$receive_mode" in
 	full) receive_mode_flag=from-receive ;;
@@ -144,6 +145,31 @@ if [ -n "$receive_mode" ]; then
 		exit 2
 		;;
 	esac
+	if [ "$receive_mode" = full ]; then
+		raw_generation=$covering_generation
+	else
+		# A normal receive may overlay the raw seed with per-object metadata.
+		# The default-clone pack is built from the *current* ref closure, so it
+		# can safely reuse the newest retained raw base and validate the newer
+		# members against the normal object table below.
+		raw_generation=$(mysql_query "
+			SELECT covering_generation
+			  FROM pack_envelopes
+			 WHERE repo_id = UNHEX('$repo_id')
+			   AND source_kind = 'receive'
+			   AND state = 'sealed'
+			   AND is_full_snapshot = TRUE
+			   AND covering_generation <= $covering_generation
+			 ORDER BY covering_generation DESC, sealed_at DESC, pack_id DESC
+			 LIMIT 1;")
+	fi
+	case "$raw_generation" in
+	''|*[!0-9]*|0)
+		printf 'vex build-pack: --%s requires a retained sealed raw base at or before generation %s for %s\n' \
+			"$receive_mode_flag" "$covering_generation" "$repo_name" >&2
+		exit 1
+		;;
+	esac
 	raw_count=$(mysql_query "
 		SELECT COUNT(*)
 		  FROM pack_envelopes
@@ -151,10 +177,10 @@ if [ -n "$receive_mode" ]; then
 		   AND source_kind = 'receive'
 		   AND state = 'sealed'
 		   AND is_full_snapshot = TRUE
-		   AND covering_generation = $covering_generation;")
+		   AND covering_generation = $raw_generation;")
 	[ "$raw_count" = 1 ] || {
 		printf 'vex build-pack: --%s requires exactly one sealed raw full snapshot at generation %s for %s (found %s)\n' \
-			"$receive_mode_flag" "$covering_generation" "$repo_name" "$raw_count" >&2
+			"$receive_mode_flag" "$raw_generation" "$repo_name" "$raw_count" >&2
 		exit 1
 	}
 	IFS=$'\t' read -r raw_pack_id raw_generation raw_members <<EOF
@@ -168,11 +194,11 @@ $(mysql_query "
 	   AND p.source_kind = 'receive'
 	   AND p.state = 'sealed'
 	   AND p.is_full_snapshot = TRUE
-	   AND p.covering_generation = $covering_generation
+	   AND p.covering_generation = $raw_generation
 	 GROUP BY p.pack_id, p.covering_generation;")
 EOF
 	case "$raw_pack_id:$raw_generation:$raw_members" in
-	????????????????????????????????????????:"$covering_generation":[1-9]*|????????????????????????????????????????????????????????????????:"$covering_generation":[1-9]*) ;;
+	????????????????????????????????????????:[1-9]*:[1-9]*|????????????????????????????????????????????????????????????????:[1-9]*:[1-9]*) ;;
 	*)
 		printf 'vex build-pack: raw receive snapshot metadata is malformed for %s: %s:%s:%s\n' \
 			"$repo_name" "$raw_pack_id" "$raw_generation" "$raw_members" >&2
@@ -189,6 +215,11 @@ EOF
 		exit 1
 		;;
 	esac
+	[ "$raw_generation" -le "$covering_generation" ] || {
+		printf 'vex build-pack: retained raw base generation %s exceeds current generation %s\n' \
+			"$raw_generation" "$covering_generation" >&2
+		exit 1
+	}
 	raw_pack_id_padded="$raw_pack_id$oid_padding"
 fi
 
@@ -534,10 +565,10 @@ elif [ "$receive_mode" = default-clone ]; then
 	# The partial artifact is intentionally a separate envelope, not a
 	# replacement for the raw receive pack or the full derived snapshot.  Its
 	# local exact-index/closure check above establishes the advertised object
-	# set; this transaction establishes that every one of those indexed OIDs was
-	# durably received in the canonical raw pack.  `pack_objects` must stay
-	# empty because it has an FK to loose `objects` payloads, which raw receive
-	# ingestion deliberately does not create.
+	# set; this transaction establishes that every one of those indexed OIDs is
+	# present either in the retained canonical raw base or in the normal
+	# per-object overlay. `pack_objects` must stay empty because it has an FK to
+	# loose `objects`, while the raw portion deliberately has none.
 	#
 	# The immutable S3 keys are content-addressed.  An identical concurrent
 	# builder may have inserted this exact derived envelope first, so the
@@ -561,21 +592,14 @@ elif [ "$receive_mode" = default-clone ]; then
 		  FROM generations
 		 WHERE repo_id = UNHEX('$repo_id')
 		   AND state = 'sealed';
-		SELECT COUNT(*) INTO @vex_raw_envelopes
-		  FROM pack_envelopes
-		 WHERE repo_id = UNHEX('$repo_id')
-		   AND source_kind = 'receive'
-		   AND state = 'sealed'
-		   AND is_full_snapshot = TRUE
-		   AND covering_generation = $covering_generation;
-		SELECT COUNT(*) INTO @vex_selected_raw_envelopes
+		SELECT COUNT(*) INTO @vex_raw_base_envelopes
 		  FROM pack_envelopes
 		 WHERE repo_id = UNHEX('$repo_id')
 		   AND pack_id = UNHEX('$raw_pack_id_padded')
 		   AND source_kind = 'receive'
 		   AND state = 'sealed'
 		   AND is_full_snapshot = TRUE
-		   AND covering_generation = $covering_generation;
+		   AND covering_generation = $raw_generation;
 		SELECT COUNT(*) INTO @vex_raw_members
 		  FROM received_pack_objects
 		 WHERE repo_id = UNHEX('$repo_id')
@@ -587,7 +611,10 @@ elif [ "$receive_mode" = default-clone ]; then
 		    ON raw.repo_id = UNHEX('$repo_id')
 		   AND raw.pack_id = UNHEX('$raw_pack_id_padded')
 		   AND raw.oid = $candidate_oid_sql
-		 WHERE raw.oid IS NULL;
+		  LEFT JOIN objects AS overlay
+		    ON overlay.repo_id = UNHEX('$repo_id')
+		   AND overlay.oid = $candidate_oid_sql
+		 WHERE raw.oid IS NULL AND overlay.oid IS NULL;
 		INSERT INTO pack_envelopes
 			(repo_id, pack_id, pack_key, idx_key, bitmap_key, covering_generation,
 			 state, source_kind, receive_generation, is_full_snapshot, sealed_at)
@@ -596,13 +623,23 @@ elif [ "$receive_mode" = default-clone ]; then
 		       CURRENT_TIMESTAMP(6)
 		 WHERE @vex_repository_lock IS NOT NULL
 		   AND @vex_current_generation = $covering_generation
-		   AND @vex_raw_envelopes = 1
-		   AND @vex_selected_raw_envelopes = 1
+		   AND @vex_raw_base_envelopes = 1
 		   AND @vex_raw_members = $raw_members
 		   AND @vex_default_members = $object_count
 		   AND @vex_default_missing = 0
 		ON DUPLICATE KEY UPDATE
-			pack_id = VALUES(pack_id);
+			covering_generation = IF(source_kind = 'derived'
+				AND receive_generation IS NULL AND is_full_snapshot = FALSE,
+				VALUES(covering_generation), covering_generation),
+			state = IF(source_kind = 'derived'
+				AND receive_generation IS NULL AND is_full_snapshot = FALSE,
+				'sealed', state),
+			sealed_at = IF(source_kind = 'derived'
+				AND receive_generation IS NULL AND is_full_snapshot = FALSE,
+				CURRENT_TIMESTAMP(6), sealed_at),
+			obsolete_at = IF(source_kind = 'derived'
+				AND receive_generation IS NULL AND is_full_snapshot = FALSE,
+				NULL, obsolete_at);
 		SELECT COUNT(*) INTO @vex_published_rows
 		  FROM pack_envelopes AS p
 		 WHERE p.repo_id = UNHEX('$repo_id')
@@ -616,8 +653,7 @@ elif [ "$receive_mode" = default-clone ]; then
 		   AND p.is_full_snapshot = FALSE
 		   AND @vex_repository_lock IS NOT NULL
 		   AND @vex_current_generation = $covering_generation
-		   AND @vex_raw_envelopes = 1
-		   AND @vex_selected_raw_envelopes = 1
+		   AND @vex_raw_base_envelopes = 1
 		   AND @vex_raw_members = $raw_members
 		   AND @vex_default_members = $object_count
 		   AND @vex_default_missing = 0;
