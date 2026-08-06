@@ -117,8 +117,8 @@ static struct ref_store *vex_be_init(struct repository *repo,
 
 	base_ref_store_init(&refs->base, repo, gitdir, &refs_be_vex);
 	refs->store_flags = opts->access_flags;
-	if (vex_store_open_for_repository(repo, gitdir, &refs->store) ||
-	    vex_repo_ensure(refs->store)) {
+	/* vex_store_open_for_repository() already ensures the Vex repository. */
+	if (vex_store_open_for_repository(repo, gitdir, &refs->store)) {
 		vex_store_close(refs->store);
 		free(refs);
 		die(_("unable to open Vex reference store for '%s'"),

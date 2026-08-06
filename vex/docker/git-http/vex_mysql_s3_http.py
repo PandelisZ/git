@@ -1280,6 +1280,10 @@ def require_configuration() -> None:
 
 
 def initialize_ready_repository() -> None:
+    # A caller cannot predeclare a schema healthy: startup must validate the
+    # durable MySQL schema before request CGI children are allowed to skip the
+    # expensive global migration checks.
+    os.environ.pop("GIT_VEX_MYSQL_SCHEMA_READY", None)
     completed = subprocess.run(
         [INIT_REPOSITORY, READY_REPOSITORY],
         stdout=subprocess.PIPE,
@@ -1291,6 +1295,7 @@ def initialize_ready_repository() -> None:
     if completed.returncode:
         detail = completed.stderr.strip() or completed.stdout.strip() or "unknown error"
         fail(f"could not initialize Vex storage readiness repository: {detail}")
+    os.environ["GIT_VEX_MYSQL_SCHEMA_READY"] = "1"
     if completed.stdout.strip():
         print(completed.stdout.strip(), flush=True)
 

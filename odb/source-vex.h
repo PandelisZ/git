@@ -30,6 +30,14 @@ int vex_store_open_for_repository(struct repository *repo, const char *gitdir,
 
 bool odb_source_is_vex(const struct odb_source *source);
 struct odb_source_packed *odb_source_vex_packed_store(struct odb_source *source);
+
+/*
+ * Return only a complete current relay artifact.  This intentionally excludes
+ * a retained raw base, which is safe for normal object lookup and pack-object
+ * construction but can be stale after an incremental overlay.
+ */
+struct odb_source_packed *odb_source_vex_precomputed_relay_store(
+	struct odb_source *source);
 bool repo_uses_vex_storage(const struct repository *repo);
 
 /*

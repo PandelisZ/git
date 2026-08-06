@@ -451,6 +451,20 @@ int vex_meta_mysql_epoch_seal(struct vex_meta_mysql *db,
 	return mysql_unavailable();
 }
 
+int vex_meta_mysql_receive_epoch_seal_locked(
+	struct vex_meta_mysql *db, const char *repo_id, uint64_t generation,
+	const struct git_hash_algo *hash_algo,
+	const struct vex_ref_update *updates, size_t updates_nr)
+{
+	(void)db;
+	(void)repo_id;
+	(void)generation;
+	(void)hash_algo;
+	(void)updates;
+	(void)updates_nr;
+	return mysql_unavailable();
+}
+
 int vex_meta_mysql_receive_pack_seal_locked(
 	struct vex_meta_mysql *db, const char *repo_id, uint64_t generation,
 	const struct git_hash_algo *hash_algo,
@@ -1626,9 +1640,16 @@ int vex_meta_mysql_epoch_begin(struct vex_meta_mysql *db,
 	*generation = 0;
 	repo = sql_repo_literal(repo_id, repo_hex);
 	push = sql_uuid_literal(push_id);
+	/*
+	 * Git's in-process callers use descriptive push labels rather than UUIDs.
+	 * The normalized state adapter has always represented those as NULL, so
+	 * retain that behavior on the direct allocation path.
+	 */
+	if (!push && push_id)
+		push = vex_strdup("NULL");
 	if (!repo || !push) {
 		ret = set_error(db, VEX_META_MYSQL_ERR_INVALID,
-				"invalid repository or push UUID");
+				"invalid repository identity for epoch allocation");
 		goto out;
 	}
 	ret = acquire_generation_lock(db, repo_hex);
@@ -1658,8 +1679,9 @@ int vex_meta_mysql_epoch_begin(struct vex_meta_mysql *db,
 	}
 	next = found ? previous + 1 : 1;
 	sql = vex_format("INSERT INTO generations "
-			 "(repo_id, generation, state, push_id) VALUES "
-			 "(%s, %" PRIu64 ", 'open', %s)", repo, next, push);
+			 "(repo_id, generation, state, push_id, receive_heartbeat_at) VALUES "
+			 "(%s, %" PRIu64 ", 'open', %s, CURRENT_TIMESTAMP(6))",
+			 repo, next, push);
 	if (!sql) {
 		ret = set_error(db, VEX_META_MYSQL_ERR_NOMEM,
 				"could not allocate generation insert query");
@@ -5503,6 +5525,463 @@ static int state_update_pack_rebuild_request(
 				     " debounce=%us", sealed_generation, delay);
 		return ret;
 	}
+}
+
+static int state_target_literals(struct vex_meta_mysql *db,
+				 const struct vex_ref_target *target,
+				 const struct git_hash_algo *hash_algo,
+				 char **oid_out, char **symref_out);
+
+static int normal_receive_ref_matches_locked(
+		struct vex_meta_mysql *db, const char *repo,
+		const struct vex_ref_update *update,
+		const struct git_hash_algo *hash_algo,
+		int *exists_out, uint64_t *version_out)
+{
+	char *refname = NULL;
+	char *sql = NULL;
+	MYSQL_RES *res = NULL;
+	MYSQL_ROW row;
+	unsigned long *lengths;
+	unsigned char expected_oid[VEX_META_MYSQL_OID_BYTES];
+	uint64_t symbolic;
+	uint64_t version;
+	int exists = 0;
+	int ret = VEX_META_MYSQL_ERR;
+
+	if (!update || !exists_out || !version_out)
+		return VEX_META_MYSQL_ERR_INVALID;
+	*exists_out = 0;
+	*version_out = 0;
+	if (update->old_target.type == VEX_REF_TARGET_OID &&
+	    normalize_oid(update->old_target.oid.hash, hash_algo->rawsz,
+			  expected_oid))
+		return set_error(db, VEX_META_MYSQL_ERR_INVALID,
+				 "invalid normal receive ref expectation");
+	refname = sql_quote(db, update->refname);
+	if (!refname) {
+		ret = set_error(db, VEX_META_MYSQL_ERR_NOMEM,
+				"could not encode normal receive ref name");
+		goto out;
+	}
+	sql = vex_format("SELECT is_symbolic, target_oid, symref_target, version "
+			 "FROM refs WHERE repo_id = %s AND refname = %s FOR UPDATE",
+			 repo, refname);
+	if (!sql) {
+		ret = set_error(db, VEX_META_MYSQL_ERR_NOMEM,
+				"could not allocate normal receive ref read");
+		goto out;
+	}
+	if (mysql_query(db->mysql, sql)) {
+		ret = set_mysql_error(db, "MySQL normal receive ref read failed");
+		goto out;
+	}
+	res = mysql_store_result(db->mysql);
+	if (!res) {
+		ret = set_mysql_error(db, "MySQL normal receive ref result failed");
+		goto out;
+	}
+	if (mysql_num_fields(res) != 4) {
+		ret = set_error(db, VEX_META_MYSQL_ERR,
+				"MySQL returned invalid normal receive ref columns");
+		goto out;
+	}
+	row = mysql_fetch_row(res);
+	if (!row) {
+		if (update->expected_version ||
+		    (update->old_target.type != VEX_REF_TARGET_ANY &&
+		     update->old_target.type != VEX_REF_TARGET_NONE))
+			ret = set_error(db, VEX_META_MYSQL_ERR_CONFLICT,
+					"normal receive ref compare-and-swap failed");
+		else
+			ret = VEX_META_MYSQL_OK;
+		goto out;
+	}
+	lengths = mysql_fetch_lengths(res);
+	if (!row[0] || !row[3] || !lengths || parse_u64(row[0], &symbolic) ||
+	    symbolic > 1 || parse_u64(row[3], &version) || !version ||
+	    (symbolic && (!row[2] || !lengths[2])) ||
+	    (!symbolic && (!row[1] ||
+			   lengths[1] != VEX_META_MYSQL_OID_BYTES))) {
+		ret = set_error(db, VEX_META_MYSQL_ERR,
+				"MySQL returned invalid normal receive ref metadata");
+		goto out;
+	}
+	if ((update->expected_version && update->expected_version != version) ||
+	    update->old_target.type == VEX_REF_TARGET_NONE ||
+	    (update->old_target.type == VEX_REF_TARGET_OID &&
+	     (symbolic ||
+	      memcmp(row[1], expected_oid, sizeof(expected_oid)))) ||
+	    (update->old_target.type == VEX_REF_TARGET_SYMREF &&
+	     (!symbolic ||
+	      lengths[2] != strlen(update->old_target.symref) ||
+	      memcmp(row[2], update->old_target.symref, lengths[2])))) {
+		ret = set_error(db, VEX_META_MYSQL_ERR_CONFLICT,
+				"normal receive ref compare-and-swap failed");
+		goto out;
+	}
+	if (mysql_fetch_row(res)) {
+		ret = set_error(db, VEX_META_MYSQL_ERR,
+				"MySQL returned duplicate normal receive refs");
+		goto out;
+	}
+	exists = 1;
+	*exists_out = exists;
+	*version_out = version;
+	ret = VEX_META_MYSQL_OK;
+
+out:
+	if (res)
+		mysql_free_result(res);
+	free(sql);
+	free(refname);
+	return ret;
+}
+
+static int normal_receive_require_target_locked(
+		struct vex_meta_mysql *db, const char *repo, uint64_t generation,
+		const struct git_hash_algo *hash_algo, const struct object_id *oid)
+{
+	char *object = NULL;
+	char *sql = NULL;
+	uint64_t count;
+	int found;
+	int ret;
+
+	object = state_oid_literal(oid, hash_algo);
+	if (!object)
+		return set_error(db, VEX_META_MYSQL_ERR_INVALID,
+				 "invalid normal receive ref target");
+	sql = vex_format("SELECT EXISTS(SELECT 1 FROM objects AS o "
+			 "WHERE o.repo_id = %s AND o.oid = %s AND "
+			 "(o.state = 'published' OR EXISTS(SELECT 1 "
+			 "FROM generation_objects AS go WHERE go.repo_id = o.repo_id "
+			 "AND go.oid = o.oid AND go.generation = %" PRIu64 ")))",
+			 repo, object, generation);
+	if (!sql) {
+		ret = set_error(db, VEX_META_MYSQL_ERR_NOMEM,
+				"could not allocate normal receive object visibility query");
+		goto out;
+	}
+	ret = query_one_u64(db, sql, &count, &found);
+	free(sql);
+	sql = NULL;
+	if (ret || !found)
+		goto out;
+	if (count) {
+		ret = VEX_META_MYSQL_OK;
+		goto out;
+	}
+	sql = vex_format("SELECT EXISTS(SELECT 1 FROM received_pack_objects AS rpo "
+			 "INNER JOIN pack_envelopes AS p ON p.repo_id = rpo.repo_id "
+			 "AND p.pack_id = rpo.pack_id WHERE rpo.repo_id = %s "
+			 "AND rpo.oid = %s AND p.source_kind = 'receive' "
+			 "AND p.state IN ('sealed', 'obsolete'))", repo, object);
+	if (!sql) {
+		ret = set_error(db, VEX_META_MYSQL_ERR_NOMEM,
+				"could not allocate normal receive raw-base query");
+		goto out;
+	}
+	ret = query_one_u64(db, sql, &count, &found);
+	if (ret || !found)
+		goto out;
+	ret = count ? VEX_META_MYSQL_OK :
+		set_error(db, VEX_META_MYSQL_ERR_NOT_FOUND,
+			  "normal receive ref target is not visible");
+
+out:
+	free(sql);
+	free(object);
+	return ret;
+}
+
+static int normal_receive_publish_objects_locked(
+		struct vex_meta_mysql *db, const char *repo, uint64_t generation)
+{
+	char *sql;
+	int ret;
+
+	sql = vex_format("UPDATE objects AS o INNER JOIN generation_objects AS go "
+			 "ON go.repo_id = o.repo_id AND go.oid = o.oid "
+			 "SET o.state = 'published', "
+			 "o.published_at = COALESCE(o.published_at, CURRENT_TIMESTAMP(6)) "
+			 "WHERE go.repo_id = %s AND go.generation = %" PRIu64,
+			 repo, generation);
+	if (!sql)
+		return set_error(db, VEX_META_MYSQL_ERR_NOMEM,
+				 "could not allocate normal receive object publication");
+	ret = mysql_exec(db, sql);
+	free(sql);
+	return ret;
+}
+
+static int normal_receive_write_ref_locked(
+		struct vex_meta_mysql *db, const char *repo,
+		const struct vex_ref_update *update,
+		const struct git_hash_algo *hash_algo, int exists, uint64_t version)
+{
+	char *refname = NULL;
+	char *target_oid = NULL;
+	char *symref_target = NULL;
+	char *sql = NULL;
+	const char *symbolic;
+	uint64_t next_version;
+	int ret = VEX_META_MYSQL_ERR;
+
+	if (exists && version == UINT64_MAX)
+		return set_error(db, VEX_META_MYSQL_ERR_STATE,
+				 "normal receive ref version counter exhausted");
+	refname = sql_quote(db, update->refname);
+	if (!refname) {
+		ret = set_error(db, VEX_META_MYSQL_ERR_NOMEM,
+				"could not encode normal receive ref update");
+		goto out;
+	}
+	if (update->new_target.type == VEX_REF_TARGET_NONE) {
+		if (!exists) {
+			ret = VEX_META_MYSQL_OK;
+			goto out;
+		}
+		sql = vex_format("DELETE FROM refs WHERE repo_id = %s AND refname = %s "
+				 "AND version = %" PRIu64, repo, refname, version);
+	} else {
+		ret = state_target_literals(db, &update->new_target, hash_algo,
+					    &target_oid, &symref_target);
+		if (ret)
+			goto out;
+		symbolic = update->new_target.type == VEX_REF_TARGET_SYMREF ?
+			"TRUE" : "FALSE";
+		next_version = exists ? version + 1 : 1;
+		if (!exists)
+			sql = vex_format("INSERT INTO refs "
+					 "(repo_id, refname, is_symbolic, target_oid, symref_target, "
+					 "peeled_oid, version) VALUES (%s, %s, %s, %s, %s, NULL, "
+					 "%" PRIu64 ")",
+					 repo, refname, symbolic, target_oid,
+					 symref_target, next_version);
+		else
+			sql = vex_format("UPDATE refs SET is_symbolic = %s, "
+					 "target_oid = %s, symref_target = %s, peeled_oid = NULL, "
+					 "version = %" PRIu64 " WHERE repo_id = %s "
+					 "AND refname = %s AND version = %" PRIu64,
+					 symbolic, target_oid, symref_target, next_version,
+					 repo, refname, version);
+	}
+	if (!sql) {
+		ret = set_error(db, VEX_META_MYSQL_ERR_NOMEM,
+				"could not allocate normal receive ref update");
+		goto out;
+	}
+	ret = mysql_exec(db, sql);
+	if (!ret && mysql_affected_rows(db->mysql) != 1)
+		ret = set_error(db, VEX_META_MYSQL_ERR_CONFLICT,
+				"normal receive ref changed before publication");
+
+out:
+	free(sql);
+	free(symref_target);
+	free(target_oid);
+	free(refname);
+	return ret;
+}
+
+static int normal_receive_append_update_locked(
+		struct vex_meta_mysql *db, const char *repo,
+		const struct vex_ref_update *update,
+		const struct git_hash_algo *hash_algo)
+{
+	char *refname = NULL;
+	char *old_oid = NULL;
+	char *old_target = NULL;
+	char *new_oid = NULL;
+	char *new_target = NULL;
+	char *actor = NULL;
+	char *push_id = NULL;
+	char *reason = NULL;
+	char *message = NULL;
+	char *sql = NULL;
+	const char *is_ff;
+	int ret = VEX_META_MYSQL_ERR;
+
+	if (!update->refname || !*update->refname || strlen(update->refname) > 1024 ||
+	    (update->actor && strlen(update->actor) > 255) ||
+	    (update->reason && strlen(update->reason) > 32) ||
+	    (update->message && strlen(update->message) > 1024) ||
+	    (update->is_fast_forward != -1 && update->is_fast_forward != 0 &&
+	     update->is_fast_forward != 1)) {
+		ret = set_error(db, VEX_META_MYSQL_ERR_INVALID,
+				"invalid normal receive ref audit update");
+		goto out;
+	}
+	refname = sql_quote(db, update->refname);
+	actor = sql_quote(db, update->actor);
+	push_id = state_uuid_literal_or_null(update->push_id);
+	reason = sql_quote(db, update->reason ? update->reason : "update");
+	message = sql_quote(db, update->message);
+	if (!refname || !actor || !push_id || !reason || !message ||
+	    (ret = state_target_literals(db, &update->old_target, hash_algo,
+					 &old_oid, &old_target)) ||
+	    (ret = state_target_literals(db, &update->new_target, hash_algo,
+					 &new_oid, &new_target))) {
+		if (!ret)
+			ret = VEX_META_MYSQL_ERR_NOMEM;
+		ret = set_error(db, ret,
+				"could not encode normal receive ref audit update");
+		goto out;
+	}
+	is_ff = update->is_fast_forward < 0 ? "NULL" :
+		(update->is_fast_forward ? "TRUE" : "FALSE");
+	sql = vex_format("INSERT INTO ref_updates "
+			 "(repo_id, refname, old_oid, new_oid, old_target, new_target, "
+			 "is_ff, actor, push_id, reason, message) VALUES "
+			 "(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+			 repo, refname, old_oid, new_oid, old_target, new_target,
+			 is_ff, actor, push_id, reason, message);
+	if (!sql) {
+		ret = set_error(db, VEX_META_MYSQL_ERR_NOMEM,
+				"could not allocate normal receive ref audit insert");
+		goto out;
+	}
+	ret = mysql_exec(db, sql);
+
+out:
+	free(sql);
+	free(message);
+	free(reason);
+	free(push_id);
+	free(actor);
+	free(new_target);
+	free(new_oid);
+	free(old_target);
+	free(old_oid);
+	free(refname);
+	return ret;
+}
+
+int vex_meta_mysql_receive_epoch_seal_locked(
+	struct vex_meta_mysql *db, const char *repo_id, uint64_t generation,
+	const struct git_hash_algo *hash_algo,
+	const struct vex_ref_update *updates, size_t updates_nr)
+{
+	char *repo = NULL;
+	char *sql = NULL;
+	int *ref_exists = NULL;
+	uint64_t *ref_versions = NULL;
+	uint64_t count;
+	int found;
+	int ret = VEX_META_MYSQL_ERR;
+	size_t i;
+
+	if (!db || !db->mysql || !db->state_transaction || !generation ||
+	    !hash_algo || (hash_algo->rawsz != 20 && hash_algo->rawsz != 32) ||
+	    (!updates && updates_nr))
+		return VEX_META_MYSQL_ERR_INVALID;
+	for (i = 0; i < updates_nr; i++)
+		if (!updates[i].refname || !*updates[i].refname ||
+		    strlen(updates[i].refname) > 1024 ||
+		    updates[i].old_target.type > VEX_REF_TARGET_SYMREF ||
+		    updates[i].new_target.type == VEX_REF_TARGET_ANY ||
+		    updates[i].new_target.type > VEX_REF_TARGET_SYMREF ||
+		    (updates[i].old_target.type == VEX_REF_TARGET_SYMREF &&
+		     !updates[i].old_target.symref) ||
+		    (updates[i].new_target.type == VEX_REF_TARGET_SYMREF &&
+		     !updates[i].new_target.symref))
+			return set_error(db, VEX_META_MYSQL_ERR_INVALID,
+					 "invalid normal receive ref update");
+	if (updates_nr) {
+		CALLOC_ARRAY(ref_exists, updates_nr);
+		CALLOC_ARRAY(ref_versions, updates_nr);
+	}
+	repo = sql_repo_literal(repo_id, NULL);
+	if (!repo) {
+		ret = set_error(db, VEX_META_MYSQL_ERR_INVALID,
+				"invalid Vex repository UUID for normal receive seal");
+		goto out;
+	}
+	if ((ret = state_verify_repository(db, repo, hash_algo)))
+		goto out;
+	sql = vex_format("SELECT COUNT(*) FROM generations WHERE repo_id = %s "
+			 "AND generation = %" PRIu64 " AND state = 'open' FOR UPDATE",
+			 repo, generation);
+	if (!sql) {
+		ret = set_error(db, VEX_META_MYSQL_ERR_NOMEM,
+				"could not allocate normal receive generation check");
+		goto out;
+	}
+	ret = query_one_u64(db, sql, &count, &found);
+	free(sql);
+	sql = NULL;
+	if (ret || !found)
+		goto out;
+	if (count != 1) {
+		ret = set_error(db, VEX_META_MYSQL_ERR_STATE,
+				"cannot seal a missing or non-open normal receive generation");
+		goto out;
+	}
+	for (i = 0; i < updates_nr; i++) {
+		ret = normal_receive_ref_matches_locked(db, repo, &updates[i],
+						       hash_algo, &ref_exists[i],
+						       &ref_versions[i]);
+		if (ret)
+			goto out;
+		if (updates[i].new_target.type == VEX_REF_TARGET_OID) {
+			ret = normal_receive_require_target_locked(
+				db, repo, generation, hash_algo,
+				&updates[i].new_target.oid);
+			if (ret)
+				goto out;
+		}
+	}
+	if ((ret = normal_receive_publish_objects_locked(db, repo, generation)))
+		goto out;
+	for (i = 0; i < updates_nr; i++) {
+		if ((ret = normal_receive_write_ref_locked(
+			     db, repo, &updates[i], hash_algo, ref_exists[i],
+			     ref_versions[i])) ||
+		    (ret = normal_receive_append_update_locked(
+			     db, repo, &updates[i], hash_algo)))
+			goto out;
+	}
+	sql = vex_format("UPDATE generations SET state = 'sealed', "
+			 "sealed_at = CURRENT_TIMESTAMP(6) WHERE repo_id = %s "
+			 "AND generation = %" PRIu64 " AND state = 'open'",
+			 repo, generation);
+	if (!sql) {
+		ret = set_error(db, VEX_META_MYSQL_ERR_NOMEM,
+				"could not allocate normal receive generation seal");
+		goto out;
+	}
+	ret = mysql_exec(db, sql);
+	free(sql);
+	sql = NULL;
+	if (ret)
+		goto out;
+	if (mysql_affected_rows(db->mysql) != 1) {
+		ret = set_error(db, VEX_META_MYSQL_ERR_STATE,
+				"normal receive generation changed before seal");
+		goto out;
+	}
+	sql = vex_format("UPDATE pack_envelopes SET state = 'obsolete', "
+			 "obsolete_at = CURRENT_TIMESTAMP(6) WHERE repo_id = %s "
+			 "AND source_kind = 'derived' AND state = 'sealed' "
+			 "AND covering_generation < %" PRIu64, repo, generation);
+	if (!sql) {
+		ret = set_error(db, VEX_META_MYSQL_ERR_NOMEM,
+				"could not allocate normal receive derived-pack invalidation");
+		goto out;
+	}
+	ret = mysql_exec(db, sql);
+	free(sql);
+	sql = NULL;
+	if (!ret)
+		ret = state_update_pack_rebuild_request(db, repo, generation, 0);
+
+out:
+	free(sql);
+	free(ref_versions);
+	free(ref_exists);
+	free(repo);
+	return ret;
 }
 
 static int state_insert_packs(struct vex_meta_mysql *db, const char *repo,

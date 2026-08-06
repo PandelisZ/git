@@ -457,7 +457,7 @@ static int vex_precomputed_pack_eligible(struct upload_pack_data *data,
 
 	/* The complete derived snapshot remains the general direct-relay path. */
 	odb_source_prepare(source, ODB_PREPARE_FLUSH_CACHES);
-	packed = odb_source_vex_packed_store(source);
+	packed = odb_source_vex_precomputed_relay_store(source);
 	if (!packed)
 		return vex_precomputed_pack_fallback("no current verified Vex pack cache");
 	pack = vex_precomputed_packed_source_one_pack(packed);

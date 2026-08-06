@@ -194,7 +194,8 @@ int vex_meta_mysql_ensure_repository(struct vex_meta_mysql *db,
 				     const char *name);
 
 /*
- * Allocate an open generation.  push_id is an optional lower-case UUID.  The
+ * Allocate an open generation.  push_id may be a lower-case UUID; descriptive
+ * internal labels are represented as NULL in the normalized schema. The
  * allocator uses a MySQL advisory lock per repository before inserting.
  */
 int vex_meta_mysql_epoch_begin(struct vex_meta_mysql *db,
@@ -380,6 +381,19 @@ int vex_meta_mysql_add_commit_parent(struct vex_meta_mysql *db,
 /* Make every object claimed by an open generation visible, then seal it. */
 int vex_meta_mysql_epoch_seal(struct vex_meta_mysql *db,
 			      const char *repo_id, uint64_t generation);
+
+/*
+ * Normal per-object receive publication boundary. The caller has already
+ * promoted its staged S3 objects, then holds vex_meta_mysql_state_lock().
+ * This verifies the complete receive ref transaction, publishes the
+ * generation's object claims, appends its audit records, obsoletes stale
+ * derived packs, queues a replacement, and seals the generation in that same
+ * MySQL transaction.
+ */
+int vex_meta_mysql_receive_epoch_seal_locked(
+	struct vex_meta_mysql *db, const char *repo_id, uint64_t generation,
+	const struct git_hash_algo *hash_algo,
+	const struct vex_ref_update *updates, size_t updates_nr);
 
 /*
  * Direct seed publication boundary.  The caller first promotes the staged

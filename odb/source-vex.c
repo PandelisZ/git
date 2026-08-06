@@ -379,6 +379,126 @@ static char *vex_source_pack_cache_root(const struct odb_source_vex *source)
 		       vex_store_repo_id(source->store));
 }
 
+/*
+ * A pack cache belongs to the local Vex scratch volume, but each smart-HTTP
+ * request has a fresh Git process.  Rehashing a large immutable pack in every
+ * process makes a warm cache no better than a download-sized read.  Persist a
+ * small, atomically-published verification witness after the first full hash.
+ * The witness is tied to the expected pack id and the local file identity, so
+ * a removed, replaced, or resized cache entry is verified again.
+ */
+#define VEX_PACK_CACHE_VERIFICATION_MAX (GIT_MAX_HEXSZ + 256)
+
+static int vex_source_pack_cache_verification_payload(
+	struct odb_source_vex *source, const char *pack_path,
+	const struct vex_pack_artifact *artifact, char *buffer, size_t buffer_len)
+{
+	const struct git_hash_algo *hash_algo = source->base.odb->repo->hash_algo;
+	struct strbuf idx_path = STRBUF_INIT;
+	struct stat pack_st;
+	struct stat idx_st;
+	char pack_hex[GIT_MAX_HEXSZ + 1];
+	size_t pack_path_len;
+	int pack_fd = -1;
+	int idx_fd = -1;
+	int len = -1;
+
+	if (!pack_path || !artifact || !hash_algo || !buffer || !buffer_len)
+		return -1;
+	pack_path_len = strlen(pack_path);
+	if (pack_path_len <= 5 ||
+	    strcmp(pack_path + pack_path_len - 5, ".pack"))
+		goto out;
+	strbuf_add(&idx_path, pack_path, pack_path_len - 5);
+	strbuf_addstr(&idx_path, ".idx");
+	pack_fd = open_nofollow(pack_path, O_RDONLY);
+	idx_fd = open_nofollow(idx_path.buf, O_RDONLY);
+	if (pack_fd < 0 || idx_fd < 0 || fstat(pack_fd, &pack_st) ||
+	    fstat(idx_fd, &idx_st) || !S_ISREG(pack_st.st_mode) ||
+	    !S_ISREG(idx_st.st_mode))
+		goto out;
+	hash_to_hex_algop_r(pack_hex, artifact->pack_id.hash, hash_algo);
+	len = xsnprintf(buffer, buffer_len,
+			"vex-pack-cache-v2\n%s\n%"PRIuMAX" %"PRIuMAX" %"PRIuMAX
+			" %"PRIdMAX" %"PRIdMAX"\n%"PRIuMAX" %"PRIuMAX" %"PRIuMAX
+			" %"PRIdMAX" %"PRIdMAX"\n",
+			pack_hex, (uintmax_t)pack_st.st_dev, (uintmax_t)pack_st.st_ino,
+			(uintmax_t)pack_st.st_size, (intmax_t)pack_st.st_mtime,
+			(intmax_t)pack_st.st_ctime, (uintmax_t)idx_st.st_dev,
+			(uintmax_t)idx_st.st_ino, (uintmax_t)idx_st.st_size,
+			(intmax_t)idx_st.st_mtime, (intmax_t)idx_st.st_ctime);
+	if (len < 0 || (size_t)len >= buffer_len)
+		len = -1;
+
+out:
+	if (idx_fd >= 0)
+		close(idx_fd);
+	if (pack_fd >= 0)
+		close(pack_fd);
+	strbuf_release(&idx_path);
+	return len;
+}
+
+static int vex_source_pack_cache_is_verified(
+	struct odb_source_vex *source, struct packed_git *pack,
+	const struct vex_pack_artifact *artifact, const char *verification_path)
+{
+	char expected[VEX_PACK_CACHE_VERIFICATION_MAX];
+	char actual[VEX_PACK_CACHE_VERIFICATION_MAX];
+	struct stat st;
+	int expected_len;
+	int fd = -1;
+	int ret = 0;
+
+	if (!pack || !verification_path)
+		return 0;
+	expected_len = vex_source_pack_cache_verification_payload(
+		source, pack->pack_name, artifact, expected, sizeof(expected));
+	if (expected_len < 0)
+		return 0;
+	fd = open_nofollow(verification_path, O_RDONLY);
+	if (fd < 0 || fstat(fd, &st) || !S_ISREG(st.st_mode) ||
+	    st.st_size != expected_len ||
+	    read_in_full(fd, actual, expected_len) != expected_len)
+		goto out;
+	ret = !memcmp(actual, expected, expected_len);
+
+out:
+	if (fd >= 0)
+		close(fd);
+	return ret;
+}
+
+static int vex_source_write_pack_cache_verification(
+	struct odb_source_vex *source, struct packed_git *pack,
+	const struct vex_pack_artifact *artifact, const char *verification_path)
+{
+	char content[VEX_PACK_CACHE_VERIFICATION_MAX];
+	char *template = NULL;
+	struct tempfile *temp = NULL;
+	int content_len;
+	int ret = -1;
+
+	if (!pack || !verification_path)
+		return -1;
+	content_len = vex_source_pack_cache_verification_payload(
+		source, pack->pack_name, artifact, content, sizeof(content));
+	if (content_len < 0)
+		goto out;
+	template = xstrfmt("%s-XXXXXX", verification_path);
+	temp = mks_tempfile_m(template, 0600);
+	if (!temp ||
+	    write_in_full(get_tempfile_fd(temp), content, content_len) != content_len ||
+	    rename_tempfile(&temp, verification_path))
+		goto out;
+	ret = 0;
+
+out:
+	delete_tempfile(&temp);
+	free(template);
+	return ret;
+}
+
 static int vex_source_verify_pack_checksum(struct odb_source_vex *source,
 					    struct packed_git *pack,
 					    const struct vex_pack_artifact *artifact)
@@ -426,7 +546,8 @@ out:
 
 static struct odb_source_packed *vex_source_open_verified_pack_cache(
 		struct odb_source_vex *source, const char *objects_path,
-		const struct vex_pack_artifact *artifact)
+		const struct vex_pack_artifact *artifact,
+		const char *verification_path)
 {
 	struct odb_source_packed *cache;
 	struct packfile_list_entry *entry;
@@ -434,12 +555,24 @@ static struct odb_source_packed *vex_source_open_verified_pack_cache(
 	cache = odb_source_packed_new(source->base.odb, objects_path, false);
 	odb_source_prepare(&cache->base, ODB_PREPARE_FLUSH_CACHES);
 	entry = packfile_store_get_packs(cache);
-	if (!entry || entry->next || verify_pack_index(entry->pack) ||
+	if (!entry || entry->next) {
+		odb_source_close(&cache->base);
+		odb_source_free(&cache->base);
+		return NULL;
+	}
+	if (verification_path && vex_source_pack_cache_is_verified(
+		    source, entry->pack, artifact, verification_path))
+		return cache;
+	if (verify_pack_index(entry->pack) ||
 	    vex_source_verify_pack_checksum(source, entry->pack, artifact)) {
 		odb_source_close(&cache->base);
 		odb_source_free(&cache->base);
 		return NULL;
 	}
+	if (verification_path && vex_source_write_pack_cache_verification(
+		    source, entry->pack, artifact, verification_path))
+		trace_printf("vex: could not persist verified pack cache witness %s",
+			     verification_path);
 	return cache;
 }
 
@@ -455,7 +588,7 @@ static int vex_source_install_receive_pack_cache(
 		return -1;
 	oidcpy(&artifact.pack_id, pack_id);
 	cache = vex_source_open_verified_pack_cache(source, objects_path,
-					      &artifact);
+					      &artifact, NULL);
 	if (!cache)
 		return -1;
 	vex_source_release_receive_pack_cache(source);
@@ -497,6 +630,7 @@ static int vex_source_materialize_pack_cache(
 	char *pack_dir = NULL;
 	char *pack_path = NULL;
 	char *idx_path = NULL;
+	char *verification_path = NULL;
 	char *lock_path = NULL;
 	int ret = -1;
 
@@ -511,11 +645,14 @@ static int vex_source_materialize_pack_cache(
 	pack_dir = xstrfmt("%s/pack", objects_path);
 	pack_path = xstrfmt("%s/pack-%s.pack", pack_dir, pack_id);
 	idx_path = xstrfmt("%s/pack-%s.idx", pack_dir, pack_id);
+	verification_path = xstrfmt("%s/pack-%s.vex-verified", pack_dir,
+					pack_id);
 	lock_path = xstrfmt("%s/.vex-pack-install-%s", pack_dir, pack_id);
 	if (safe_create_leading_directories_const(source->base.odb->repo,
 						  pack_path) < 0)
 		goto out;
-	cache = vex_source_open_verified_pack_cache(source, objects_path, artifact);
+	cache = vex_source_open_verified_pack_cache(source, objects_path, artifact,
+						      verification_path);
 	/*
 	 * The index is the pack discovery point. A reader can adopt an immutable,
 	 * verified pair without contending on the installer lock: the installer
@@ -530,10 +667,11 @@ static int vex_source_materialize_pack_cache(
 	/* An installer may have completed while this process waited for its lock. */
 	if (!cache)
 		cache = vex_source_open_verified_pack_cache(source, objects_path,
-						      artifact);
+							      artifact, verification_path);
 	if (!cache) {
 		unlink(pack_path);
 		unlink(idx_path);
+		unlink(verification_path);
 		pack_temp = vex_source_pack_cache_tempfile(pack_dir, "pack");
 		idx_temp = vex_source_pack_cache_tempfile(pack_dir, "idx");
 		if (!pack_temp || !idx_temp || close_tempfile_gently(pack_temp) < 0 ||
@@ -550,7 +688,7 @@ static int vex_source_materialize_pack_cache(
 			goto out;
 		}
 		cache = vex_source_open_verified_pack_cache(source, objects_path,
-						      artifact);
+							      artifact, verification_path);
 		if (!cache) {
 			unlink(pack_path);
 			unlink(idx_path);
@@ -575,6 +713,7 @@ out:
 	free(idx_path);
 	free(pack_path);
 	free(pack_dir);
+	free(verification_path);
 	free(objects_path);
 	free(root);
 	return ret;
@@ -1737,7 +1876,19 @@ struct odb_source_packed *odb_source_vex_packed_store(struct odb_source *base)
 		return NULL;
 	source = container_of(base, struct odb_source_vex, base);
 	return source->receive_pack_cache ? source->receive_pack_cache :
-		source->pack_cache;
+		source->pack_cache ? source->pack_cache : source->raw_base_cache;
+}
+
+struct odb_source_packed *odb_source_vex_precomputed_relay_store(
+	struct odb_source *base)
+{
+	struct odb_source_vex *source;
+
+	if (!odb_source_is_vex(base))
+		return NULL;
+	source = container_of(base, struct odb_source_vex, base);
+	/* A raw base is a lookup layer, never a whole-pack relay after overlays. */
+	return source->pack_cache;
 }
 
 int odb_source_vex_open_default_clone_pack(

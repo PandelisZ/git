@@ -184,8 +184,9 @@ git_https clone -q "$origin" "$warm_clone"
 cache_dir="/var/git-scratch/vex-pack-cache/$repo_id/$pack_id/objects/pack"
 cache_pack="$cache_dir/pack-$pack_id.pack"
 cache_idx="$cache_dir/pack-$pack_id.idx"
-"${compose[@]}" exec -T git-http /bin/sh -c 'test -s "$1" && test -s "$2"' \
-	sh "$cache_pack" "$cache_idx"
+cache_verified="$cache_dir/pack-$pack_id.vex-verified"
+"${compose[@]}" exec -T git-http /bin/sh -c 'test -s "$1" && test -s "$2" && test -s "$3"' \
+	sh "$cache_pack" "$cache_idx" "$cache_verified"
 
 # The gateway now rejects every S3 GET, including a derived-pack download.
 # This succeeds only when the new request opens the already verified local

@@ -6,6 +6,7 @@
 #include "oidset.h"
 #include "object.h"
 #include "object-file.h"
+#include "parse.h"
 #include "run-command.h"
 #include "strbuf.h"
 #include "tempfile.h"
@@ -386,10 +387,19 @@ static int meta_ensure(struct vex_store *store)
 
 	if (store->backend != VEX_STORE_BACKEND_MYSQL_S3)
 		return vex_meta_fs_ensure(store->meta);
-	ret = meta_mysql_result(vex_meta_mysql_schema_check(store->meta_mysql,
+	/*
+	 * The Vex smart-HTTP gateway validates and migrates the global schema before
+	 * it accepts requests, then marks its child CGI environment accordingly.
+	 * Avoid repeating information_schema scans and migration advisory locks for
+	 * every fresh upload-pack/pack-objects process. Direct callers retain the
+	 * defensive check unless they explicitly run behind that startup boundary.
+	 */
+	if (!git_env_bool("GIT_VEX_MYSQL_SCHEMA_READY", 0)) {
+		ret = meta_mysql_result(vex_meta_mysql_schema_check(store->meta_mysql,
 								     NULL));
-	if (ret)
-		return ret;
+		if (ret)
+			return ret;
+	}
 	return meta_mysql_result(vex_meta_mysql_ensure_repository(
 		store->meta_mysql, store->repo_id, store->hash_algo->name, NULL));
 }
@@ -893,6 +903,8 @@ static int vex_store_recover_expired_receive_packs(
 			raw_pack_id));
 		if (ret == VEX_STORE_ERR_NOT_FOUND) {
 			meta_unlock(store, &lock);
+			/* This stale ordinary epoch has no raw receive-pack envelope. */
+			ret = VEX_STORE_OK;
 			continue;
 		}
 		if (ret)
@@ -938,7 +950,7 @@ int vex_store_recover_expired_epochs(struct vex_store *store,
 				      unsigned int *recovered)
 {
 	struct vex_meta_lock lock;
-	struct vex_meta_state state;
+	struct vex_meta_state state = { 0 };
 	struct vex_expired_epoch_list epochs = { 0 };
 	size_t i;
 	int ret;
@@ -954,12 +966,23 @@ int vex_store_recover_expired_epochs(struct vex_store *store,
 					       &raw_recovered);
 	if (ret)
 		return ret;
-	if ((ret = load_locked(store, &lock, &state)))
+	if ((ret = meta_lock(store, &lock)))
 		return ret;
 	ret = meta_mysql_result(vex_meta_mysql_state_for_each_expired_open_locked(
 		store->meta_mysql, store->repo_id, min_age_seconds,
 		collect_expired_epoch, &epochs));
 	if (ret)
+		goto out;
+	/*
+	 * Each smart-HTTP request opens a fresh store.  In the usual case there
+	 * are no stale generations, so avoid loading every ref, audit row, and
+	 * object merely to discover that recovery has nothing to do.  Keep the
+	 * repository lock while loading the snapshot when candidates do exist so
+	 * their recovery still has the original single-transaction semantics.
+	 */
+	if (!epochs.nr)
+		goto out;
+	if ((ret = meta_load(store, &state)))
 		goto out;
 	for (i = 0; i < epochs.nr; i++) {
 		struct vex_meta_epoch *epoch = find_epoch(&state, epochs.items[i].id);
@@ -1795,7 +1818,25 @@ int vex_epoch_allocate(struct vex_store *store, const char *push_id,
 	if (!store || !epoch_out)
 		return VEX_STORE_ERR_INVALID;
 	*epoch_out = NULL;
-	if ((ret = vex_repo_ensure(store)) || (ret = load_locked(store, &lock, &state)))
+	if ((ret = vex_repo_ensure(store)))
+		return ret;
+	if (store->backend == VEX_STORE_BACKEND_MYSQL_S3) {
+		uint64_t generation;
+
+		ret = meta_mysql_result(vex_meta_mysql_epoch_begin(
+			store->meta_mysql, store->repo_id, push_id, &generation));
+		if (ret)
+			return ret;
+		CALLOC_ARRAY(epoch, 1);
+		epoch->store = store;
+		epoch->id = generation;
+		epoch->active = 1;
+		epoch->owner = 1;
+		epoch->last_heartbeat = time(NULL);
+		*epoch_out = epoch;
+		return VEX_STORE_OK;
+	}
+	if ((ret = load_locked(store, &lock, &state)))
 		return ret;
 	ALLOC_GROW(state.epochs, state.epochs_nr + 1, state.epochs_alloc);
 	meta_epoch = &state.epochs[state.epochs_nr++];
@@ -1843,6 +1884,28 @@ int vex_epoch_attach(struct vex_store *store, uint64_t epoch_id,
 	if (!store || !epoch_out || !epoch_id)
 		return VEX_STORE_ERR_INVALID;
 	*epoch_out = NULL;
+	if (store->backend == VEX_STORE_BACKEND_MYSQL_S3) {
+		enum vex_meta_mysql_epoch_state mysql_state;
+
+		ret = meta_mysql_result(vex_meta_mysql_epoch_get_state(
+			store->meta_mysql, store->repo_id, epoch_id, &mysql_state));
+		if (ret)
+			return ret;
+		if (mysql_state != VEX_META_MYSQL_EPOCH_OPEN)
+			return VEX_STORE_ERR_STATE;
+		CALLOC_ARRAY(epoch, 1);
+		epoch->store = store;
+		epoch->id = epoch_id;
+		epoch->active = 1;
+		epoch->owner = 0;
+		ret = vex_epoch_heartbeat_now(epoch, 1);
+		if (ret) {
+			vex_epoch_detach(epoch);
+			return ret;
+		}
+		*epoch_out = epoch;
+		return VEX_STORE_OK;
+	}
 	if ((ret = meta_load(store, &state)))
 		return ret;
 	meta_epoch = find_epoch(&state, epoch_id);
@@ -3549,6 +3612,24 @@ int vex_ref_transaction_commit(struct vex_ref_transaction *transaction)
 		return ret;
 	}
 	vex_test_kill_at("after-blob-promote");
+	if (store->backend == VEX_STORE_BACKEND_MYSQL_S3) {
+		/*
+		 * Staged objects are already durable in S3 and the repository row is
+		 * locked. Publish this receive by touching only its generation, refs,
+		 * audit rows, and stale pack state instead of rewriting every ref and
+		 * audit record in the repository.
+		 */
+		ret = meta_mysql_result(vex_meta_mysql_receive_epoch_seal_locked(
+			store->meta_mysql, store->repo_id, epoch->id, store->hash_algo,
+			transaction->updates, transaction->updates_nr));
+		if (!ret)
+			ret = meta_commit_locked(store, &lock);
+		if (!ret) {
+			epoch->active = 0;
+			transaction->committed = 1;
+		}
+		goto out;
+	}
 	if ((ret = publish_epoch(store, &state, epoch->id)))
 		goto out;
 	for (i = 0; i < transaction->updates_nr; i++) {
