@@ -1,0 +1,319 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="description" content="An interactive, byte-level tour of Git's object database, index, refs, commits, and packfiles." />
+    <title>Inside Git — Interactive Internals Lab</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <a class="skip-link" href="#lab">Skip to the lab</a>
+
+    <header class="topbar">
+      <a class="brand" href="#top" aria-label="Inside Git home">
+        <span class="brand-mark" aria-hidden="true">
+          <svg viewBox="0 0 28 28"><path d="M7 8.5 14 4l7 4.5v11L14 24l-7-4.5z"/><circle cx="10" cy="10" r="1.5"/><circle cx="18" cy="11.5" r="1.5"/><circle cx="12" cy="18" r="1.5"/><path d="m10 10 8 1.5M10 10l2 8"/></svg>
+        </span>
+        <span>inside<span class="accent">git</span></span>
+      </a>
+      <nav aria-label="Primary navigation">
+        <a href="#lab">Repository lab</a>
+        <a href="#objects">Objects</a>
+        <a href="#packs">Packfiles</a>
+        <a href="#clones">Clones</a>
+        <a href="#deep-dives">Deep dives</a>
+      </nav>
+      <a class="edition-link" href="./jj.html">JJ edition <span aria-hidden="true">→</span></a>
+    </header>
+
+    <main id="top">
+      <section class="hero" aria-labelledby="hero-title">
+        <div class="hero-copy reveal">
+          <p class="eyebrow">A systems-level field guide</p>
+          <h1 id="hero-title">Git is a graph of immutable objects with movable names.</h1>
+          <p class="hero-lede">Build a repository one operation at a time. Watch bytes become object IDs, files become trees, commits move refs, and loose objects collapse into delta-compressed packs.</p>
+          <div class="hero-actions">
+            <a class="primary-button" href="#lab">Start with <code>git init</code></a>
+            <a class="text-link" href="#mental-model">Learn the mental model <span aria-hidden="true">→</span></a>
+          </div>
+          <dl class="hero-stats" aria-label="Topics covered">
+            <div><dt>4</dt><dd>canonical object types</dd></div>
+            <div><dt>3</dt><dd>simultaneous trees</dd></div>
+            <div><dt>2</dt><dd>delta encodings</dd></div>
+          </dl>
+        </div>
+
+        <div class="hero-visual reveal" aria-label="Animated Git data flow">
+          <div class="orbit orbit-a"></div>
+          <div class="orbit orbit-b"></div>
+          <div class="flow-node node-file"><span>working tree</span><strong>app.js</strong></div>
+          <div class="flow-node node-index"><span>index</span><strong>stage 0</strong></div>
+          <div class="flow-node node-object"><span>object database</span><strong>blob 8f2a…</strong></div>
+          <svg class="flow-lines" viewBox="0 0 620 480" aria-hidden="true">
+            <path d="M155 115 C290 85 315 220 395 224"/>
+            <path d="M430 250 C490 310 390 395 270 380"/>
+            <circle cx="155" cy="115" r="4"/><circle cx="395" cy="224" r="4"/><circle cx="270" cy="380" r="4"/>
+          </svg>
+          <div class="hero-caption"><span class="status-dot"></span> Content-addressed, not file-addressed</div>
+        </div>
+      </section>
+
+      <section class="mental-model" id="mental-model" aria-labelledby="mental-title">
+        <div class="section-heading reveal">
+          <p class="eyebrow">The invariant to remember</p>
+          <h2 id="mental-title">Porcelain changes state. Plumbing exposes the machinery.</h2>
+          <p>Most commands can be reduced to writing objects, updating the index, or moving refs. The object graph itself never mutates.</p>
+        </div>
+        <div class="model-strip reveal">
+          <article><span class="step-number">01</span><h3>Content becomes identity</h3><p><code>hash(type + size + NUL + content)</code>. Equal bytes produce the same object ID.</p></article>
+          <span class="strip-arrow" aria-hidden="true">→</span>
+          <article><span class="step-number">02</span><h3>Objects point backward</h3><p>Trees point to blobs and trees. Commits point to a root tree and parent commits.</p></article>
+          <span class="strip-arrow" aria-hidden="true">→</span>
+          <article><span class="step-number">03</span><h3>Refs supply names</h3><p><code>main</code> is a movable file containing an OID. <code>HEAD</code> usually points to that ref.</p></article>
+        </div>
+      </section>
+
+      <section class="lab-section" id="lab" aria-labelledby="lab-title">
+        <div class="section-heading reveal">
+          <p class="eyebrow">Functional repository visualizer</p>
+          <h2 id="lab-title">Run the story. Inspect every side effect.</h2>
+          <p>Each command updates a simulated working tree, index, object database, refs, and reflog using Git's real conceptual rules.</p>
+        </div>
+
+        <div class="lab-shell reveal">
+          <div class="lab-toolbar">
+            <div class="window-controls" aria-hidden="true"><i></i><i></i><i></i></div>
+            <div class="repo-path"><span>~/interview/demo</span><strong id="branch-indicator">unborn branch</strong></div>
+            <button class="icon-button" id="reset-lab" type="button" title="Reset repository" aria-label="Reset repository">
+              <svg viewBox="0 0 24 24"><path d="M4 12a8 8 0 1 0 2.34-5.66L4 8.68M4 4v4.68h4.68"/></svg>
+            </button>
+          </div>
+
+          <div class="lab-grid">
+            <aside class="command-panel" aria-label="Git command sequence">
+              <div class="panel-label">Command sequence</div>
+              <div class="command-list" id="command-list"></div>
+              <div class="command-help" id="command-help">
+                <span>Next mutation</span>
+                <p>Select or run the highlighted command to see what changes and why.</p>
+              </div>
+            </aside>
+
+            <div class="repo-panel">
+              <div class="repo-tabs" role="tablist" aria-label="Repository views">
+                <button role="tab" aria-selected="true" aria-controls="tree-view" id="tree-tab" data-tab="tree-view">File tree</button>
+                <button role="tab" aria-selected="false" aria-controls="three-trees-view" id="three-trees-tab" data-tab="three-trees-view">Three trees</button>
+                <button role="tab" aria-selected="false" aria-controls="reflog-view" id="reflog-tab" data-tab="reflog-view">Reflog</button>
+              </div>
+
+              <div class="tab-panel active" id="tree-view" role="tabpanel" aria-labelledby="tree-tab">
+                <div class="tree-layout">
+                  <div class="file-tree" id="file-tree" aria-label="Repository file tree"></div>
+                  <div class="file-inspector" id="file-inspector">
+                    <div class="empty-state">
+                      <svg viewBox="0 0 48 48" aria-hidden="true"><path d="M9 10h13l4 5h13v23H9z"/><path d="M15 23h18M15 29h12"/></svg>
+                      <h3>No repository yet</h3>
+                      <p>Run <code>git init</code> to create the administrative directory.</p>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              <div class="tab-panel" id="three-trees-view" role="tabpanel" aria-labelledby="three-trees-tab" hidden>
+                <div class="three-trees" id="three-trees"></div>
+              </div>
+
+              <div class="tab-panel" id="reflog-view" role="tabpanel" aria-labelledby="reflog-tab" hidden>
+                <div class="reflog-list" id="reflog-list"></div>
+              </div>
+            </div>
+
+            <aside class="graph-panel" aria-label="Commit graph">
+              <div class="panel-label">Reachability graph</div>
+              <div class="graph-legend"><span><i class="legend-ref"></i>ref</span><span><i class="legend-head"></i>HEAD</span></div>
+              <div class="commit-graph" id="commit-graph"></div>
+              <div class="graph-note" id="graph-note">No commits exist. An unborn branch is a ref name that has no value yet.</div>
+            </aside>
+          </div>
+
+          <div class="terminal" aria-live="polite">
+            <div class="terminal-prompt"><span>demo</span><b id="terminal-branch">(no commits)</b><i>$</i><code id="terminal-command">Choose “git init” to begin</code></div>
+            <pre id="terminal-output">This simulator exposes the state Git normally keeps out of sight.</pre>
+          </div>
+        </div>
+      </section>
+
+      <section class="object-section" id="objects" aria-labelledby="objects-title">
+        <div class="section-heading reveal">
+          <p class="eyebrow">Object database</p>
+          <h2 id="objects-title">Four types. One addressing rule.</h2>
+          <p>Select an object, edit its payload, then watch the canonical bytes and object ID change. The filename is derived from content—not chosen by the user.</p>
+        </div>
+
+        <div class="object-workbench reveal">
+          <div class="object-types" role="tablist" aria-label="Git object types">
+            <button role="tab" aria-selected="true" data-object-type="blob"><span>01</span><strong>blob</strong><small>file bytes</small></button>
+            <button role="tab" aria-selected="false" data-object-type="tree"><span>02</span><strong>tree</strong><small>directory snapshot</small></button>
+            <button role="tab" aria-selected="false" data-object-type="commit"><span>03</span><strong>commit</strong><small>history node</small></button>
+            <button role="tab" aria-selected="false" data-object-type="tag"><span>04</span><strong>tag</strong><small>signed annotation</small></button>
+          </div>
+
+          <div class="object-main">
+            <div class="object-editor">
+              <div class="code-header"><span id="object-type-label">blob payload</span><span id="payload-count">0 bytes</span></div>
+              <textarea id="object-payload" spellcheck="false" aria-label="Object payload"></textarea>
+              <div class="object-explanation" id="object-explanation"></div>
+            </div>
+
+            <div class="hash-pipeline" aria-label="Object hashing pipeline">
+              <div class="pipeline-step"><span>1</span><p><strong>Header</strong><code id="object-header"></code></p></div>
+              <div class="pipeline-join" aria-hidden="true">+</div>
+              <div class="pipeline-step"><span>2</span><p><strong>Payload</strong><code id="payload-preview"></code></p></div>
+              <div class="pipeline-arrow" aria-hidden="true">→</div>
+              <div class="pipeline-step hash-result"><span>3</span><p><strong>SHA-1 object ID</strong><code id="object-hash"></code></p></div>
+            </div>
+            <div class="loose-path"><span>loose object path</span><code id="loose-path"></code><button id="copy-oid" type="button">Copy OID</button></div>
+          </div>
+        </div>
+      </section>
+
+      <section class="pack-section" id="packs" aria-labelledby="packs-title">
+        <div class="pack-heading reveal">
+          <div>
+            <p class="eyebrow">Packfile laboratory</p>
+            <h2 id="packs-title">Compression changes representation, never identity.</h2>
+          </div>
+          <p>Loose objects repeat headers and compress independently. Packs combine objects and may represent similar objects as deltas. Git reconstructs canonical content before verifying its OID.</p>
+        </div>
+
+        <div class="pack-lab reveal">
+          <div class="pack-controls">
+            <div class="segmented" role="group" aria-label="Pack display mode">
+              <button class="active" data-pack-mode="loose" type="button">Loose objects</button>
+              <button data-pack-mode="packed" type="button">After <code>git gc</code></button>
+            </div>
+            <button class="primary-button compact" id="run-pack" type="button">Pack objects</button>
+          </div>
+
+          <div class="pack-stage" id="pack-stage">
+            <div class="pack-state-intro">
+              <div><span id="pack-state-step">Before packing</span><strong id="pack-state-title">Six independent loose-object files</strong></div>
+              <p id="pack-state-description">Each object is stored in its own path. The path comes from the object ID; the file contains the zlib-compressed canonical object.</p>
+            </div>
+            <div class="loose-object-field" id="loose-object-field"></div>
+            <div class="packed-object-view" id="packed-object-view" hidden>
+              <div class="pack-file">
+                <div class="pack-byte pack-header"><span>file header</span><strong>PACK</strong><small>version 2 · 6 entries</small></div>
+                <div class="pack-byte base-entry"><span>entry 1</span><strong>base blob</strong><small>complete content · zlib</small></div>
+                <div class="pack-byte delta-entry"><span>entry 2</span><strong>delta blob</strong><small>copy from base + insert 17 bytes</small></div>
+                <div class="pack-byte tree-entry"><span>entry 3</span><strong>tree</strong><small>complete content · zlib</small></div>
+                <div class="pack-byte commit-entry"><span>entries 4–6</span><strong>3 commits</strong><small>complete or delta representations</small></div>
+                <div class="pack-byte pack-trailer"><span>file trailer</span><strong>pack checksum</strong><small>verifies the pack bytes</small></div>
+              </div>
+              <div class="pack-identity-proof">
+                <span>same logical object</span>
+                <code>blob d7fc73a…</code>
+                <i aria-hidden="true">→</i>
+                <code>pack offset 0x004a</code>
+                <strong>OID unchanged</strong>
+              </div>
+            </div>
+          </div>
+
+          <div class="pack-details" id="pack-details"></div>
+        </div>
+      </section>
+
+      <section class="clone-section" id="clones" aria-labelledby="clones-title">
+        <div class="clone-heading reveal">
+          <div>
+            <p class="eyebrow">Clone and materialization laboratory</p>
+            <h2 id="clones-title">A clone is negotiation, object transfer, ref setup, then an optional checkout.</h2>
+          </div>
+          <p>“Small clone” can mean fewer commits, fewer objects, fewer refs, fewer checked-out paths, or borrowed storage. Those are different mechanisms with different offline and integrity tradeoffs.</p>
+        </div>
+
+        <div class="clone-lab reveal">
+          <div class="clone-mode-rail" role="tablist" aria-label="Clone modes" id="clone-mode-rail"></div>
+
+          <div class="clone-command-bar">
+            <span>command</span>
+            <code id="clone-command"></code>
+            <button type="button" id="clone-action"></button>
+          </div>
+
+          <div class="clone-stage">
+            <div class="clone-source">
+              <div class="clone-panel-label">Remote object graph</div>
+              <div class="remote-stack" aria-hidden="true">
+                <div class="stack-layer stack-commits"><span>commits</span><b>18,420</b></div>
+                <div class="stack-layer stack-trees"><span>trees</span><b>46,891</b></div>
+                <div class="stack-layer stack-blobs"><span>blobs</span><b>182,306</b></div>
+              </div>
+              <p id="clone-source-note"></p>
+            </div>
+
+            <div class="clone-pipeline" id="clone-pipeline" aria-label="Clone data flow"></div>
+
+            <div class="clone-disk">
+              <div class="clone-panel-label">Materialized on disk</div>
+              <div class="clone-disk-tree" id="clone-disk-tree"></div>
+            </div>
+          </div>
+
+          <div class="clone-metrics" id="clone-metrics"></div>
+
+          <div class="clone-explanation">
+            <div>
+              <span class="clone-kicker" id="clone-kicker"></span>
+              <h3 id="clone-title"></h3>
+            </div>
+            <div id="clone-description"></div>
+            <div class="clone-warning" id="clone-warning"></div>
+          </div>
+        </div>
+
+        <div class="clone-dimensions reveal" aria-label="Clone mechanism comparison">
+          <article><span>01</span><h3>Shallow</h3><p>Truncates commit ancestry and records boundary OIDs in <code>.git/shallow</code>. Deepen to cross the boundary.</p></article>
+          <article><span>02</span><h3>Partial</h3><p>Retains graph references to missing objects. A promisor remote supplies those objects on demand.</p></article>
+          <article><span>03</span><h3>Sparse</h3><p>Limits paths populated in the working tree. By itself it does not reduce downloaded history or objects.</p></article>
+          <article><span>04</span><h3>Borrowed</h3><p>Hardlinks or alternates avoid duplicate local storage. The safety properties depend on which mechanism is used.</p></article>
+        </div>
+      </section>
+
+      <section class="deep-section" id="deep-dives" aria-labelledby="deep-title">
+        <div class="section-heading reveal">
+          <p class="eyebrow">Interview depth</p>
+          <h2 id="deep-title">Follow the edge cases until the model holds.</h2>
+          <p>These are the questions that separate command familiarity from a real understanding of Git's storage and history semantics.</p>
+        </div>
+
+        <div class="deep-layout reveal">
+          <div class="topic-rail" role="tablist" aria-label="Deep dive topics" id="topic-rail"></div>
+          <article class="topic-content" id="topic-content" tabindex="0"></article>
+          <aside class="interview-card" id="interview-card">
+            <span class="interview-label">Test your model</span>
+            <h3 id="interview-question"></h3>
+            <button type="button" id="reveal-answer">Reveal answer</button>
+            <div id="interview-answer" hidden></div>
+          </aside>
+        </div>
+      </section>
+
+      <section class="final-model reveal" aria-labelledby="final-title">
+        <div><p class="eyebrow">The whole system in one sentence</p><h2 id="final-title">Git stores immutable snapshots, discovers relationships by hashes, and gives humans mutable refs to navigate the graph.</h2></div>
+        <a class="primary-button" href="#lab">Replay the repository</a>
+      </section>
+    </main>
+
+    <footer>
+      <div class="brand"><span class="brand-mark" aria-hidden="true"><svg viewBox="0 0 28 28"><path d="M7 8.5 14 4l7 4.5v11L14 24l-7-4.5z"/></svg></span><span>inside<span class="accent">git</span></span></div>
+      <p>Built against Git's documented object, index, and pack formats.</p>
+      <a href="#top">Back to top ↑</a>
+    </footer>
+
+    <div class="toast" id="toast" role="status" aria-live="polite"></div>
+    <script defer src="./app.js"></script>
+  </body>
+</html>

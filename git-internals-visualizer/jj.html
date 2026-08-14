@@ -1,0 +1,226 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="description" content="An interactive systems-level guide to Jujutsu: working-copy commits, change IDs, revsets, operation history, conflicts, and Git interoperability." />
+    <title>Inside JJ — Interactive Jujutsu Internals Lab</title>
+    <link rel="stylesheet" href="./styles.css" />
+    <link rel="stylesheet" href="./jj.css" />
+  </head>
+  <body class="jj-page">
+    <a class="skip-link" href="#jj-lab">Skip to the lab</a>
+    <header class="topbar jj-topbar">
+      <a class="brand" href="#top" aria-label="Inside JJ home">
+        <span class="jj-brand-mark" aria-hidden="true">jj</span>
+        <span>inside<span class="jj-accent">jj</span></span>
+      </a>
+      <nav aria-label="Primary navigation">
+        <a href="#jj-lab">Workflow</a>
+        <a href="#identity">Identity</a>
+        <a href="#revsets">Revsets</a>
+        <a href="#operations">Operations</a>
+        <a href="#git-bridge">Git bridge</a>
+      </nav>
+      <a class="edition-link" href="./index.html">Git edition <span aria-hidden="true">→</span></a>
+    </header>
+
+    <main id="top">
+      <section class="jj-hero" aria-labelledby="jj-hero-title">
+        <div class="jj-hero-copy reveal">
+          <p class="eyebrow jj-eyebrow">A change-oriented field guide</p>
+          <h1 id="jj-hero-title">Your working copy is already a commit.</h1>
+          <p class="hero-lede">Jujutsu treats editing, rewriting, conflicts, and undo as normal graph operations. There is no staging area, no detached HEAD anxiety, and no requirement to name every line of work.</p>
+          <div class="hero-actions">
+            <a class="primary-button jj-primary" href="#jj-lab">Run the workflow</a>
+            <a class="text-link" href="#jj-model">See the two histories <span aria-hidden="true">→</span></a>
+          </div>
+          <dl class="hero-stats" aria-label="Core Jujutsu concepts">
+            <div><dt>2</dt><dd>parallel DAGs</dd></div>
+            <div><dt>0</dt><dd>staging-area steps</dd></div>
+            <div><dt>1</dt><dd>stable change identity</dd></div>
+          </dl>
+        </div>
+
+        <div class="jj-hero-visual reveal" aria-label="A change retaining identity across rewritten commits">
+          <div class="rewrite-axis"></div>
+          <div class="rewrite-card rewrite-old"><span>hidden commit</span><code>8a31c99</code><strong>change qpvuntsm</strong></div>
+          <div class="rewrite-arrow"><span>rebase + edit</span><i>→</i></div>
+          <div class="rewrite-card rewrite-new"><span>visible commit</span><code>c74b921</code><strong>change qpvuntsm</strong></div>
+          <div class="working-copy-chip"><i></i><span>working copy</span><code>@</code></div>
+          <p>Commit ID changes. Change ID survives.</p>
+        </div>
+      </section>
+
+      <section class="jj-model" id="jj-model" aria-labelledby="jj-model-title">
+        <div class="section-heading reveal">
+          <p class="eyebrow jj-eyebrow">The model to hold</p>
+          <h2 id="jj-model-title">Jujutsu versions your files—and its own view of the repository.</h2>
+          <p>Commits form the content history. Operations form a second DAG of repository states: visible heads, bookmarks, and each workspace’s working-copy commit.</p>
+        </div>
+        <div class="dual-dag reveal">
+          <article>
+            <span class="dag-label">Commit DAG</span>
+            <h3>What the project became</h3>
+            <div class="mini-dag commit-mini"><i class="root-node"></i><b>A</b><b>B</b><b class="wc-node">@</b></div>
+            <p>Snapshots, parents, descriptions, authors, change IDs, and commit IDs. Usually backed by Git objects.</p>
+          </article>
+          <div class="dag-relation"><span>view points into graph</span><i>↔</i><span>operation records view</span></div>
+          <article>
+            <span class="dag-label">Operation DAG</span>
+            <h3>What you did to the repository</h3>
+            <div class="mini-dag op-mini"><i class="root-node"></i><b>init</b><b>new</b><b>rebase</b></div>
+            <p>Every mutating command records an atomic repository view. This is why undo is broader than moving a branch ref.</p>
+          </article>
+        </div>
+      </section>
+
+      <section class="jj-lab-section" id="jj-lab" aria-labelledby="jj-lab-title">
+        <div class="section-heading reveal">
+          <p class="eyebrow jj-eyebrow">Functional workflow simulator</p>
+          <h2 id="jj-lab-title">Edit freely. Watch both histories move.</h2>
+          <p>Run each command and inspect the working-copy commit, visible heads, bookmarks, hidden predecessors, and operation log.</p>
+        </div>
+
+        <div class="jj-shell reveal">
+          <div class="jj-shell-bar">
+            <span class="jj-path">~/packet-garden</span>
+            <div><i class="wc-pulse"></i><strong id="jj-workspace-label">workspace: default</strong></div>
+            <button id="jj-reset" type="button">Reset</button>
+          </div>
+          <div class="jj-shell-grid">
+            <aside class="jj-command-column">
+              <span class="jj-panel-label">Command sequence</span>
+              <div id="jj-command-list"></div>
+              <div class="jj-next-explanation" id="jj-next-explanation"></div>
+            </aside>
+            <div class="jj-graph-column">
+              <div class="jj-view-tabs" role="tablist" aria-label="Jujutsu simulator views">
+                <button role="tab" data-jj-view="commit" aria-selected="true">Commit graph</button>
+                <button role="tab" data-jj-view="operation" aria-selected="false">Operation log</button>
+                <button role="tab" data-jj-view="files" aria-selected="false">Snapshot</button>
+              </div>
+              <div id="jj-main-view"></div>
+            </div>
+            <aside class="jj-state-column">
+              <span class="jj-panel-label">Current view</span>
+              <div id="jj-current-state"></div>
+            </aside>
+          </div>
+          <div class="jj-terminal">
+            <div><span>packet-garden</span><b>$</b><code id="jj-terminal-command">Select “jj git init --colocate” to begin</code></div>
+            <pre id="jj-terminal-output">Jujutsu will create a repository view and a working-copy commit.</pre>
+          </div>
+        </div>
+      </section>
+
+      <section class="identity-section" id="identity" aria-labelledby="identity-title">
+        <div class="section-heading reveal">
+          <p class="eyebrow jj-eyebrow">Two identities</p>
+          <h2 id="identity-title">A commit is one version. A change is the idea evolving through rewrites.</h2>
+          <p>Rewrite the example and see which fields alter the content-addressed commit ID while the random change ID remains stable.</p>
+        </div>
+        <div class="identity-lab reveal">
+          <div class="identity-controls">
+            <label for="jj-description">Description</label>
+            <input id="jj-description" value="decode packets" />
+            <label for="jj-parent">Parent commit</label>
+            <select id="jj-parent"><option value="a17e6b1">a17e6b1 · root</option><option value="b321aa4">b321aa4 · upstream moved</option></select>
+            <label for="jj-content">Snapshot change</label>
+            <textarea id="jj-content" rows="4">app.js: decode bytes</textarea>
+          </div>
+          <div class="identity-result">
+            <div class="identity-row stable"><span>Change ID</span><code>qpvuntsmwlqt</code><strong>stable</strong></div>
+            <div class="identity-row changing"><span>Commit ID</span><code id="jj-commit-id">c74b921d84af</code><strong>rewritten</strong></div>
+            <div class="identity-chain"><span>earlier versions</span><code>8a31c99 → b4e20f1 → <b id="identity-tip">c74b921</b></code></div>
+            <p>The old commits still exist in backend storage and operation history, but only the latest version is normally visible.</p>
+          </div>
+        </div>
+      </section>
+
+      <section class="revset-section" id="revsets" aria-labelledby="revsets-title">
+        <div class="revset-heading reveal">
+          <div><p class="eyebrow jj-eyebrow">Revision-set language</p><h2 id="revsets-title">Select graph shapes, not string ranges.</h2></div>
+          <p>Revsets are composable set expressions. Pick an expression to highlight exactly which revisions it selects.</p>
+        </div>
+        <div class="revset-lab reveal">
+          <div class="revset-options" id="revset-options"></div>
+          <div class="revset-canvas">
+            <div class="revset-graph" id="revset-graph"></div>
+            <div class="revset-result"><span>selected revisions</span><code id="revset-result"></code></div>
+          </div>
+          <aside id="revset-explanation"></aside>
+        </div>
+      </section>
+
+      <section class="operation-section" id="operations" aria-labelledby="operations-title">
+        <div class="section-heading reveal">
+          <p class="eyebrow jj-eyebrow">Repository time machine</p>
+          <h2 id="operations-title">Undo restores a repository view, not merely a commit pointer.</h2>
+          <p>The operation log records bookmark movements, visible heads, working-copy assignments, and rewrites. Select an operation to inspect or restore its view.</p>
+        </div>
+        <div class="op-lab reveal">
+          <div class="op-timeline" id="op-timeline"></div>
+          <div class="op-inspector" id="op-inspector"></div>
+        </div>
+      </section>
+
+      <section class="conflict-section" id="conflicts" aria-labelledby="conflict-title">
+        <div class="conflict-copy reveal">
+          <p class="eyebrow jj-eyebrow">First-class conflicts</p>
+          <h2 id="conflict-title">A rebase can succeed with a conflict recorded inside the result.</h2>
+          <p>Jujutsu stores a logical conflict with multiple terms. Markers are a working-copy materialization, not the canonical stored form. You can rebase, merge, or inspect the conflicted commit before resolving it.</p>
+          <button class="primary-button jj-primary" id="conflict-toggle" type="button">Materialize conflict</button>
+        </div>
+        <div class="conflict-visual reveal">
+          <div class="conflict-terms" id="conflict-terms">
+            <div><span>base</span><code>grape</code></div><i>−</i><div><span>side 1</span><code>grapefruit</code></div><i>+</i><div><span>side 2</span><code>GRAPE</code></div>
+          </div>
+          <pre id="conflict-markers" hidden>&lt;&lt;&lt;&lt;&lt;&lt;&lt; Conflict 1 of 1
+%%%%%%% Changes from base to side #1
+-grape
++grapefruit
+++++++ Contents of side #2
+GRAPE
+&gt;&gt;&gt;&gt;&gt;&gt;&gt; Conflict 1 of 1 ends</pre>
+          <div class="conflict-status"><i></i><span>conflicted commit remains a valid graph node</span></div>
+        </div>
+      </section>
+
+      <section class="git-bridge-section" id="git-bridge" aria-labelledby="git-bridge-title">
+        <div class="section-heading reveal">
+          <p class="eyebrow jj-eyebrow">Git backend and colocation</p>
+          <h2 id="git-bridge-title">JJ adds a repository view above Git’s object store.</h2>
+          <p>In a colocated workspace, `.jj/` and `.git/` are siblings. Commit IDs are Git commit IDs; bookmarks map to Git branches; snapshots and refs synchronize at command boundaries.</p>
+        </div>
+        <div class="bridge-lab reveal">
+          <div class="bridge-layer jj-layer"><span>.jj/</span><strong>operations · views · workspace state</strong><code>change IDs · visible heads · bookmarks</code></div>
+          <div class="bridge-sync"><i>⇅</i><span>import / export refs</span></div>
+          <div class="bridge-layer git-layer"><span>.git/</span><strong>commits · trees · blobs · refs</strong><code>Git commit IDs are JJ commit IDs</code></div>
+          <div class="bridge-working"><span>working directory</span><p>JJ snapshots edits into <code>@</code>; Git sees the exported checkout and branches.</p></div>
+        </div>
+        <div class="comparison-table reveal">
+          <div class="comparison-head"><span>Concept</span><strong>Git</strong><strong>Jujutsu</strong></div>
+          <div><span>Current work</span><code>working tree + index</code><code>working-copy commit @</code></div>
+          <div><span>Named line</span><code>branch, usually checked out</code><code>bookmark, never “current”</code></div>
+          <div><span>Rewrite identity</span><code>new commit ID</code><code>new commit ID, same change ID</code></div>
+          <div><span>Undo scope</span><code>reflog + command-specific repair</code><code>restore prior operation view</code></div>
+          <div><span>Conflicts</span><code>transient index stages</code><code>recorded in commits</code></div>
+        </div>
+      </section>
+
+      <section class="final-model reveal" aria-labelledby="jj-final-title">
+        <div><p class="eyebrow jj-eyebrow">The whole system in one sentence</p><h2 id="jj-final-title">Jujutsu makes rewriting safe by tracking stable changes, visible repository views, and every operation that transformed them.</h2></div>
+        <a class="primary-button jj-primary" href="#jj-lab">Replay the workflow</a>
+      </section>
+    </main>
+
+    <footer>
+      <div class="brand"><span class="jj-brand-mark">jj</span><span>inside<span class="jj-accent">jj</span></span></div>
+      <p>Built against Jujutsu 0.42 terminology and its Git-backend model.</p>
+      <a href="#top">Back to top ↑</a>
+    </footer>
+    <div class="toast" id="jj-toast" role="status" aria-live="polite"></div>
+    <script defer src="./jj.js"></script>
+  </body>
+</html>

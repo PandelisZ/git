@@ -1,0 +1,10 @@
+{
+  "name": "git-internals-visualizer",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Dependency-free interactive visualizer for Git internals",
+  "scripts": {
+    "start": "python3 -m http.server 4173",
+    "check": "node --check app.js && node --check jj.js"
+  }
+}
